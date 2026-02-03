@@ -440,3 +440,51 @@ async def get_shortest_path(
         logger.error(f"Error finding path: {e}")
         return {"path_exists": False, "node_ids": [], "link_ids": [], "length": 0}
 
+
+@router.get("/layout/{folder_id}")
+async def get_layout(
+    folder_id: str,
+    current_user: dict = Depends(get_current_user),
+    algorithm: str = Query(default="forceAtlas2", description="Layout algorithm"),
+    iterations: int = Query(default=100, ge=10, le=500),
+    scale: float = Query(default=500.0, ge=100, le=2000),
+    neo4j = Depends(get_neo4j),
+) -> Dict[str, Any]:
+    """
+    Calculate server-side layout for a folder's graph.
+    
+    Uses Neo4j GDS ForceAtlas2 when available, with intelligent fallback
+    to deterministic type-clustered positioning.
+    """
+    try:
+        from app.services.graph_layout import get_layout_service
+        
+        layout_service = get_layout_service(neo4j)
+        positions = await layout_service.calculate_layout(
+            folder_id=folder_id,
+            algorithm=algorithm,
+            iterations=iterations,
+            scale=scale,
+        )
+        
+        # Convert to serializable format
+        result = {
+            node_id: {"x": pos.x, "y": pos.y, "z": pos.z}
+            for node_id, pos in positions.items()
+        }
+        
+        return {
+            "folder_id": folder_id,
+            "algorithm": algorithm,
+            "node_count": len(result),
+            "positions": result,
+        }
+    except Exception as e:
+        logger.error(f"Error calculating layout: {e}")
+        return {
+            "folder_id": folder_id,
+            "algorithm": algorithm,
+            "node_count": 0,
+            "positions": {},
+            "error": str(e),
+        }
