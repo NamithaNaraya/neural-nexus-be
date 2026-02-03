@@ -488,3 +488,154 @@ async def get_layout(
             "positions": {},
             "error": str(e),
         }
+
+
+# === Phase 6: Advanced Intelligence ===
+
+class CompareRequest(BaseModel):
+    """Request for cluster comparison."""
+    left: Dict[str, Any]  # {"type": "file|folder|cluster|selection", "id": str, "node_ids": List[str]}
+    right: Dict[str, Any]
+    include_bridges: bool = True
+    include_similarity: bool = True
+
+
+@router.post("/compare")
+async def compare_clusters(
+    request: CompareRequest,
+    current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
+) -> Dict[str, Any]:
+    """
+    Compare two clusters of nodes (file vs file, folder vs folder, etc.).
+    
+    Returns common entities, unique nodes, bridge nodes, and similarity metrics.
+    """
+    from app.services.cluster_comparison import get_comparison_service
+    
+    try:
+        comparison = get_comparison_service(neo4j)
+        result = await comparison.compare(
+            left=request.left,
+            right=request.right,
+            include_bridges=request.include_bridges,
+            include_similarity=request.include_similarity,
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Cluster comparison failed: {e}")
+        return {"error": str(e)}
+
+
+@router.get("/blind-spots/{folder_id}")
+async def discover_blind_spots(
+    folder_id: str,
+    current_user: dict = Depends(get_current_user),
+    min_confidence: float = Query(default=0.5, ge=0.0, le=1.0),
+    method: str = Query(default="structural"),
+    limit: int = Query(default=50, le=200),
+    neo4j = Depends(get_neo4j),
+) -> Dict[str, Any]:
+    """
+    Discover blind spots (missing relationships) in the graph.
+    
+    Returns "ghost lines" - predicted relationships that should exist
+    but aren't documented.
+    """
+    from app.services.blind_spot_discovery import get_discovery_service, PredictionMethod
+    
+    try:
+        discovery = get_discovery_service(neo4j)
+        
+        # Map string to enum
+        method_map = {
+            "structural": PredictionMethod.STRUCTURAL,
+            "common_neighbors": PredictionMethod.COMMON_NEIGHBORS,
+            "jaccard": PredictionMethod.JACCARD,
+            "adamic_adar": PredictionMethod.ADAMIC_ADAR,
+            "preferential_attachment": PredictionMethod.PREFERENTIAL_ATTACHMENT,
+        }
+        pred_method = method_map.get(method, PredictionMethod.STRUCTURAL)
+        
+        result = await discovery.discover(
+            folder_id=folder_id,
+            min_confidence=min_confidence,
+            method=pred_method,
+            limit=limit,
+        )
+        return result
+    except Exception as e:
+        logger.error(f"Blind spot discovery failed: {e}")
+        return {"error": str(e), "ghost_lines": []}
+
+
+@router.get("/blind-spots/cross-topic")
+async def cross_topic_bridges(
+    folder_ids: str = Query(..., description="Comma-separated folder IDs"),
+    current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
+) -> Dict[str, Any]:
+    """
+    Find cross-topic bridging opportunities between folders.
+    
+    Identifies entities that could connect different topic areas.
+    """
+    from app.services.blind_spot_discovery import get_discovery_service
+    
+    try:
+        folder_list = [f.strip() for f in folder_ids.split(",") if f.strip()]
+        
+        if len(folder_list) < 2:
+            return {"error": "At least 2 folder IDs required", "bridges": []}
+        
+        discovery = get_discovery_service(neo4j)
+        bridges = await discovery.get_cross_topic_bridges(folder_list)
+        
+        return {
+            "folder_count": len(folder_list),
+            "folders": folder_list,
+            "bridge_count": len(bridges),
+            "bridges": bridges,
+        }
+    except Exception as e:
+        logger.error(f"Cross-topic bridge discovery failed: {e}")
+        return {"error": str(e), "bridges": []}
+
+
+@router.get("/export/{folder_id}")
+async def export_analytics(
+    folder_id: str,
+    current_user: dict = Depends(get_current_user),
+    format: str = Query(default="pdf", description="Export format: pdf, json, csv"),
+    include_centrality: bool = Query(default=True),
+    include_clustering: bool = Query(default=True),
+    include_ghost_lines: bool = Query(default=True),
+    include_health: bool = Query(default=True),
+    neo4j = Depends(get_neo4j),
+) -> Dict[str, Any]:
+    """
+    Export graph analytics with analytics supplement tables.
+    
+    Available formats:
+    - pdf: Structured data for frontend PDF rendering
+    - json: Full analytics data
+    - csv: Summary metrics table
+    """
+    from app.services.analytics_export import get_export_service, ExportConfig
+    
+    try:
+        export_service = get_export_service(neo4j)
+        
+        config = ExportConfig(
+            include_centrality=include_centrality,
+            include_clustering=include_clustering,
+            include_ghost_lines=include_ghost_lines,
+            include_health_score=include_health,
+            format=format,
+        )
+        
+        result = await export_service.export(folder_id, config)
+        return result
+    except Exception as e:
+        logger.error(f"Analytics export failed: {e}")
+        return {"error": str(e), "folder_id": folder_id}

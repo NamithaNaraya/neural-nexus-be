@@ -49,32 +49,55 @@ async def run_query(
     Execute a natural language query using Hybrid RAG.
     
     Steps:
-    1. Vector Search - Find relevant text chunks
-    2. Graph Reasoning - Verify and expand with relationships
-    3. LLM Generation - Generate answer with citations
+    1. Get conversation context (sliding window - last 5)
+    2. Vector Search - Find relevant text chunks
+    3. Graph Reasoning - Verify and expand with relationships
+    4. LLM Generation - Generate answer with citations
     """
+    from app.db.connections import get_neo4j_driver
+    from app.services.ai_service import AIService
+    from app.services.hybrid_rag import get_rag_service
+    
     # Create session if not provided
     session_id = request.session_id or str(uuid.uuid4())
     
-    # Clear history if requested
-    if request.clear_history:
-        # TODO: Clear chat history for session
-        pass
-    
-    # TODO: Implement Hybrid RAG pipeline
-    # 1. Embed question with Ollama
-    # 2. Vector search in Neo4j
-    # 3. Graph context expansion
-    # 4. LLM answer generation
-    
-    logger.info(f"Query from user {current_user.user_id}: {request.question[:50]}...")
-    
-    return QueryResponse(
-        answer="Query processing is not yet implemented.",
-        citations=[],
-        session_id=session_id,
-        related_nodes=[],
-    )
+    try:
+        # Get services
+        neo4j = get_neo4j_driver()
+        ai_service = AIService()
+        rag_service = get_rag_service(neo4j, ai_service)
+        
+        # Execute query
+        result = await rag_service.query(
+            question=request.question,
+            session_id=session_id,
+            scope=request.scope,
+            clear_history=request.clear_history,
+        )
+        
+        return QueryResponse(
+            answer=result.get("answer", "No answer generated"),
+            citations=[
+                Citation(
+                    node_id=c.get("node_id", ""),
+                    node_name=c.get("node_name", ""),
+                    chunk_text=c.get("chunk_text", ""),
+                    confidence=c.get("confidence", 0.0),
+                )
+                for c in result.get("citations", [])
+            ],
+            session_id=session_id,
+            related_nodes=result.get("related_nodes", []),
+        )
+        
+    except Exception as e:
+        logger.error(f"Query failed: {e}")
+        return QueryResponse(
+            answer=f"Error processing query: {str(e)}",
+            citations=[],
+            session_id=session_id,
+            related_nodes=[],
+        )
 
 
 @router.get("/chat/history/{session_id}")
