@@ -1,31 +1,36 @@
 """
 Ontology Agent - Phase 3 of the Ingestion Pipeline
 
-Defines graph schema and ensures consistency with existing folder schemas.
-RULE: Must check existing folder schema first to reuse labels 
+Defines graph schema and entity types for extraction.
+RULE: Must check existing folder schema first to reuse labels
 (prevent "WORKS_AT" vs "EMPLOYED_BY" conflicts).
 """
-from typing import Any, Dict, List, Optional, Set
-from dataclasses import dataclass
+import logging
+from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+
+from app.services.ai_service import get_ollama_service
+from app.db.connections import get_neo4j_driver
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class EntityType:
-    """Represents an entity type in the ontology."""
-    name: str  # Person, Place, Organization, Concept, Event, Document
+    """Represents an entity type in the schema."""
+    name: str  # e.g., "Person", "Organization"
     description: str
-    properties: List[str]
-    examples: List[str] = None
+    properties: List[str] = field(default_factory=list)
+    examples: List[str] = field(default_factory=list)
 
 
 @dataclass
-class RelationshipType:
-    """Represents a relationship type in the ontology."""
-    name: str  # WORKS_FOR, LIVES_IN, RELATED_TO, etc.
-    source_types: List[str]  # Allowed source entity types
-    target_types: List[str]  # Allowed target entity types
+class RelationType:
+    """Represents a relationship type in the schema."""
+    name: str  # e.g., "WORKS_AT", "LIVES_IN"
     description: str
-    is_directional: bool = True
+    source_types: List[str] = field(default_factory=list)
+    target_types: List[str] = field(default_factory=list)
 
 
 class OntologyAgent:
@@ -33,76 +38,269 @@ class OntologyAgent:
     Phase 3: Ontology Definition Agent
     
     Responsibilities:
-    - Define graph schema for new documents
-    - Check existing folder schema to reuse labels
-    - Prevent label conflicts (WORKS_AT vs EMPLOYED_BY)
-    - Suggest entity and relationship types based on content
+    - Define entity types for the document
+    - Define relationship types
+    - Reuse existing schema from folder when possible
+    - Prevent semantic duplicates (WORKS_AT vs EMPLOYED_BY)
     """
     
-    def __init__(self, model_name: str = "gemma2:latest"):
+    SYSTEM_PROMPT = """You are an ontology designer for knowledge graphs.
+
+Given a document sample, identify the types of entities and relationships that should be extracted.
+
+OUTPUT FORMAT (JSON):
+{
+    "entity_types": [
+        {
+            "name": "Person",
+            "description": "A human individual mentioned in the text",
+            "properties": ["age", "occupation", "nationality"],
+            "examples": ["John Smith", "Dr. Jane Doe"]
+        }
+    ],
+    "relationship_types": [
+        {
+            "name": "WORKS_AT",
+            "description": "Employment relationship",
+            "source_types": ["Person"],
+            "target_types": ["Organization"]
+        }
+    ]
+}
+
+RULES:
+1. Use UPPERCASE_SNAKE_CASE for relationship names
+2. Use PascalCase for entity type names
+3. Keep types generic enough to be reusable
+4. Include common properties for each entity type
+5. If given existing schema, REUSE those types instead of creating new ones"""
+    
+    def __init__(self, model_name: str = None):
+        self.ollama = get_ollama_service()
         self.model_name = model_name
-        self._default_entity_types = [
-            "Person", "Place", "Organization", "Concept", "Event", "Document"
-        ]
         
-    async def define_schema(self, 
-                           chunks: List[Any],
-                           folder_id: str,
-                           existing_schema: Optional[Dict] = None) -> Dict[str, Any]:
+    async def define_schema(
+        self,
+        chunks: List[Any],
+        folder_id: str,
+        existing_schema: Dict[str, Any] = None,
+    ) -> Dict[str, Any]:
         """
-        Define the ontology schema for document extraction.
+        Define ontology schema for extraction.
         
         Args:
             chunks: Text chunks from ChunkingAgent
-            folder_id: ID of the folder (for schema consistency)
-            existing_schema: Existing schema in the folder to maintain consistency
+            folder_id: Folder ID to check for existing schema
+            existing_schema: Optional cached schema from folder
             
         Returns:
-            Dictionary containing entity types and relationship types
+            Schema definition with entity and relationship types
         """
-        # First, load existing schema from folder
+        logger.info(f"Defining ontology for folder {folder_id}")
+        
+        # Get existing schema from folder if not provided
         if existing_schema is None:
-            existing_schema = await self._load_folder_schema(folder_id)
+            existing_schema = await self._get_folder_schema(folder_id)
         
-        # Analyze chunks to suggest new types
-        suggested_types = await self._suggest_types(chunks)
+        # Sample text for analysis
+        sample_text = self._get_sample_text(chunks)
         
-        # Merge with existing schema (prefer existing labels)
-        merged_schema = await self._merge_schemas(existing_schema, suggested_types)
+        if existing_schema and existing_schema.get("entity_types"):
+            # Merge with existing schema
+            new_schema = await self._extend_schema(sample_text, existing_schema)
+        else:
+            # Create new schema
+            new_schema = await self._create_schema(sample_text)
         
-        return merged_schema
+        logger.info(f"Schema defined with {len(new_schema['entity_types'])} entity types, "
+                   f"{len(new_schema['relationship_types'])} relationship types")
+        
+        return new_schema
     
-    async def _load_folder_schema(self, folder_id: str) -> Dict[str, Any]:
-        """Load existing ontology schema from folder."""
-        # TODO: Implement schema loading from Neo4j
+    async def _get_folder_schema(self, folder_id: str) -> Dict[str, Any]:
+        """Get existing schema from folder's entities."""
+        try:
+            driver = get_neo4j_driver()
+            
+            async with driver.session() as session:
+                # Get distinct entity types
+                entity_result = await session.run("""
+                    MATCH (e:Entity {folder_id: $folder_id})
+                    RETURN DISTINCT e.type as type, count(e) as count
+                    ORDER BY count DESC
+                    LIMIT 20
+                """, folder_id=folder_id)
+                entity_records = await entity_result.data()
+                
+                # Get distinct relationship types
+                rel_result = await session.run("""
+                    MATCH (e1:Entity {folder_id: $folder_id})-[r:RELATIONSHIP]->(e2:Entity)
+                    RETURN DISTINCT r.type as type, count(r) as count
+                    ORDER BY count DESC
+                    LIMIT 20
+                """, folder_id=folder_id)
+                rel_records = await rel_result.data()
+                
+                if not entity_records and not rel_records:
+                    return {}
+                
+                return {
+                    "entity_types": [
+                        EntityType(
+                            name=r["type"],
+                            description=f"Existing entity type with {r['count']} instances",
+                            properties=[],
+                            examples=[],
+                        ).__dict__
+                        for r in entity_records if r["type"]
+                    ],
+                    "relationship_types": [
+                        RelationType(
+                            name=r["type"],
+                            description=f"Existing relationship type with {r['count']} instances",
+                            source_types=[],
+                            target_types=[],
+                        ).__dict__
+                        for r in rel_records if r["type"]
+                    ],
+                }
+                
+        except Exception as e:
+            logger.warning(f"Could not fetch folder schema: {e}")
+            return {}
+    
+    def _get_sample_text(self, chunks: List[Any], max_chars: int = 3000) -> str:
+        """Get sample text from chunks for analysis."""
+        sample_parts = []
+        total_chars = 0
+        
+        for chunk in chunks:
+            content = chunk.content if hasattr(chunk, 'content') else chunk.get('content', '')
+            if total_chars + len(content) > max_chars:
+                remaining = max_chars - total_chars
+                sample_parts.append(content[:remaining])
+                break
+            sample_parts.append(content)
+            total_chars += len(content)
+        
+        return '\n\n'.join(sample_parts)
+    
+    async def _create_schema(self, sample_text: str) -> Dict[str, Any]:
+        """Create new schema from scratch using AI."""
+        try:
+            messages = [
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "user", "content": f"Analyze this text and define the ontology:\n\n{sample_text}"}
+            ]
+            
+            result = await self.ollama.chat_json(messages, self.model_name)
+            
+            return {
+                "entity_types": result.get("entity_types", []),
+                "relationship_types": result.get("relationship_types", []),
+            }
+            
+        except Exception as e:
+            logger.error(f"Schema creation failed: {e}")
+            # Return default schema
+            return self._get_default_schema()
+    
+    async def _extend_schema(
+        self,
+        sample_text: str,
+        existing_schema: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Extend existing schema with new types if needed."""
+        existing_types = [t["name"] for t in existing_schema.get("entity_types", [])]
+        existing_rels = [t["name"] for t in existing_schema.get("relationship_types", [])]
+        
+        prompt = f"""Given the existing schema:
+Entity Types: {', '.join(existing_types)}
+Relationship Types: {', '.join(existing_rels)}
+
+Analyze the following text. If new entity or relationship types are needed, add them.
+Otherwise, reuse the existing types.
+
+Text:
+{sample_text}"""
+        
+        try:
+            messages = [
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "user", "content": prompt}
+            ]
+            
+            result = await self.ollama.chat_json(messages, self.model_name)
+            
+            # Merge with existing
+            merged_entities = existing_schema.get("entity_types", [])
+            merged_rels = existing_schema.get("relationship_types", [])
+            
+            # Add new types (avoid duplicates)
+            for et in result.get("entity_types", []):
+                if et["name"] not in existing_types:
+                    merged_entities.append(et)
+            
+            for rt in result.get("relationship_types", []):
+                if rt["name"] not in existing_rels:
+                    merged_rels.append(rt)
+            
+            return {
+                "entity_types": merged_entities,
+                "relationship_types": merged_rels,
+            }
+            
+        except Exception as e:
+            logger.error(f"Schema extension failed: {e}")
+            return existing_schema
+    
+    def _get_default_schema(self) -> Dict[str, Any]:
+        """Return a sensible default schema."""
         return {
-            "entity_types": [],
-            "relationship_types": [],
+            "entity_types": [
+                {
+                    "name": "Person",
+                    "description": "A human individual",
+                    "properties": ["occupation", "age", "location"],
+                    "examples": [],
+                },
+                {
+                    "name": "Organization",
+                    "description": "A company, institution, or group",
+                    "properties": ["industry", "location", "size"],
+                    "examples": [],
+                },
+                {
+                    "name": "Location",
+                    "description": "A geographical place",
+                    "properties": ["type", "country"],
+                    "examples": [],
+                },
+                {
+                    "name": "Concept",
+                    "description": "An abstract idea or topic",
+                    "properties": ["category"],
+                    "examples": [],
+                },
+            ],
+            "relationship_types": [
+                {
+                    "name": "WORKS_AT",
+                    "description": "Employment relationship",
+                    "source_types": ["Person"],
+                    "target_types": ["Organization"],
+                },
+                {
+                    "name": "LOCATED_IN",
+                    "description": "Location relationship",
+                    "source_types": ["Person", "Organization"],
+                    "target_types": ["Location"],
+                },
+                {
+                    "name": "RELATED_TO",
+                    "description": "General relationship",
+                    "source_types": [],
+                    "target_types": [],
+                },
+            ],
         }
-    
-    async def _suggest_types(self, chunks: List[Any]) -> Dict[str, Any]:
-        """Use AI to suggest entity and relationship types from content."""
-        # TODO: Implement AI-based type suggestion
-        return {
-            "entity_types": self._default_entity_types,
-            "relationship_types": [],
-        }
-    
-    async def _merge_schemas(self, 
-                            existing: Dict[str, Any], 
-                            suggested: Dict[str, Any]) -> Dict[str, Any]:
-        """Merge schemas, preferring existing labels to prevent conflicts."""
-        # TODO: Implement smart schema merging
-        # Rule: If "EMPLOYED_BY" exists, don't create "WORKS_AT"
-        return {
-            "entity_types": list(set(existing.get("entity_types", []) + 
-                                    suggested.get("entity_types", []))),
-            "relationship_types": existing.get("relationship_types", []) +
-                                 suggested.get("relationship_types", []),
-        }
-    
-    async def normalize_relationship(self, rel_type: str, existing_types: Set[str]) -> str:
-        """Normalize relationship type to existing schema if similar."""
-        # TODO: Use AI to map similar relationship types
-        # e.g., "WORKS_AT" -> "EMPLOYED_BY" if that exists
-        return rel_type

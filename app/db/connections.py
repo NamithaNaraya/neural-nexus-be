@@ -55,6 +55,10 @@ def get_neo4j_driver() -> AsyncDriver:
     return _neo4j_driver
 
 
+# Alias for dependency injection
+get_neo4j = get_neo4j_driver
+
+
 # === PostgreSQL ===
 async def init_postgres() -> None:
     """Initialize PostgreSQL connection."""

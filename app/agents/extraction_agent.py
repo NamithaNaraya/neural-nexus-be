@@ -2,11 +2,17 @@
 Extraction Agent - Phase 4 of the Ingestion Pipeline
 
 Identifies and extracts entities/relationships from text chunks.
-CONSTRAINT: System prompts strictly forbid hallucinations; 
+CONSTRAINT: System prompts strictly forbid hallucinations;
 every claim must have ground-truth text evidence.
 """
+import logging
+import uuid
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
+
+from app.services.ai_service import get_ollama_service
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -46,24 +52,48 @@ class ExtractionAgent:
     - Avoid hallucinations - only extract what's in the text
     """
     
-    # Anti-hallucination system prompt
-    SYSTEM_PROMPT = """You are a precise knowledge extraction agent.
+    SYSTEM_PROMPT = """You are a precise knowledge extraction agent for building knowledge graphs.
 
 STRICT RULES:
 1. ONLY extract entities and relationships that are EXPLICITLY mentioned in the text.
 2. NEVER infer or assume information not directly stated.
 3. For EVERY entity and relationship, provide the exact quote from the text as evidence.
 4. If you're uncertain about a fact, DO NOT include it.
-5. Prefer specific, verifiable information over vague mentions.
+5. Use the provided entity types and relationship types from the schema.
 
-Your output must be grounded in the source text. Hallucinations are strictly forbidden."""
+OUTPUT FORMAT (JSON):
+{
+    "entities": [
+        {
+            "name": "John Smith",
+            "type": "Person",
+            "description": "A software engineer at TechCorp",
+            "properties": {"occupation": "software engineer"},
+            "evidence": "John Smith, a software engineer at TechCorp, presented..."
+        }
+    ],
+    "relationships": [
+        {
+            "source": "John Smith",
+            "target": "TechCorp",
+            "type": "WORKS_AT",
+            "description": "Employment relationship",
+            "evidence": "John Smith, a software engineer at TechCorp"
+        }
+    ]
+}
+
+Hallucinations are strictly forbidden. Only extract what you can directly quote from the text."""
     
-    def __init__(self, model_name: str = "gemma2:latest"):
+    def __init__(self, model_name: str = None):
+        self.ollama = get_ollama_service()
         self.model_name = model_name
         
-    async def extract(self, 
-                     chunks: List[Any],
-                     schema: Dict[str, Any]) -> Dict[str, List]:
+    async def extract(
+        self,
+        chunks: List[Any],
+        schema: Dict[str, Any],
+    ) -> Dict[str, List]:
         """
         Extract entities and relationships from text chunks.
         
@@ -76,35 +106,133 @@ Your output must be grounded in the source text. Hallucinations are strictly for
         """
         all_entities = []
         all_relationships = []
+        entity_name_to_id = {}  # Track entity names to IDs for relationship linking
         
-        for chunk in chunks:
-            result = await self._extract_from_chunk(chunk, schema)
-            all_entities.extend(result.get("entities", []))
-            all_relationships.extend(result.get("relationships", []))
+        entity_types = [et["name"] for et in schema.get("entity_types", [])]
+        rel_types = [rt["name"] for rt in schema.get("relationship_types", [])]
+        
+        logger.info(f"Extracting from {len(chunks)} chunks with schema: "
+                   f"{len(entity_types)} entity types, {len(rel_types)} relationship types")
+        
+        for i, chunk in enumerate(chunks):
+            chunk_content = chunk.content if hasattr(chunk, 'content') else chunk.get('content', '')
+            chunk_id = chunk.chunk_id if hasattr(chunk, 'chunk_id') else chunk.get('chunk_id', str(i))
+            
+            if not chunk_content.strip():
+                continue
+            
+            try:
+                result = await self._extract_from_chunk(
+                    chunk_content=chunk_content,
+                    chunk_id=chunk_id,
+                    entity_types=entity_types,
+                    rel_types=rel_types,
+                )
+                
+                # Process entities
+                for entity_data in result.get("entities", []):
+                    entity = ExtractedEntity(
+                        id=str(uuid.uuid4()),
+                        name=entity_data["name"],
+                        type=entity_data.get("type", "Concept"),
+                        description=entity_data.get("description", ""),
+                        properties=entity_data.get("properties", {}),
+                        source_chunk_id=chunk_id,
+                        source_text=entity_data.get("evidence", ""),
+                        confidence=0.9,
+                    )
+                    all_entities.append(entity)
+                    entity_name_to_id[entity.name.lower()] = entity.id
+                
+                # Process relationships (will link after all entities are extracted)
+                for rel_data in result.get("relationships", []):
+                    all_relationships.append({
+                        **rel_data,
+                        "source_chunk_id": chunk_id,
+                    })
+                    
+            except Exception as e:
+                logger.warning(f"Extraction failed for chunk {i}: {e}")
+                continue
+        
+        # Link relationships to entity IDs
+        linked_relationships = []
+        for rel in all_relationships:
+            source_name = rel.get("source", "").lower()
+            target_name = rel.get("target", "").lower()
+            
+            source_id = entity_name_to_id.get(source_name)
+            target_id = entity_name_to_id.get(target_name)
+            
+            if source_id and target_id:
+                linked_relationships.append(ExtractedRelationship(
+                    source_entity_id=source_id,
+                    target_entity_id=target_id,
+                    relationship_type=rel.get("type", "RELATED_TO"),
+                    description=rel.get("description", ""),
+                    source_chunk_id=rel.get("source_chunk_id"),
+                    source_text=rel.get("evidence", ""),
+                    confidence=0.85,
+                ))
+            else:
+                logger.debug(f"Could not link relationship: {source_name} -> {target_name}")
+        
+        logger.info(f"Extracted {len(all_entities)} entities, {len(linked_relationships)} relationships")
         
         return {
             "entities": all_entities,
-            "relationships": all_relationships,
+            "relationships": linked_relationships,
         }
     
-    async def _extract_from_chunk(self, 
-                                  chunk: Any, 
-                                  schema: Dict[str, Any]) -> Dict[str, List]:
+    async def _extract_from_chunk(
+        self,
+        chunk_content: str,
+        chunk_id: str,
+        entity_types: List[str],
+        rel_types: List[str],
+    ) -> Dict[str, List]:
         """Extract entities and relationships from a single chunk."""
-        # TODO: Implement AI-based extraction with anti-hallucination prompt
-        return {
-            "entities": [],
-            "relationships": [],
-        }
+        
+        prompt = f"""Extract entities and relationships from this text.
+
+ALLOWED ENTITY TYPES: {', '.join(entity_types) if entity_types else 'Any type'}
+ALLOWED RELATIONSHIP TYPES: {', '.join(rel_types) if rel_types else 'Any type'}
+
+TEXT:
+{chunk_content}
+
+Remember: Only extract what is EXPLICITLY stated. Include exact quotes as evidence."""
+        
+        try:
+            messages = [
+                {"role": "system", "content": self.SYSTEM_PROMPT},
+                {"role": "user", "content": prompt}
+            ]
+            
+            result = await self.ollama.chat_json(messages, self.model_name)
+            
+            return {
+                "entities": result.get("entities", []),
+                "relationships": result.get("relationships", []),
+            }
+            
+        except Exception as e:
+            logger.error(f"Chunk extraction failed: {e}")
+            return {"entities": [], "relationships": []}
     
-    async def _validate_evidence(self, 
-                                 extraction: Any, 
-                                 source_text: str) -> bool:
+    def _validate_evidence(
+        self,
+        extraction: Any,
+        source_text: str,
+    ) -> bool:
         """Validate that extraction has valid ground-truth evidence."""
-        # TODO: Verify the source_text quote exists in the chunk
-        return True
-    
-    async def _assign_confidence(self, extraction: Any) -> float:
-        """Assign confidence score based on extraction quality."""
-        # TODO: Implement confidence scoring
-        return 1.0
+        evidence = extraction.source_text if hasattr(extraction, 'source_text') else ""
+        
+        if not evidence:
+            return False
+        
+        # Check if evidence appears in the source
+        evidence_lower = evidence.lower()[:50]  # First 50 chars
+        source_lower = source_text.lower()
+        
+        return evidence_lower in source_lower

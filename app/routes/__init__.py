@@ -3,6 +3,8 @@
 
 from app.routes import health
 from app.routes import auth
+from app.routes import folders
+from app.routes import files
 from app.routes import upload
 from app.routes import graph
 from app.routes import query
@@ -13,6 +15,8 @@ from app.routes import websocket
 __all__ = [
     "health",
     "auth",
+    "folders",
+    "files",
     "upload", 
     "graph",
     "query",

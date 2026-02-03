@@ -1,25 +1,15 @@
 """
 Embedding Agent - Phase 7 of the Ingestion Pipeline
 
-Finalizes vector embeddings and commits data to Neo4j.
-This is the final agent that prepares data for storage.
+Generates vector embeddings for entities and chunks.
+Uses Ollama's embedding models for semantic similarity.
 """
-from typing import Any, Dict, List
-from dataclasses import dataclass
+import logging
+from typing import Any, Dict, List, Optional
 
+from app.services.ai_service import get_ollama_service
 
-@dataclass
-class EmbeddedEntity:
-    """Entity with computed embedding vector."""
-    id: str
-    name: str
-    type: str
-    description: str
-    properties: Dict[str, Any]
-    embedding: List[float]  # 768-dimensional vector
-    folder_id: str
-    user_id: str
-    source_file_id: str
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingAgent:
@@ -27,77 +17,129 @@ class EmbeddingAgent:
     Phase 7: Embedding Generation Agent
     
     Responsibilities:
-    - Generate semantic embeddings for all entities
-    - Prepare data for Neo4j storage
-    - Handle the final commit to the graph database
-    - Trigger Typesense indexing
+    - Generate embeddings for entities
+    - Generate embeddings for text chunks
+    - Prepare data for vector similarity search
     """
     
-    EMBEDDING_DIMENSION = 768  # mxbai-embed-large dimension
-    
-    def __init__(self, 
-                 embedding_model: str = "mxbai-embed-large",
-                 ollama_base_url: str = "http://localhost:11434"):
-        self.embedding_model = embedding_model
-        self.ollama_base_url = ollama_base_url
+    def __init__(self, model_name: str = None):
+        self.ollama = get_ollama_service()
+        self.model_name = model_name
         
-    async def embed_and_prepare(self,
-                                entities: List[Any],
-                                relationships: List[Any],
-                                folder_id: str,
-                                user_id: str,
-                                file_id: str) -> Dict[str, Any]:
+    async def embed_entities(
+        self,
+        entities: List[Any],
+    ) -> List[Any]:
         """
-        Generate embeddings and prepare data for storage.
+        Generate embeddings for entities.
         
         Args:
-            entities: Validated entities from Phase 6
-            relationships: Validated relationships from Phase 6
-            folder_id: Target folder ID
-            user_id: Owner user ID
-            file_id: Source file ID
+            entities: List of validated entities
             
         Returns:
-            Dictionary with embedded entities and relationships ready for storage
+            Entities with embeddings added
         """
+        logger.info(f"Generating embeddings for {len(entities)} entities")
+        
         embedded_entities = []
         
         for entity in entities:
-            # Generate embedding for entity
-            embedding = await self._generate_embedding(entity)
+            try:
+                # Build text for embedding
+                name = entity.name if hasattr(entity, 'name') else entity.get('name', '')
+                entity_type = entity.type if hasattr(entity, 'type') else entity.get('type', '')
+                description = entity.description if hasattr(entity, 'description') else entity.get('description', '')
+                
+                embed_text = f"{name}. Type: {entity_type}. {description}"
+                
+                # Generate embedding
+                embedding = await self.ollama.embed(embed_text, self.model_name)
+                
+                # Add embedding to entity
+                if hasattr(entity, 'embedding'):
+                    entity.embedding = embedding
+                else:
+                    entity['embedding'] = embedding
+                
+                embedded_entities.append(entity)
+                
+            except Exception as e:
+                logger.warning(f"Failed to embed entity {name}: {e}")
+                # Still include entity without embedding
+                embedded_entities.append(entity)
+        
+        logger.info(f"Generated embeddings for {len(embedded_entities)} entities")
+        return embedded_entities
+    
+    async def embed_chunks(
+        self,
+        chunks: List[Any],
+    ) -> List[Any]:
+        """
+        Generate embeddings for text chunks.
+        
+        Args:
+            chunks: List of text chunks
             
-            embedded = EmbeddedEntity(
-                id=entity.id,
-                name=entity.name,
-                type=entity.type,
-                description=entity.description,
-                properties=getattr(entity, 'properties', {}),
-                embedding=embedding,
-                folder_id=folder_id,
-                user_id=user_id,
-                source_file_id=file_id,
-            )
-            embedded_entities.append(embedded)
+        Returns:
+            Chunks with embeddings added
+        """
+        logger.info(f"Generating embeddings for {len(chunks)} chunks")
         
-        return {
-            "entities": embedded_entities,
-            "relationships": relationships,
-            "ready_for_commit": True,
+        embedded_chunks = []
+        
+        for chunk in chunks:
+            try:
+                content = chunk.content if hasattr(chunk, 'content') else chunk.get('content', '')
+                
+                if not content.strip():
+                    embedded_chunks.append(chunk)
+                    continue
+                
+                # Generate embedding
+                embedding = await self.ollama.embed(content, self.model_name)
+                
+                # Add embedding to chunk
+                if hasattr(chunk, 'embedding'):
+                    chunk.embedding = embedding
+                else:
+                    chunk['embedding'] = embedding
+                
+                embedded_chunks.append(chunk)
+                
+            except Exception as e:
+                logger.warning(f"Failed to embed chunk: {e}")
+                embedded_chunks.append(chunk)
+        
+        logger.info(f"Generated embeddings for {len(embedded_chunks)} chunks")
+        return embedded_chunks
+    
+    async def embed_query(self, query: str) -> List[float]:
+        """
+        Generate embedding for a search query.
+        
+        Args:
+            query: Search query text
+            
+        Returns:
+            Query embedding vector
+        """
+        try:
+            return await self.ollama.embed(query, self.model_name)
+        except Exception as e:
+            logger.error(f"Failed to embed query: {e}")
+            raise
+    
+    def get_embedding_dimension(self) -> int:
+        """Return the dimension of embeddings for the current model."""
+        # mxbai-embed-large returns 1024-dimensional embeddings
+        # Other models may vary
+        model = self.model_name or self.ollama.embed_model
+        
+        dimension_map = {
+            "mxbai-embed-large": 1024,
+            "nomic-embed-text": 768,
+            "all-minilm": 384,
         }
-    
-    async def _generate_embedding(self, entity: Any) -> List[float]:
-        """Generate embedding vector for an entity."""
-        # Combine name and description for embedding
-        text = f"{getattr(entity, 'name', '')} {getattr(entity, 'description', '')}"
         
-        # TODO: Call Ollama embedding API
-        # POST {ollama_base_url}/api/embeddings
-        # { "model": "mxbai-embed-large", "prompt": text }
-        
-        # Return placeholder
-        return [0.0] * self.EMBEDDING_DIMENSION
-    
-    async def _batch_embed(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for multiple texts in batch."""
-        # TODO: Implement batch embedding for efficiency
-        return [[0.0] * self.EMBEDDING_DIMENSION for _ in texts]
+        return dimension_map.get(model, 768)  # Default to 768

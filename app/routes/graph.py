@@ -10,6 +10,7 @@ from pydantic import BaseModel
 import logging
 
 from app.core.security import get_current_user
+from app.db.connections import get_neo4j
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -23,6 +24,9 @@ class NodeResponse(BaseModel):
     type: str
     description: Optional[str] = None
     properties: Dict[str, Any] = {}
+    degree: int = 0
+    file_id: Optional[str] = None
+    folder_id: Optional[str] = None
     x: Optional[float] = None
     y: Optional[float] = None
     z: Optional[float] = None
@@ -63,14 +67,73 @@ class NodeDetailsResponse(BaseModel):
 async def get_all_graph(
     current_user: dict = Depends(get_current_user),
     limit: int = Query(default=10000, le=100000),
+    neo4j = Depends(get_neo4j),
 ) -> GraphResponse:
     """
     Get all nodes across all folders (Floating Island view).
     
     Limited to prevent browser overload.
     """
-    # TODO: Query Neo4j with user scope
-    return GraphResponse(nodes=[], links=[], total_nodes=0, total_links=0)
+    try:
+        # Query nodes with degree
+        nodes_query = """
+        MATCH (n)
+        OPTIONAL MATCH (n)-[r]-()
+        WITH n, count(DISTINCT r) as degree
+        RETURN n, degree
+        LIMIT $limit
+        """
+        nodes_result = neo4j.execute_query(nodes_query, {"limit": limit})
+        
+        nodes = []
+        node_ids = set()
+        
+        for record in nodes_result.records:
+            node = record["n"]
+            props = dict(node)
+            node_id = props.get("id") or props.get("entity_id") or str(node.element_id)
+            
+            if node_id not in node_ids:
+                node_ids.add(node_id)
+                labels = list(node.labels) if node.labels else ["Unknown"]
+                nodes.append(NodeResponse(
+                    id=node_id,
+                    name=props.get("name", props.get("label", "Unknown")),
+                    type=props.get("type", labels[0] if labels else "Unknown"),
+                    description=props.get("description"),
+                    properties={k: v for k, v in props.items() if k not in ["id", "name", "type", "description", "folder_id", "file_id"]},
+                    degree=record["degree"],
+                    file_id=props.get("file_id"),
+                    folder_id=props.get("folder_id"),
+                ))
+        
+        # Query relationships
+        links_query = """
+        MATCH (a)-[r]->(b)
+        RETURN COALESCE(a.id, a.entity_id, elementId(a)) as source,
+               COALESCE(b.id, b.entity_id, elementId(b)) as target,
+               type(r) as rel_type,
+               r.weight as weight
+        LIMIT $limit
+        """
+        links_result = neo4j.execute_query(links_query, {"limit": limit * 2})
+        
+        links = []
+        for record in links_result.records:
+            source_id = str(record["source"])
+            target_id = str(record["target"])
+            if source_id in node_ids and target_id in node_ids:
+                links.append(LinkResponse(
+                    source=source_id,
+                    target=target_id,
+                    type=record["rel_type"],
+                    strength=record["weight"] or 1.0,
+                ))
+        
+        return GraphResponse(nodes=nodes, links=links, total_nodes=len(nodes), total_links=len(links))
+    except Exception as e:
+        logger.error(f"Error fetching all graph: {e}")
+        return GraphResponse(nodes=[], links=[], total_nodes=0, total_links=0)
 
 
 @router.get("/folder/{folder_id}", response_model=GraphResponse)
@@ -79,65 +142,204 @@ async def get_folder_graph(
     current_user: dict = Depends(get_current_user),
     node_type: Optional[str] = Query(default=None),
     min_connections: int = Query(default=0),
+    limit: int = Query(default=1000, le=10000),
+    neo4j = Depends(get_neo4j),
 ) -> GraphResponse:
     """Get graph data for all files in a folder."""
-    # TODO: Query Neo4j filtered by folder_id
-    return GraphResponse(nodes=[], links=[], total_nodes=0, total_links=0)
+    try:
+        # Build type filter
+        type_filter = ""
+        if node_type:
+            type_filter = f"AND (n.type = '{node_type}' OR '{node_type}' IN labels(n))"
+        
+        # Query nodes
+        nodes_query = f"""
+        MATCH (n)
+        WHERE n.folder_id = $folder_id OR n.folderId = $folder_id
+        {type_filter}
+        OPTIONAL MATCH (n)-[r]-()
+        WITH n, count(DISTINCT r) as degree
+        WHERE degree >= $min_connections
+        RETURN n, degree
+        LIMIT $limit
+        """
+        
+        nodes_result = neo4j.execute_query(nodes_query, {
+            "folder_id": folder_id,
+            "min_connections": min_connections,
+            "limit": limit,
+        })
+        
+        nodes = []
+        node_ids = set()
+        
+        for record in nodes_result.records:
+            node = record["n"]
+            props = dict(node)
+            node_id = props.get("id") or props.get("entity_id") or str(node.element_id)
+            
+            if node_id not in node_ids:
+                node_ids.add(node_id)
+                labels = list(node.labels) if node.labels else ["Unknown"]
+                nodes.append(NodeResponse(
+                    id=node_id,
+                    name=props.get("name", props.get("label", "Unknown")),
+                    type=props.get("type", labels[0] if labels else "Unknown"),
+                    description=props.get("description"),
+                    properties={k: v for k, v in props.items() if k not in ["id", "name", "type", "description", "folder_id", "file_id"]},
+                    degree=record["degree"],
+                    file_id=props.get("file_id"),
+                    folder_id=props.get("folder_id"),
+                ))
+        
+        # Query relationships within folder
+        links_query = """
+        MATCH (a)-[r]->(b)
+        WHERE (a.folder_id = $folder_id OR a.folderId = $folder_id)
+          AND (b.folder_id = $folder_id OR b.folderId = $folder_id)
+        RETURN COALESCE(a.id, a.entity_id, elementId(a)) as source,
+               COALESCE(b.id, b.entity_id, elementId(b)) as target,
+               type(r) as rel_type,
+               r.weight as weight,
+               r.description as description
+        LIMIT $limit
+        """
+        
+        links_result = neo4j.execute_query(links_query, {
+            "folder_id": folder_id,
+            "limit": limit * 2,
+        })
+        
+        links = []
+        for record in links_result.records:
+            source_id = str(record["source"])
+            target_id = str(record["target"])
+            if source_id in node_ids and target_id in node_ids:
+                links.append(LinkResponse(
+                    source=source_id,
+                    target=target_id,
+                    type=record["rel_type"],
+                    strength=record["weight"] or 1.0,
+                ))
+        
+        return GraphResponse(nodes=nodes, links=links, total_nodes=len(nodes), total_links=len(links))
+    except Exception as e:
+        logger.error(f"Error fetching folder graph: {e}")
+        return GraphResponse(nodes=[], links=[], total_nodes=0, total_links=0)
 
 
 @router.get("/file/{file_id}", response_model=GraphResponse)
 async def get_file_graph(
     file_id: str,
     current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
 ) -> GraphResponse:
     """Get graph data for a specific file."""
-    # TODO: Query Neo4j filtered by file_id
-    return GraphResponse(nodes=[], links=[], total_nodes=0, total_links=0)
-
-
-@router.get("/files", response_model=GraphResponse)
-async def get_multi_file_graph(
-    ids: str = Query(..., description="Comma-separated file IDs"),
-    current_user: dict = Depends(get_current_user),
-) -> GraphResponse:
-    """Get graph data for multiple selected files."""
-    file_ids = [id.strip() for id in ids.split(",")]
-    # TODO: Query Neo4j filtered by file_ids
-    return GraphResponse(nodes=[], links=[], total_nodes=0, total_links=0)
-
-
-@router.get("/chunk/{chunk_id}", response_model=GraphResponse)
-async def get_chunk_graph(
-    chunk_id: str,
-    current_user: dict = Depends(get_current_user),
-) -> GraphResponse:
-    """Get graph data for a specific text chunk."""
-    # TODO: Query Neo4j filtered by chunk_id
-    return GraphResponse(nodes=[], links=[], total_nodes=0, total_links=0)
+    try:
+        # Query nodes
+        nodes_query = """
+        MATCH (n)
+        WHERE n.file_id = $file_id OR n.fileId = $file_id
+        OPTIONAL MATCH (n)-[r]-()
+        WITH n, count(DISTINCT r) as degree
+        RETURN n, degree
+        """
+        nodes_result = neo4j.execute_query(nodes_query, {"file_id": file_id})
+        
+        nodes = []
+        node_ids = set()
+        for record in nodes_result.records:
+            node = record["n"]
+            props = dict(node)
+            node_id = props.get("id") or props.get("entity_id") or str(node.element_id)
+            if node_id not in node_ids:
+                node_ids.add(node_id)
+                labels = list(node.labels) if node.labels else ["Unknown"]
+                nodes.append(NodeResponse(
+                    id=node_id,
+                    name=props.get("name", props.get("label", "Unknown")),
+                    type=props.get("type", labels[0] if labels else "Unknown"),
+                    description=props.get("description"),
+                    properties={k: v for k, v in props.items() if k not in ["id", "name", "type", "description", "folder_id", "file_id"]},
+                    degree=record["degree"],
+                    file_id=props.get("file_id"),
+                    folder_id=props.get("folder_id"),
+                ))
+        
+        # Query relationships
+        links_query = """
+        MATCH (a)-[r]->(b)
+        WHERE (a.file_id = $file_id OR a.fileId = $file_id)
+          AND (b.file_id = $file_id OR b.fileId = $file_id)
+        RETURN COALESCE(a.id, a.entity_id, elementId(a)) as source,
+               COALESCE(b.id, b.entity_id, elementId(b)) as target,
+               type(r) as rel_type,
+               r.weight as weight
+        """
+        links_result = neo4j.execute_query(links_query, {"file_id": file_id})
+        
+        links = []
+        for record in links_result.records:
+            source_id = str(record["source"])
+            target_id = str(record["target"])
+            if source_id in node_ids and target_id in node_ids:
+                links.append(LinkResponse(
+                    source=source_id,
+                    target=target_id,
+                    type=record["rel_type"],
+                    strength=record["weight"] or 1.0,
+                ))
+                
+        return GraphResponse(nodes=nodes, links=links, total_nodes=len(nodes), total_links=len(links))
+    except Exception as e:
+        logger.error(f"Error fetching file graph: {e}")
+        return GraphResponse(nodes=[], links=[], total_nodes=0, total_links=0)
 
 
 @router.get("/node/{node_id}/details", response_model=NodeDetailsResponse)
 async def get_node_details(
     node_id: str,
     current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
 ) -> NodeDetailsResponse:
     """
     Get detailed information for a specific node (lazy-loaded).
-    
-    This is called on node click to avoid loading full metadata upfront.
     """
-    # TODO: Query Neo4j for full node details
-    return NodeDetailsResponse(
-        id=node_id,
-        name="Example Node",
-        type="Person",
-        description="Detailed description",
-        properties={},
-        source_files=[],
-        created_at="2026-02-03T00:00:00Z",
-        created_by="user_123",
-        connection_count=0,
-    )
+    try:
+        query = """
+        MATCH (n)
+        WHERE n.id = $node_id OR n.entity_id = $node_id OR elementId(n) = $node_id
+        OPTIONAL MATCH (n)-[r]-()
+        RETURN n, count(DISTINCT r) as degree
+        LIMIT 1
+        """
+        result = neo4j.execute_query(query, {"node_id": node_id})
+        if not result.records:
+            raise HTTPException(status_code=404, detail="Node not found")
+            
+        record = result.records[0]
+        node = record["n"]
+        props = dict(node)
+        labels = list(node.labels)
+        
+        # Get source files (if tracking enabled)
+        # This assumes we have a relationship or property tracking source
+        source_files = [props.get("file_id")] if props.get("file_id") else []
+        
+        return NodeDetailsResponse(
+            id=node_id,
+            name=props.get("name", "Unknown"),
+            type=labels[0] if labels else "Unknown",
+            description=props.get("description", "No description available"),
+            properties={k: v for k, v in props.items() if k not in ["id", "name", "type", "description"]},
+            source_files=source_files,
+            created_at=props.get("created_at", ""),
+            created_by=props.get("created_by", "system"),
+            connection_count=record["degree"],
+        )
+    except Exception as e:
+        logger.error(f"Error fetching node details: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/expand/{node_id}", response_model=GraphResponse)
@@ -146,15 +348,62 @@ async def expand_node(
     depth: int = Query(default=1, le=3),
     relationship_types: Optional[str] = Query(default=None),
     current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
 ) -> GraphResponse:
     """
     Expand a node to show its connections (Neo4j Browser style).
-    
-    Returns connected nodes up to specified depth.
     """
-    rel_types = relationship_types.split(",") if relationship_types else None
-    # TODO: Query Neo4j for connected nodes
-    return GraphResponse(nodes=[], links=[], total_nodes=0, total_links=0)
+    try:
+        rel_clause = ""
+        if relationship_types:
+            types = relationship_types.split(",")
+            rel_clause = ":" + "|".join(types)
+            
+        query = f"""
+        MATCH (center)
+        WHERE center.id = $node_id OR center.entity_id = $node_id OR elementId(center) = $node_id
+        MATCH p = (center)-[r{rel_clause}*1..{depth}]-(neighbor)
+        WITH neighbor, relationships(p) as rels
+        OPTIONAL MATCH (neighbor)-[r2]-()
+        RETURN neighbor, rels, count(DISTINCT r2) as degree
+        LIMIT 100
+        """
+        
+        result = neo4j.execute_query(query, {"node_id": node_id})
+        
+        nodes = []
+        links = []
+        node_ids = set()
+        
+        for record in result.records:
+            neighbor = record["neighbor"]
+            props = dict(neighbor)
+            n_id = props.get("id") or props.get("entity_id") or str(neighbor.element_id)
+            
+            if n_id not in node_ids:
+                node_ids.add(n_id)
+                nodes.append(NodeResponse(
+                    id=n_id,
+                    name=props.get("name", "Unknown"),
+                    type=list(neighbor.labels)[0] if neighbor.labels else "Unknown",
+                    degree=record["degree"],
+                    properties={k: v for k, v in props.items() if k not in ["id", "name", "type"]}
+                ))
+            
+            for rel in record["rels"]:
+                links.append(LinkResponse(
+                    source=props.get("id", str(rel.start_node.id)),
+                    target=props.get("id", str(rel.end_node.id)),
+                    type=rel.type
+                ))
+        
+        # Dedup links
+        unique_links = {f"{l.source}-{l.target}-{l.type}": l for l in links}.values()
+        
+        return GraphResponse(nodes=nodes, links=list(unique_links), total_nodes=len(nodes), total_links=len(unique_links))
+    except Exception as e:
+        logger.error(f"Error expanding node: {e}")
+        return GraphResponse(nodes=[], links=[], total_nodes=0, total_links=0)
 
 
 @router.get("/path/{source_id}/{target_id}")
@@ -162,34 +411,32 @@ async def get_shortest_path(
     source_id: str,
     target_id: str,
     current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
 ) -> Dict[str, Any]:
     """Find shortest path between two nodes."""
-    # TODO: Use Neo4j shortest path algorithm
-    return {
-        "path_exists": False,
-        "node_ids": [],
-        "link_ids": [],
-        "length": 0,
-    }
+    try:
+        query = """
+        MATCH p = shortestPath((a)-[*..10]-(b))
+        WHERE (a.id = $source_id OR elementId(a) = $source_id)
+          AND (b.id = $target_id OR elementId(b) = $target_id)
+        RETURN 
+            [n IN nodes(p) | COALESCE(n.id, elementId(n))] as node_ids,
+            [r IN relationships(p) | elementId(r)] as link_ids,
+            length(p) as hops
+        """
+        result = neo4j.execute_query(query, {"source_id": source_id, "target_id": target_id})
+        
+        if not result.records:
+            return {"path_exists": False, "node_ids": [], "link_ids": [], "length": 0}
+            
+        record = result.records[0]
+        return {
+            "path_exists": True,
+            "node_ids": record["node_ids"],
+            "link_ids": record["link_ids"],
+            "length": record["hops"]
+        }
+    except Exception as e:
+        logger.error(f"Error finding path: {e}")
+        return {"path_exists": False, "node_ids": [], "link_ids": [], "length": 0}
 
-
-@router.post("/compare")
-async def compare_clusters(
-    left: Dict[str, Any],
-    right: Dict[str, Any],
-    include_bridges: bool = True,
-    include_similarity: bool = True,
-    current_user: dict = Depends(get_current_user),
-) -> Dict[str, Any]:
-    """Compare two clusters/files/folders for common entities and bridges."""
-    # TODO: Implement cluster comparison
-    return {
-        "left_nodes": [],
-        "right_nodes": [],
-        "common_entities": [],
-        "unique_left": [],
-        "unique_right": [],
-        "bridges": [],
-        "semantic_similarity": 0.0,
-        "structural_similarity": 0.0,
-    }

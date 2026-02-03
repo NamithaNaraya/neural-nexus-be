@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routes import health, auth, upload, graph, query, analytics, sse, websocket
+from app.routes import health, auth, folders, files, upload, graph, query, analytics, sse, websocket
 from app.db.connections import (
     init_neo4j, 
     close_neo4j, 
@@ -123,6 +123,8 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 # Include routers
 app.include_router(health.router, prefix="/api/v1", tags=["Health"])
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
+app.include_router(folders.router, prefix="/api/v1/folders", tags=["Folders"])
+app.include_router(files.router, prefix="/api/v1/files", tags=["Files"])
 app.include_router(upload.router, prefix="/api/v1", tags=["Upload"])
 app.include_router(graph.router, prefix="/api/v1/graph", tags=["Graph"])
 app.include_router(query.router, prefix="/api/v1", tags=["Query"])
