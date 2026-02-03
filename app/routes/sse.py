@@ -13,7 +13,7 @@ import asyncio
 import json
 import logging
 
-from app.routes.auth import get_current_user, TokenData
+from app.core.security import get_current_user
 from app.db.connections import get_redis_client
 
 router = APIRouter()
@@ -60,7 +60,7 @@ async def event_generator(user_id: str, request: Request) -> AsyncGenerator[str,
 async def stream_task_events(
     user_id: str,
     request: Request,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> StreamingResponse:
     """
     Stream real-time task events to the client.

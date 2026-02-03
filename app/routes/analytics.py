@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 import logging
 
-from app.routes.auth import get_current_user, TokenData
+from app.core.security import get_current_user
 from app.algorithms import (
     DegreeDistribution,
     EntitySimilarity,
@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 async def run_pagerank(
     folder_id: Optional[str] = None,
     top_k: int = Query(default=10, le=100),
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Run PageRank algorithm to identify influential nodes."""
     # TODO: Use Neo4j GDS PageRank
@@ -51,7 +51,7 @@ async def run_pagerank(
 async def run_betweenness(
     folder_id: Optional[str] = None,
     top_k: int = Query(default=10, le=100),
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Run Betweenness Centrality to find bridge nodes."""
     # TODO: Use Neo4j GDS Betweenness
@@ -67,7 +67,7 @@ async def run_betweenness(
 @router.get("/community/louvain")
 async def run_louvain(
     folder_id: Optional[str] = None,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Run Louvain community detection."""
     clustering = TopicClustering()
@@ -77,7 +77,7 @@ async def run_louvain(
 @router.get("/community/leiden")
 async def run_leiden(
     folder_id: Optional[str] = None,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Run Leiden community detection (improved Louvain)."""
     clustering = TopicClustering()
@@ -89,7 +89,7 @@ async def run_leiden(
 async def run_knn(
     node_id: str,
     top_k: int = Query(default=5, le=50),
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Find K nearest neighbors using similarity."""
     similarity = EntitySimilarity()
@@ -105,7 +105,7 @@ async def run_knn(
 @router.get("/health")
 async def run_graph_health(
     folder_id: Optional[str] = None,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Run comprehensive graph health audit."""
     health = GraphHealth()
@@ -115,7 +115,7 @@ async def run_graph_health(
 @router.get("/completeness")
 async def run_knowledge_completeness(
     folder_id: Optional[str] = None,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Analyze knowledge completeness score."""
     completeness = KnowledgeCompleteness()
@@ -125,7 +125,7 @@ async def run_knowledge_completeness(
 @router.get("/degree-distribution")
 async def run_degree_distribution(
     folder_id: Optional[str] = None,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Analyze degree distribution and hub nodes."""
     dd = DegreeDistribution()
@@ -137,7 +137,7 @@ async def run_link_prediction(
     folder_id: Optional[str] = None,
     method: str = Query(default="ml"),
     top_k: int = Query(default=20, le=100),
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Predict missing links (Ghost Lines)."""
     lp = LinkPrediction()
@@ -148,7 +148,7 @@ async def run_link_prediction(
 async def run_missing_relationships(
     folder_id: Optional[str] = None,
     min_confidence: float = Query(default=0.7, ge=0.0, le=1.0),
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Find definite missing relationships."""
     mr = MissingRelationships()
@@ -159,7 +159,7 @@ async def run_missing_relationships(
 async def run_incomplete_entities(
     folder_id: Optional[str] = None,
     threshold: float = Query(default=0.7, ge=0.0, le=1.0),
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Find entities with missing properties."""
     ie = IncompleteEntities()
@@ -169,7 +169,7 @@ async def run_incomplete_entities(
 @router.get("/structural-holes")
 async def run_structural_holes(
     folder_id: Optional[str] = None,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Find structural holes for bridging opportunities."""
     sh = StructuralHoles()
@@ -180,7 +180,7 @@ async def run_structural_holes(
 async def run_hits(
     folder_id: Optional[str] = None,
     iterations: int = Query(default=20, le=100),
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Run HITS algorithm for hubs and authorities."""
     hits = HITS()
@@ -190,7 +190,7 @@ async def run_hits(
 @router.get("/k-core")
 async def run_k_core(
     folder_id: Optional[str] = None,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Run K-Core decomposition."""
     kcore = KCore()
@@ -202,7 +202,7 @@ async def run_k_core(
 async def train_ml_pipeline(
     pipeline_type: str,
     folder_id: Optional[str] = None,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Train an ML pipeline (link-prediction, node-classification)."""
     # TODO: Implement Neo4j GDS ML pipelines
@@ -215,7 +215,7 @@ async def train_ml_pipeline(
 
 @router.get("/ml/models")
 async def list_ml_models(
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """List trained ML models."""
     # TODO: Query Neo4j for trained models
@@ -225,7 +225,7 @@ async def list_ml_models(
 @router.post("/ml/predict/{model_name}")
 async def run_ml_prediction(
     model_name: str,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Run prediction using a trained model."""
     return {

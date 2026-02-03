@@ -70,15 +70,25 @@ async def create_fulltext_indexes() -> None:
         except Exception as e:
             logger.debug(f"Full-text index exists: {e}")
         
-        # Relationship search index
+        # Relationship search index (for Deep Search)
         try:
             await session.run("""
                 CREATE FULLTEXT INDEX rel_search IF NOT EXISTS
-                FOR ()-[r:RELATIONSHIP]-() ON EACH [r.description, r.type]
+                FOR ()-[r:RELATIONSHIP]-() ON EACH [r.description, r.type, r.category]
             """)
             logger.info("Created relationship full-text search index")
         except Exception as e:
             logger.debug(f"Relationship full-text index exists: {e}")
+        
+        # Relationship type index (for query optimization)
+        try:
+            await session.run("""
+                CREATE INDEX rel_type_idx IF NOT EXISTS 
+                FOR ()-[r:RELATIONSHIP]-() ON (r.type)
+            """)
+            logger.info("Created relationship type index")
+        except Exception as e:
+            logger.debug(f"Relationship type index exists: {e}")
 
 
 async def create_vector_index(dimension: int = 768) -> None:

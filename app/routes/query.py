@@ -10,7 +10,7 @@ from pydantic import BaseModel
 import logging
 import uuid
 
-from app.routes.auth import get_current_user, TokenData
+from app.core.security import get_current_user
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ class QueryResponse(BaseModel):
 @router.post("/query", response_model=QueryResponse)
 async def run_query(
     request: QueryRequest,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> QueryResponse:
     """
     Execute a natural language query using Hybrid RAG.
@@ -81,7 +81,7 @@ async def run_query(
 async def get_chat_history(
     session_id: str,
     limit: int = 20,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Get chat history for a session (Sliding Window: last 5 for context)."""
     # TODO: Query PostgreSQL for chat history
@@ -94,7 +94,7 @@ async def get_chat_history(
 
 @router.get("/chat/sessions")
 async def list_chat_sessions(
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
     """List all chat sessions for the current user."""
     # TODO: Query PostgreSQL for user's sessions
@@ -104,7 +104,7 @@ async def list_chat_sessions(
 @router.delete("/chat/session/{session_id}")
 async def delete_chat_session(
     session_id: str,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, str]:
     """Delete a chat session and its history."""
     # TODO: Delete from PostgreSQL

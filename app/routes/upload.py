@@ -10,10 +10,11 @@ from pydantic import BaseModel
 import uuid
 import logging
 
-from app.routes.auth import get_current_user, TokenData
+from app.core.security import get_current_user
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
 
 
 class UploadResponse(BaseModel):
@@ -38,7 +39,7 @@ class UploadStatus(BaseModel):
 async def upload_file(
     file: UploadFile = File(...),
     folder_id: str = Form(...),
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> UploadResponse:
     """
     Upload a file for knowledge extraction.
@@ -63,7 +64,7 @@ async def upload_file(
     # TODO: Create file record in PostgreSQL
     # TODO: Queue Celery task for ingestion pipeline
     
-    logger.info(f"File uploaded: {file.filename} by user {current_user.user_id}")
+    logger.info(f"File uploaded: {file.filename} by user {current_user['id']}")
     
     return UploadResponse(
         file_id=file_id,
@@ -77,7 +78,7 @@ async def upload_file(
 @router.get("/upload/status/{file_id}", response_model=UploadStatus)
 async def get_upload_status(
     file_id: str,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> UploadStatus:
     """Get the status of a file upload/ingestion."""
     # TODO: Query PostgreSQL for file status
@@ -95,7 +96,7 @@ async def get_upload_status(
 @router.delete("/upload/{file_id}")
 async def cancel_upload(
     file_id: str,
-    current_user: TokenData = Depends(get_current_user),
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, str]:
     """Cancel an in-progress upload/ingestion."""
     # TODO: Cancel Celery task
