@@ -1,0 +1,48 @@
+# Backend Dependencies
+# Neural Nexus Knowledge Graph Platform
+
+# === Core Framework ===
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+
+# === Database Drivers ===
+neo4j==5.16.0
+sqlalchemy[asyncio]==2.0.25
+asyncpg==0.29.0
+alembic==1.13.1
+
+# === Redis & Task Queue ===
+redis==5.0.1
+celery[redis]==5.3.6
+flower==2.0.1
+
+# === AI & ML ===
+langchain==0.1.0
+langgraph==0.0.20
+httpx==0.26.0
+numpy==1.26.3
+scikit-learn==1.4.0
+
+# === File Processing ===
+python-multipart==0.0.6
+pypdf2==3.0.1
+pandas==2.1.4
+
+# === Azure Storage ===
+azure-storage-blob==12.19.0
+
+# === Security ===
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+# === Utilities ===
+python-dotenv==1.0.0
+tenacity==8.2.3
+
+# === Development ===
+pytest==7.4.4
+pytest-asyncio==0.23.3
+black==23.12.1
+ruff==0.1.11
