@@ -343,3 +343,239 @@ async def list_folder_files(
         )
         for row in rows
     ]
+
+
+# === Permission Management Routes ===
+
+class FolderPermission(BaseModel):
+    """Permission entry for a folder."""
+    user_id: str
+    user_email: Optional[str] = None
+    permission: str  # 'read', 'write', 'admin'
+    granted_at: Optional[str] = None
+
+
+class PermissionGrant(BaseModel):
+    """Request to grant a permission."""
+    user_email: str
+    permission: str = "read"
+
+
+class PermissionsResponse(BaseModel):
+    """Response with all folder permissions."""
+    folder_id: str
+    owner_id: str
+    permissions: List[FolderPermission]
+
+
+@router.get("/{folder_id}/permissions", response_model=PermissionsResponse)
+async def get_folder_permissions(
+    folder_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> PermissionsResponse:
+    """
+    Get all permissions for a folder.
+    Only the folder owner can view permissions.
+    """
+    user_id = current_user["id"]
+    
+    async with get_postgres_session() as session:
+        # Check folder exists and user is owner
+        folder = await session.execute(
+            text("""
+                SELECT id, user_id FROM neural_nexus.folders 
+                WHERE id = :folder_id
+            """),
+            {"folder_id": folder_id}
+        )
+        row = folder.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        
+        if str(row.user_id) != user_id:
+            # Check if user has admin permission
+            perm = await session.execute(
+                text("""
+                    SELECT permission FROM neural_nexus.folder_permissions 
+                    WHERE folder_id = :folder_id AND user_id = :user_id
+                """),
+                {"folder_id": folder_id, "user_id": user_id}
+            )
+            perm_row = perm.fetchone()
+            if not perm_row or perm_row.permission != 'admin':
+                raise HTTPException(status_code=403, detail="Not authorized to view permissions")
+        
+        # Get all permissions
+        perms = await session.execute(
+            text("""
+                SELECT 
+                    fp.user_id, 
+                    u.email as user_email,
+                    fp.permission,
+                    fp.granted_at
+                FROM neural_nexus.folder_permissions fp
+                LEFT JOIN neural_nexus.users u ON u.id = fp.user_id
+                WHERE fp.folder_id = :folder_id
+                ORDER BY fp.granted_at DESC
+            """),
+            {"folder_id": folder_id}
+        )
+        perm_rows = perms.fetchall()
+    
+    return PermissionsResponse(
+        folder_id=folder_id,
+        owner_id=str(row.user_id),
+        permissions=[
+            FolderPermission(
+                user_id=str(p.user_id),
+                user_email=p.user_email,
+                permission=p.permission,
+                granted_at=p.granted_at.isoformat() if p.granted_at else None,
+            )
+            for p in perm_rows
+        ]
+    )
+
+
+@router.post("/{folder_id}/permissions")
+async def grant_folder_permission(
+    folder_id: str,
+    data: PermissionGrant,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """
+    Grant a permission to a user for a folder.
+    Only the folder owner or users with admin permission can grant.
+    """
+    user_id = current_user["id"]
+    now = datetime.utcnow()
+    
+    if data.permission not in ['read', 'write', 'admin']:
+        raise HTTPException(status_code=400, detail="Invalid permission level")
+    
+    async with get_postgres_session() as session:
+        # Check folder exists and user is owner or admin
+        folder = await session.execute(
+            text("""
+                SELECT id, user_id FROM neural_nexus.folders 
+                WHERE id = :folder_id
+            """),
+            {"folder_id": folder_id}
+        )
+        row = folder.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        
+        is_owner = str(row.user_id) == user_id
+        if not is_owner:
+            perm = await session.execute(
+                text("""
+                    SELECT permission FROM neural_nexus.folder_permissions 
+                    WHERE folder_id = :folder_id AND user_id = :user_id
+                """),
+                {"folder_id": folder_id, "user_id": user_id}
+            )
+            perm_row = perm.fetchone()
+            if not perm_row or perm_row.permission != 'admin':
+                raise HTTPException(status_code=403, detail="Not authorized to grant permissions")
+        
+        # Find target user by email
+        target = await session.execute(
+            text("SELECT id FROM neural_nexus.users WHERE email = :email"),
+            {"email": data.user_email}
+        )
+        target_row = target.fetchone()
+        
+        if not target_row:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        target_user_id = str(target_row.id)
+        
+        # Upsert permission
+        await session.execute(
+            text("""
+                INSERT INTO neural_nexus.folder_permissions 
+                (folder_id, user_id, permission, granted_at, granted_by)
+                VALUES (:folder_id, :user_id, :permission, :granted_at, :granted_by)
+                ON CONFLICT (folder_id, user_id) 
+                DO UPDATE SET permission = :permission, granted_at = :granted_at
+            """),
+            {
+                "folder_id": folder_id,
+                "user_id": target_user_id,
+                "permission": data.permission,
+                "granted_at": now,
+                "granted_by": user_id,
+            }
+        )
+        await session.commit()
+    
+    logger.info(f"Granted {data.permission} permission on folder {folder_id} to {data.user_email}")
+    
+    return {
+        "message": f"Permission '{data.permission}' granted to {data.user_email}",
+        "folder_id": folder_id,
+        "user_email": data.user_email,
+        "permission": data.permission,
+    }
+
+
+@router.delete("/{folder_id}/permissions/{target_user_id}")
+async def revoke_folder_permission(
+    folder_id: str,
+    target_user_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """
+    Revoke a user's permission for a folder.
+    Only the folder owner or users with admin permission can revoke.
+    """
+    user_id = current_user["id"]
+    
+    async with get_postgres_session() as session:
+        # Check folder exists and user is owner or admin
+        folder = await session.execute(
+            text("""
+                SELECT id, user_id FROM neural_nexus.folders 
+                WHERE id = :folder_id
+            """),
+            {"folder_id": folder_id}
+        )
+        row = folder.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        
+        is_owner = str(row.user_id) == user_id
+        if not is_owner:
+            perm = await session.execute(
+                text("""
+                    SELECT permission FROM neural_nexus.folder_permissions 
+                    WHERE folder_id = :folder_id AND user_id = :user_id
+                """),
+                {"folder_id": folder_id, "user_id": user_id}
+            )
+            perm_row = perm.fetchone()
+            if not perm_row or perm_row.permission != 'admin':
+                raise HTTPException(status_code=403, detail="Not authorized to revoke permissions")
+        
+        # Delete permission
+        await session.execute(
+            text("""
+                DELETE FROM neural_nexus.folder_permissions 
+                WHERE folder_id = :folder_id AND user_id = :target_user_id
+            """),
+            {"folder_id": folder_id, "target_user_id": target_user_id}
+        )
+        await session.commit()
+    
+    logger.info(f"Revoked permission on folder {folder_id} from user {target_user_id}")
+    
+    return {
+        "message": "Permission revoked",
+        "folder_id": folder_id,
+        "user_id": target_user_id,
+    }
+

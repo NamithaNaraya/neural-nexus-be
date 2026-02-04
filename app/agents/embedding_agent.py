@@ -53,7 +53,7 @@ class EmbeddingAgent:
                 embed_text = f"{name}. Type: {entity_type}. {description}"
                 
                 # Generate embedding
-                embedding = await self.ollama.embed(embed_text, self.model_name)
+                embedding = await self.ollama.embed(embed_text)
                 
                 # Add embedding to entity
                 if hasattr(entity, 'embedding'):
@@ -97,7 +97,7 @@ class EmbeddingAgent:
                     continue
                 
                 # Generate embedding
-                embedding = await self.ollama.embed(content, self.model_name)
+                embedding = await self.ollama.embed(content)
                 
                 # Add embedding to chunk
                 if hasattr(chunk, 'embedding'):
@@ -125,7 +125,7 @@ class EmbeddingAgent:
             Query embedding vector
         """
         try:
-            return await self.ollama.embed(query, self.model_name)
+            return await self.ollama.embed(query)
         except Exception as e:
             logger.error(f"Failed to embed query: {e}")
             raise

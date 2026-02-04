@@ -19,6 +19,7 @@ from app.agents.deduplication_agent import DeduplicationAgent
 from app.agents.validation_agent import ValidationAgent
 from app.agents.embedding_agent import EmbeddingAgent
 from app.agents.storage_agent import StorageAgent
+from app.services.graph_service import get_graph_service
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,7 @@ class PipelineOrchestrator:
         self.validation_agent = ValidationAgent()
         self.embedding_agent = EmbeddingAgent()
         self.storage_agent = StorageAgent()
+        self.graph_service = get_graph_service()
         
         self.progress_callback = progress_callback
         self.total_phases = 8  # Including storage
@@ -252,7 +254,11 @@ class PipelineOrchestrator:
                 )
                 
                 # Store in temporary state for review
-                # TODO: Implement review queue storage
+                await self.storage_agent.store_staging(
+                    file_id=file_id,
+                    entities=validated_entities,
+                    relationships=validated_relationships,
+                )
                 
                 duration = (datetime.utcnow() - start_time).total_seconds()
                 
@@ -316,6 +322,10 @@ class PipelineOrchestrator:
                     "chunks_stored": chunk_count,
                 }
             )
+            
+            # Phase 9: Graph Structural Enrichment (FastRP)
+            await self._report_progress(PipelinePhase.STORAGE, 8, "Generating graph structural embeddings (FastRP)...")
+            await self.graph_service.run_fastrp_node_embeddings(folder_id)
             
             await self._report_progress(
                 PipelinePhase.COMPLETED, 8,

@@ -119,13 +119,30 @@ PRIORITY: Find errors over confirming validity. Be strict!"""
                 all_issues.extend(result["issues"])
             elif result["action"] == "flag":
                 flagged_count += 1
-                entity.confidence = result.get("confidence", 0.5)
+                
+                # Update confidence
+                if hasattr(entity, 'confidence'):
+                    entity.confidence = result.get("confidence", 0.5)
+                elif isinstance(entity, dict):
+                    entity['confidence'] = result.get("confidence", 0.5)
+
+                # Update properties
                 if hasattr(entity, 'properties'):
+                    if entity.properties is None:
+                        entity.properties = {}
                     entity.properties["needs_review"] = True
+                elif isinstance(entity, dict):
+                    if entity.get("properties") is None:
+                        entity["properties"] = {}
+                    entity["properties"]["needs_review"] = True
+                    
                 validated_entities.append(entity)
                 all_issues.extend(result["issues"])
             else:
-                entity.confidence = result.get("confidence", 0.9)
+                if hasattr(entity, 'confidence'):
+                    entity.confidence = result.get("confidence", 0.9)
+                elif isinstance(entity, dict):
+                    entity['confidence'] = result.get("confidence", 0.9)
                 validated_entities.append(entity)
         
         # Validate relationships

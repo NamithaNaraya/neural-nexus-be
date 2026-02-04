@@ -16,7 +16,8 @@ from sqlalchemy import text
 
 from app.core.security import get_current_user
 from app.db.connections import get_postgres_session
-from app.agents.pipeline import run_pipeline, PipelineResult
+from app.agents.pipeline import PipelineResult
+from app.agents.langgraph_pipeline import run_langgraph_pipeline
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -80,15 +81,56 @@ async def _process_file_async(
     user_id: str,
     file_type: str,
 ) -> None:
-    """Background task to process file through the pipeline."""
+    """Background task to process file through the pipeline with SSE progress updates."""
+    from app.routes.sse import publish_ingestion_progress
+    
+    async def progress_callback(progress):
+        """Send progress updates via SSE."""
+        try:
+            await publish_ingestion_progress(
+                user_id=user_id,
+                file_id=file_id,
+                phase=progress.phase.value,
+                progress=progress.progress_percent,
+                message=progress.message,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to publish progress: {e}")
+    
     try:
-        result = await run_pipeline(
+        final_state = await run_langgraph_pipeline(
             content=content,
             file_id=file_id,
             folder_id=folder_id,
             user_id=user_id,
             file_type=file_type,
             auto_approve=False,  # Require human review for flagged items
+            progress_callback=progress_callback,
+        )
+        
+        # Transform LangGraph state to PipelineResult for the completion event
+        success = final_state.get("status") in ["completed", "paused"]
+        result = PipelineResult(
+            success=success,
+            file_id=file_id,
+            folder_id=folder_id,
+            entity_count=len(final_state.get("entity_id_map", {})),
+            relationship_count=len(final_state.get("relationships", [])),
+            chunk_count=len(final_state.get("chunks", [])),
+            requires_review=final_state.get("requires_review", False),
+            validation_issues=final_state.get("validation_issues", []),
+            error_message=final_state.get("error"),
+            duration_seconds=(datetime.utcnow() - final_state.get("start_time")).total_seconds()
+        )
+        
+        # Send completion event
+        await publish_ingestion_progress(
+            user_id=user_id,
+            file_id=file_id,
+            phase="completed" if result.success else "failed",
+            progress=100 if result.success else 0,
+            message=f"Completed: {result.entity_count} entities, {result.relationship_count} relationships" 
+                    if result.success else f"Failed: {result.error_message}",
         )
         
         if result.success:
@@ -99,6 +141,16 @@ async def _process_file_async(
             
     except Exception as e:
         logger.error(f"Background processing failed for file {file_id}: {e}")
+        
+        # Send error event
+        await publish_ingestion_progress(
+            user_id=user_id,
+            file_id=file_id,
+            phase="failed",
+            progress=0,
+            message=f"Error: {str(e)}",
+        )
+        
         # Update file status to failed
         from app.agents.storage_agent import StorageAgent
         storage = StorageAgent()

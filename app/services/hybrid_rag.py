@@ -1,440 +1,258 @@
 """
-Hybrid RAG Service
+Hybrid RAG Service - LangGraph refactor
 
 Vector + Graph reasoning chain for natural language queries.
 Uses LangGraph for orchestration with sliding window context.
 """
 import logging
-from typing import Dict, Any, List, Optional, Tuple
-from dataclasses import dataclass
-from datetime import datetime
 import json
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Tuple, Annotated, TypedDict, Union
+
+from langgraph.graph import StateGraph, END
 
 logger = logging.getLogger(__name__)
 
 # Sliding window size for conversation context
 SLIDING_WINDOW_SIZE = 5
 
-
-@dataclass
-class ChatMessage:
-    """Single chat message."""
+class ChatMessage(TypedDict):
+    """Single chat message for LangGraph state."""
     role: str  # 'user' or 'assistant'
     content: str
-    timestamp: datetime
-    citations: List[Dict[str, Any]] = None
-    
+    timestamp: str
+    citations: Optional[List[Dict[str, Any]]]
 
-@dataclass
-class Citation:
-    """Source citation for an answer."""
-    node_id: str
-    node_name: str
-    chunk_text: str
-    confidence: float
-    source_file: str = None
-
-
-class ConversationMemory:
+class RAGState(TypedDict):
     """
-    Sliding window conversation memory.
-    Keeps last N messages for context, optimizing for performance.
+    State for the Hybrid RAG LangGraph.
     """
+    # Inputs
+    question: str
+    session_id: str
+    scope: Optional[Dict[str, Any]]
     
-    def __init__(self, window_size: int = SLIDING_WINDOW_SIZE):
-        self.window_size = window_size
-        self._sessions: Dict[str, List[ChatMessage]] = {}
+    # Context
+    history: List[Dict[str, str]]
+    enhanced_question: str
+    vector_results: List[Dict[str, Any]]
+    graph_context: Dict[str, Any]
     
-    def add_message(self, session_id: str, role: str, content: str, citations: List = None):
-        """Add a message to the session."""
-        if session_id not in self._sessions:
-            self._sessions[session_id] = []
+    # Outputs
+    answer: str
+    citations: List[Dict[str, Any]]
+    related_nodes: List[str]
+    
+    # Metadata
+    error: Optional[str]
+
+# Node Implementations
+async def context_loading_node(state: RAGState) -> Dict[str, Any]:
+    """Step 1: Get conversation context and build enhanced question."""
+    logger.info(f"RAG Graph: Loading context for session {state['session_id']}")
+    
+    history = state.get("history", [])
+    last_questions = [msg["content"] for msg in history if msg["role"] == "user"]
+    
+    enhanced_question = state["question"]
+    if last_questions:
+        context_summary = " | ".join(last_questions[-3:])
+        enhanced_question = f"Previous context: {context_summary}\n\nCurrent question: {state['question']}"
         
-        message = ChatMessage(
-            role=role,
-            content=content,
-            timestamp=datetime.utcnow(),
-            citations=citations,
-        )
-        self._sessions[session_id].append(message)
-        
-        # Trim to window size (keeping last N pairs = 2N messages)
-        max_messages = self.window_size * 2
-        if len(self._sessions[session_id]) > max_messages:
-            self._sessions[session_id] = self._sessions[session_id][-max_messages:]
-    
-    def get_context(self, session_id: str) -> List[Dict[str, str]]:
-        """Get conversation context for the session."""
-        if session_id not in self._sessions:
-            return []
-        
-        return [
-            {"role": msg.role, "content": msg.content}
-            for msg in self._sessions[session_id]
-        ]
-    
-    def clear_session(self, session_id: str):
-        """Clear a session's history."""
-        if session_id in self._sessions:
-            del self._sessions[session_id]
-    
-    def get_last_n_questions(self, session_id: str, n: int = 5) -> List[str]:
-        """Get the last N questions for context."""
-        if session_id not in self._sessions:
-            return []
-        
-        questions = [
-            msg.content for msg in self._sessions[session_id]
-            if msg.role == 'user'
-        ]
-        return questions[-n:]
+    return {"enhanced_question": enhanced_question}
+
+async def vector_search_node(state: RAGState) -> Dict[str, Any]:
+    """Step 2: Perform vector similarity search."""
+    # This node needs access to neo4j. In LangGraph we usually pass tools or services in config
+    # For now we'll assume the service instance handles the neo4j connection
+    return {"vector_results": []} # To be implemented in the class wrapper
+
+async def graph_expansion_node(state: RAGState) -> Dict[str, Any]:
+    """Step 3: Expand context via graph traversal."""
+    return {"graph_context": {}} # To be implemented in the class wrapper
+
+async def answer_generation_node(state: RAGState) -> Dict[str, Any]:
+    """Step 4: Generate final answer with citations."""
+    return {"answer": "", "citations": []} # To be implemented in the class wrapper
 
 
 class HybridRAGService:
     """
-    Hybrid RAG (Retrieval Augmented Generation) Service.
-    
-    Combines:
-    - Vector search for semantic similarity
-    - Graph traversal for relationship context
-    - LLM for answer generation
+    Hybrid RAG Service orchestrated by LangGraph.
     """
     
     def __init__(self, neo4j_driver, ai_service):
         self.neo4j = neo4j_driver
         self.ai = ai_service
-        self.memory = ConversationMemory()
-    
-    async def query(
-        self,
-        question: str,
-        session_id: str,
-        scope: Optional[Dict[str, Any]] = None,
-        clear_history: bool = False,
-    ) -> Dict[str, Any]:
-        """
-        Execute a hybrid RAG query.
+        self.graph = self._build_graph()
         
-        Steps:
-        1. Get conversation context (sliding window)
-        2. Vector search for relevant chunks
-        3. Graph traversal for relationship context
-        4. LLM generation with citations
-        """
-        # Clear history if requested
-        if clear_history:
-            self.memory.clear_session(session_id)
+    def _build_graph(self):
+        workflow = StateGraph(RAGState)
         
-        try:
-            # Step 1: Get conversation context
-            conversation_context = self.memory.get_context(session_id)
-            last_questions = self.memory.get_last_n_questions(session_id)
-            
-            # Build context-aware query
-            enhanced_question = self._build_enhanced_question(question, last_questions)
-            
-            # Step 2: Vector search
-            vector_results = await self._vector_search(enhanced_question, scope)
-            
-            # Step 3: Graph context expansion
-            graph_context = await self._expand_graph_context(vector_results, scope)
-            
-            # Step 4: Generate answer with LLM
-            answer, citations = await self._generate_answer(
-                question=question,
-                vector_context=vector_results,
-                graph_context=graph_context,
-                conversation_context=conversation_context,
-            )
-            
-            # Store in memory
-            self.memory.add_message(session_id, 'user', question)
-            self.memory.add_message(session_id, 'assistant', answer, citations)
-            
-            # Get related nodes from citations
-            related_nodes = [c['node_id'] for c in citations if 'node_id' in c]
-            
-            return {
-                "answer": answer,
-                "citations": citations,
-                "session_id": session_id,
-                "related_nodes": related_nodes,
-                "context_used": len(conversation_context),
-            }
-            
-        except Exception as e:
-            logger.error(f"RAG query failed: {e}")
-            return {
-                "answer": f"I encountered an error processing your question: {str(e)}",
-                "citations": [],
-                "session_id": session_id,
-                "related_nodes": [],
-                "error": str(e),
-            }
-    
-    def _build_enhanced_question(self, question: str, last_questions: List[str]) -> str:
-        """
-        Build an enhanced question using conversation context.
-        Helps resolve pronouns and references.
-        """
-        if not last_questions:
-            return question
+        # Add nodes (using instance methods to access neo4j/ai)
+        workflow.add_node("load_context", context_loading_node)
+        workflow.add_node("vector_search", self._vector_search_node)
+        workflow.add_node("graph_expansion", self._graph_expansion_node)
+        workflow.add_node("generate_answer", self._answer_generation_node)
         
-        # Create context summary for entity resolution
-        context_summary = " | ".join(last_questions[-3:])  # Last 3 questions
-        return f"Previous context: {context_summary}\n\nCurrent question: {question}"
-    
-    async def _vector_search(
-        self,
-        query: str,
-        scope: Optional[Dict[str, Any]] = None,
-        top_k: int = 10,
-    ) -> List[Dict[str, Any]]:
-        """
-        Perform vector similarity search in Neo4j.
-        """
-        try:
-            # Build scope filter
-            scope_filter = ""
-            params = {"query": query, "top_k": top_k}
-            
-            if scope:
-                scope_type = scope.get("type")
-                scope_id = scope.get("id")
-                
-                if scope_type == "folder" and scope_id:
-                    scope_filter = "AND (n.folder_id = $scope_id OR n.folderId = $scope_id)"
-                    params["scope_id"] = scope_id
-                elif scope_type == "file" and scope_id:
-                    scope_filter = "AND (n.file_id = $scope_id OR n.fileId = $scope_id)"
-                    params["scope_id"] = scope_id
-                elif scope_type == "selection":
-                    node_ids = scope.get("node_ids", [])
-                    if node_ids:
-                        scope_filter = "AND n.id IN $node_ids"
-                        params["node_ids"] = node_ids
-            
-            # Query using vector index (if available) or text search fallback
-            vector_query = f"""
-            CALL db.index.fulltext.queryNodes('entity_search', $query)
-            YIELD node, score
-            WHERE score > 0.3 {scope_filter.replace('n.', 'node.')}
-            RETURN 
-                COALESCE(node.id, node.entity_id, elementId(node)) as node_id,
-                node.name as name,
-                node.description as description,
-                node.type as type,
-                score
-            ORDER BY score DESC
-            LIMIT $top_k
-            """
-            
-            result = self.neo4j.execute_query(vector_query, params)
-            
-            return [
-                {
-                    "node_id": record["node_id"],
-                    "name": record["name"],
-                    "description": record["description"] or "",
-                    "type": record["type"],
-                    "score": record["score"],
-                }
-                for record in result.records
-            ]
-            
-        except Exception as e:
-            logger.warning(f"Vector search failed, using fallback: {e}")
-            # Fallback to simple text matching
-            return await self._fallback_text_search(query, scope, top_k)
-    
-    async def _fallback_text_search(
-        self,
-        query: str,
-        scope: Optional[Dict[str, Any]] = None,
-        top_k: int = 10,
-    ) -> List[Dict[str, Any]]:
-        """Fallback text-based search when vector search unavailable."""
+        # Set edges
+        workflow.set_entry_point("load_context")
+        workflow.add_edge("load_context", "vector_search")
+        workflow.add_edge("vector_search", "graph_expansion")
+        workflow.add_edge("graph_expansion", "generate_answer")
+        workflow.add_edge("generate_answer", END)
+        
+        return workflow.compile()
+
+    # --- Node Implementation Methods ---
+
+    async def _vector_search_node(self, state: RAGState) -> Dict[str, Any]:
+        params = {"query": state["enhanced_question"], "top_k": 10}
         scope_filter = ""
-        params = {"query": f".*{query}.*", "top_k": top_k}
         
-        if scope and scope.get("type") == "folder" and scope.get("id"):
-            scope_filter = "AND (n.folder_id = $scope_id OR n.folderId = $scope_id)"
-            params["scope_id"] = scope.get("id")
-        
-        fallback_query = f"""
-        MATCH (n)
-        WHERE (n.name =~ $query OR n.description =~ $query)
+        if state["scope"]:
+            s = state["scope"]
+            if s.get("type") == "folder":
+                scope_filter = "AND (n.folder_id = $scope_id OR n.folderId = $scope_id)"
+                params["scope_id"] = s.get("id")
+            elif s.get("type") == "file":
+                scope_filter = "AND (n.file_id = $scope_id OR n.fileId = $scope_id)"
+                params["scope_id"] = s.get("id")
+
+        # Vector/Text search query
+        query = f"""
+        MATCH (n:Entity)
+        WHERE (toLower(n.name) CONTAINS toLower($query) OR toLower(n.description) CONTAINS toLower($query))
         {scope_filter}
         RETURN 
-            COALESCE(n.id, n.entity_id, elementId(n)) as node_id,
+            COALESCE(n.id, elementId(n)) as node_id,
             n.name as name,
             n.description as description,
             n.type as type,
             1.0 as score
-        LIMIT $top_k
+        LIMIT 10
         """
-        
-        result = self.neo4j.execute_query(fallback_query, params)
-        
-        return [
-            {
-                "node_id": record["node_id"],
-                "name": record["name"],
-                "description": record["description"] or "",
-                "type": record["type"],
-                "score": record["score"],
-            }
-            for record in result.records
-        ]
-    
-    async def _expand_graph_context(
-        self,
-        vector_results: List[Dict[str, Any]],
-        scope: Optional[Dict[str, Any]] = None,
-        max_hops: int = 2,
-    ) -> Dict[str, Any]:
-        """
-        Expand the graph context around vector search results.
-        Follows relationships to build a rich context.
-        """
-        if not vector_results:
-            return {"nodes": [], "relationships": [], "paths": []}
-        
-        node_ids = [r["node_id"] for r in vector_results[:5]]  # Top 5 for expansion
         
         try:
-            expansion_query = """
-            UNWIND $node_ids AS nodeId
-            MATCH (n)
-            WHERE n.id = nodeId OR elementId(n) = nodeId
-            OPTIONAL MATCH path = (n)-[r*1..2]-(related)
-            RETURN 
-                n.name as source_name,
-                [rel in relationships(path) | type(rel)] as rel_types,
-                [node in nodes(path) | node.name] as path_nodes,
-                related.name as related_name,
-                related.type as related_type
-            LIMIT 50
-            """
+            # Note: Using session.run or similar depending on neo4j driver version
+            # Assuming self.neo4j is a driver instance
+            async with self.neo4j.session() as session:
+                result = await session.run(query, params)
+                records = await result.data()
+                
+            return {"vector_results": records}
+        except Exception as e:
+            logger.error(f"Vector search node failed: {e}")
+            return {"vector_results": [], "error": str(e)}
+
+    async def _graph_expansion_node(self, state: RAGState) -> Dict[str, Any]:
+        if not state["vector_results"]:
+            return {"graph_context": {"nodes": [], "relationships": []}}
             
-            result = self.neo4j.execute_query(expansion_query, {"node_ids": node_ids})
-            
-            relationships = []
+        node_ids = [r["node_id"] for r in state["vector_results"][:5]]
+        
+        query = """
+        UNWIND $node_ids AS nodeId
+        MATCH (n)
+        WHERE n.id = nodeId OR elementId(n) = nodeId
+        OPTIONAL MATCH (n)-[r]-(related)
+        RETURN 
+            n.name as source_name,
+            type(r) as rel_type,
+            related.name as related_name
+        LIMIT 20
+        """
+        
+        try:
+            async with self.neo4j.session() as session:
+                result = await session.run(query, {"node_ids": node_ids})
+                records = await result.data()
+                
             nodes = set()
+            rels = []
+            for r in records:
+                nodes.add(r["source_name"])
+                if r["related_name"]:
+                    nodes.add(r["related_name"])
+                    rels.append(f"{r['source_name']} -[{r['rel_type']}]-> {r['related_name']}")
+                    
+            return {"graph_context": {"nodes": list(nodes), "relationships": rels}}
+        except Exception as e:
+            logger.error(f"Graph expansion node failed: {e}")
+            return {"graph_context": {"nodes": [], "relationships": []}}
+
+    async def _answer_generation_node(self, state: RAGState) -> Dict[str, Any]:
+        # Context formatting
+        context = "Relevant Entities:\n"
+        for r in state["vector_results"][:5]:
+            context += f"- {r['name']} ({r['type']}): {r['description'][:150]}\n"
             
-            for record in result.records:
-                source = record["source_name"]
-                if source:
-                    nodes.add(source)
+        if state["graph_context"].get("relationships"):
+            context += "\nRelationships:\n"
+            for rel in state["graph_context"]["relationships"][:10]:
+                context += f"- {rel}\n"
                 
-                related = record["related_name"]
-                if related:
-                    nodes.add(related)
-                
-                rel_types = record["rel_types"]
-                if rel_types and source and related:
-                    relationships.append({
-                        "source": source,
-                        "target": related,
-                        "types": rel_types,
-                    })
+        system_prompt = "You are a Knowledge Graph assistant. Answer based ONLY on the context. If unknown, say so."
+        user_prompt = f"Context:\n{context}\n\nQuestion: {state['question']}"
+        
+        try:
+            answer = await self.ai.chat([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ])
+            
+            citations = [
+                {"node_id": r["node_id"], "node_name": r["name"], "score": r["score"]}
+                for r in state["vector_results"][:5]
+            ]
             
             return {
-                "nodes": list(nodes),
-                "relationships": relationships,
-                "node_count": len(nodes),
-                "relationship_count": len(relationships),
+                "answer": answer,
+                "citations": citations,
+                "related_nodes": [r["node_id"] for r in state["vector_results"][:5]]
             }
-            
         except Exception as e:
-            logger.error(f"Graph expansion failed: {e}")
-            return {"nodes": [], "relationships": [], "paths": []}
-    
-    async def _generate_answer(
+            return {"answer": f"Error generating answer: {e}", "citations": []}
+
+    async def query(
         self,
         question: str,
-        vector_context: List[Dict[str, Any]],
-        graph_context: Dict[str, Any],
-        conversation_context: List[Dict[str, str]],
-    ) -> Tuple[str, List[Dict[str, Any]]]:
-        """
-        Generate an answer using the LLM with all available context.
-        """
-        # Build context prompt
-        context_parts = []
+        session_id: str,
+        history: List[Dict[str, str]] = None,
+        scope: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Execute the LangGraph RAG query."""
+        initial_state = {
+            "question": question,
+            "session_id": session_id,
+            "history": history or [],
+            "scope": scope,
+            "vector_results": [],
+            "graph_context": {},
+            "answer": "",
+            "citations": [],
+            "related_nodes": [],
+            "error": None
+        }
         
-        # Add vector search results
-        if vector_context:
-            context_parts.append("Relevant entities found:")
-            for i, result in enumerate(vector_context[:5], 1):
-                context_parts.append(
-                    f"{i}. {result['name']} ({result['type']}): {result['description'][:200]}"
-                )
-        
-        # Add graph relationships
-        if graph_context.get("relationships"):
-            context_parts.append("\nRelevant relationships:")
-            for rel in graph_context["relationships"][:10]:
-                rel_str = " -> ".join(rel["types"]) if rel["types"] else "related to"
-                context_parts.append(f"- {rel['source']} {rel_str} {rel['target']}")
-        
-        context_str = "\n".join(context_parts) if context_parts else "No relevant context found."
-        
-        # Build conversation history
-        history_str = ""
-        if conversation_context:
-            history_parts = []
-            for msg in conversation_context[-6:]:  # Last 3 exchanges
-                role = "User" if msg["role"] == "user" else "Assistant"
-                history_parts.append(f"{role}: {msg['content'][:200]}")
-            history_str = "\n".join(history_parts)
-        
-        # Build the prompt
-        system_prompt = """You are a knowledge graph assistant. Answer questions based ONLY on the provided context.
-If the context doesn't contain enough information, say so clearly. Do not hallucinate or make up information.
-When citing information, mention the source entity name."""
-
-        user_prompt = f"""Context from knowledge graph:
-{context_str}
-
-{'Conversation history:' + chr(10) + history_str if history_str else ''}
-
-Question: {question}
-
-Provide a helpful answer based on the context. Be precise and cite your sources."""
-
-        # Call AI service
         try:
-            response = await self.ai.generate(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                max_tokens=1000,
-            )
-            answer = response.get("text", "I couldn't generate a response.")
-        except Exception as e:
-            logger.error(f"LLM generation failed: {e}")
-            answer = "I encountered an error generating the response. Please try again."
-        
-        # Build citations from vector results
-        citations = [
-            {
-                "node_id": r["node_id"],
-                "node_name": r["name"],
-                "chunk_text": r["description"][:200] if r["description"] else "",
-                "confidence": r["score"],
+            final_state = await self.graph.ainvoke(initial_state)
+            return {
+                "answer": final_state["answer"],
+                "citations": final_state["citations"],
+                "session_id": session_id,
+                "related_nodes": final_state["related_nodes"],
+                "error": final_state["error"]
             }
-            for r in vector_context[:5]
-        ]
-        
-        return answer, citations
+        except Exception as e:
+            logger.error(f"LangGraph RAG execution failed: {e}")
+            return {"answer": f"System error: {e}", "citations": [], "session_id": session_id}
 
 
 # Singleton instance
 _rag_service: Optional[HybridRAGService] = None
 
-
 def get_rag_service(neo4j, ai_service) -> HybridRAGService:
-    """Get or create the RAG service singleton."""
     global _rag_service
     if _rag_service is None:
         _rag_service = HybridRAGService(neo4j, ai_service)

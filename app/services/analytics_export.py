@@ -122,7 +122,7 @@ class AnalyticsExportService:
         """
         
         try:
-            result = self.neo4j.execute_query(query, {"folder_id": folder_id})
+            result = await self.neo4j.execute_query(query, {"folder_id": folder_id})
             
             if result.records:
                 record = result.records[0]
@@ -159,7 +159,7 @@ class AnalyticsExportService:
         """
         
         try:
-            result = self.neo4j.execute_query(degree_query, {"folder_id": folder_id})
+            result = await self.neo4j.execute_query(degree_query, {"folder_id": folder_id})
             
             degree_top = [
                 {
@@ -202,7 +202,7 @@ class AnalyticsExportService:
         """
         
         try:
-            result = self.neo4j.execute_query(type_query, {"folder_id": folder_id})
+            result = await self.neo4j.execute_query(type_query, {"folder_id": folder_id})
             
             type_distribution = [
                 {"type": r["type"] or "Unknown", "count": r["count"]}
@@ -238,7 +238,7 @@ class AnalyticsExportService:
         """
         
         try:
-            result = self.neo4j.execute_query(query, {"folder_id": folder_id})
+            result = await self.neo4j.execute_query(query, {"folder_id": folder_id})
             
             if result.records:
                 r = result.records[0]
@@ -305,7 +305,7 @@ class AnalyticsExportService:
         """
         
         try:
-            result = self.neo4j.execute_query(rel_query, {"folder_id": folder_id})
+            result = await self.neo4j.execute_query(rel_query, {"folder_id": folder_id})
             if result.records:
                 rel_types = result.records[0]["rel_types"]
                 if rel_types == 1 and link_count > 10:
@@ -396,60 +396,169 @@ class AnalyticsExportService:
             "generated_at": data.get("generated_at"),
             "sections": [
                 {
-                    "title": "Overview",
-                    "type": "metrics",
-                    "data": data.get("overview", {}),
+                    "title": "Executive Summary",
+                    "type": "summary",
+                    "data": self._build_executive_summary(data),
+                },
+                {
+                    "title": "Graph Overview",
+                    "type": "metrics_grid",
+                    "columns": 4,
+                    "metrics": [
+                        {
+                            "label": "Total Nodes",
+                            "value": data.get("overview", {}).get("node_count", 0),
+                            "icon": "nodes",
+                        },
+                        {
+                            "label": "Total Relationships",
+                            "value": data.get("overview", {}).get("link_count", 0),
+                            "icon": "links",
+                        },
+                        {
+                            "label": "Graph Density",
+                            "value": f"{data.get('overview', {}).get('density', 0):.4f}",
+                            "icon": "density",
+                        },
+                        {
+                            "label": "Average Degree",
+                            "value": data.get("overview", {}).get("avg_degree", 0),
+                            "icon": "degree",
+                        },
+                    ],
                 },
             ],
         }
         
-        # Add centrality section
+        # Add centrality section with enhanced table
         centrality = data.get("sections", {}).get("centrality", {})
         if centrality:
+            degree_nodes = centrality.get("degree_centrality", {}).get("top_nodes", [])
             pdf_structure["sections"].append({
                 "title": "Centrality Analysis",
-                "type": "table",
-                "description": "Top nodes by degree centrality",
-                "columns": ["Rank", "Name", "Type", "Score"],
-                "rows": [
-                    [i + 1, n["name"], n["type"], n["score"]]
-                    for i, n in enumerate(centrality.get("degree_centrality", {}).get("top_nodes", []))
+                "type": "enhanced_table",
+                "description": "Top 10 most connected nodes in the knowledge graph",
+                "columns": [
+                    {"key": "rank", "label": "#", "width": 40, "align": "center"},
+                    {"key": "name", "label": "Entity Name", "width": 200, "align": "left"},
+                    {"key": "type", "label": "Type", "width": 100, "align": "center"},
+                    {"key": "score", "label": "Connections", "width": 80, "align": "right"},
+                    {"key": "bar", "label": "Relative", "width": 100, "type": "progress_bar"},
                 ],
+                "rows": [
+                    {
+                        "rank": i + 1,
+                        "name": n["name"],
+                        "type": n["type"],
+                        "score": n["score"],
+                        "bar": n["score"] / max(1, degree_nodes[0]["score"] if degree_nodes else 1) * 100,
+                    }
+                    for i, n in enumerate(degree_nodes)
+                ],
+                "footer": f"Showing top {len(degree_nodes)} nodes by degree centrality",
             })
         
-        # Add clustering section
+        # Add entity type distribution pie chart
         clustering = data.get("sections", {}).get("clustering", {})
         if clustering:
+            type_dist = clustering.get("type_distribution", [])
             pdf_structure["sections"].append({
                 "title": "Entity Type Distribution",
-                "type": "chart_data",
-                "chart_type": "pie",
-                "data": clustering.get("type_distribution", []),
+                "type": "pie_chart",
+                "description": "Distribution of entities across different types",
+                "data": [
+                    {"label": t["type"], "value": t["count"]}
+                    for t in type_dist
+                ],
+                "total": sum(t["count"] for t in type_dist),
             })
         
-        # Add blind spots
-        blind_spots = data.get("sections", {}).get("blind_spots", {})
-        if blind_spots and blind_spots.get("top_predictions"):
+        # Add degree distribution histogram
+        degree_dist = data.get("sections", {}).get("degree_distribution", {})
+        if degree_dist:
             pdf_structure["sections"].append({
-                "title": "Predicted Missing Relationships (Blind Spots)",
-                "type": "table",
-                "description": f"Found {blind_spots.get('count', 0)} potential missing connections",
-                "columns": ["Source", "Target", "Confidence", "Reason"],
-                "rows": [
-                    [p["source_name"], p["target_name"], f"{p['confidence']:.0%}", p["reason"]]
-                    for p in blind_spots.get("top_predictions", [])[:10]
+                "title": "Degree Distribution Statistics",
+                "type": "stats_box",
+                "description": "Statistical analysis of node connectivity",
+                "stats": [
+                    {"label": "Minimum Degree", "value": degree_dist.get("min", 0)},
+                    {"label": "Maximum Degree", "value": degree_dist.get("max", 0)},
+                    {"label": "Mean Degree", "value": degree_dist.get("mean", 0)},
+                    {"label": "Median Degree", "value": degree_dist.get("median", 0)},
+                    {"label": "90th Percentile", "value": degree_dist.get("p90", 0)},
+                    {"label": "Standard Deviation", "value": degree_dist.get("std_dev", 0)},
                 ],
             })
+            
+            # Add histogram data for rendering
+            pdf_structure["sections"].append({
+                "title": "Degree Distribution Histogram",
+                "type": "histogram",
+                "description": "Visual distribution of node degrees",
+                "bins": await self._get_degree_histogram_data(folder_id),
+            })
         
-        # Add health score
+        # Add blind spots with enhanced formatting
+        blind_spots = data.get("sections", {}).get("blind_spots", {})
+        if blind_spots and blind_spots.get("top_predictions"):
+            predictions = blind_spots.get("top_predictions", [])
+            pdf_structure["sections"].append({
+                "title": "Predicted Missing Relationships (Blind Spots)",
+                "type": "enhanced_table",
+                "description": f"AI-identified potential connections ({blind_spots.get('count', 0)} total predictions)",
+                "columns": [
+                    {"key": "source", "label": "Source Entity", "width": 150, "align": "left"},
+                    {"key": "arrow", "label": "", "width": 40, "type": "icon", "icon": "arrow-right"},
+                    {"key": "target", "label": "Target Entity", "width": 150, "align": "left"},
+                    {"key": "confidence", "label": "Confidence", "width": 80, "type": "percentage"},
+                    {"key": "reason", "label": "Reasoning", "width": 200, "align": "left"},
+                ],
+                "rows": [
+                    {
+                        "source": p.get("source_name", "Unknown"),
+                        "arrow": "→",
+                        "target": p.get("target_name", "Unknown"),
+                        "confidence": p.get("confidence", 0),
+                        "reason": p.get("reason", "Structural similarity"),
+                    }
+                    for p in predictions[:10]
+                ],
+                "highlight_rows": True,
+            })
+            
+            # Add category breakdown
+            by_category = blind_spots.get("by_category", {})
+            if by_category:
+                pdf_structure["sections"].append({
+                    "title": "Blind Spots by Category",
+                    "type": "bar_chart",
+                    "orientation": "horizontal",
+                    "data": [
+                        {"label": cat, "value": count}
+                        for cat, count in by_category.items()
+                    ],
+                })
+        
+        # Add health score section with visual gauge
         health = data.get("sections", {}).get("health", {})
         if health:
+            score = health.get("score", 0)
+            grade = health.get("grade", "N/A")
+            issues = health.get("issues", [])
+            
             pdf_structure["sections"].append({
                 "title": "Graph Health Assessment",
-                "type": "health_score",
-                "score": health.get("score", 0),
-                "grade": health.get("grade", "N/A"),
-                "issues": health.get("issues", []),
+                "type": "health_gauge",
+                "score": score,
+                "grade": grade,
+                "max_score": 100,
+                "zones": [
+                    {"from": 0, "to": 60, "color": "#EF4444", "label": "Needs Work"},
+                    {"from": 60, "to": 80, "color": "#F59E0B", "label": "Good"},
+                    {"from": 80, "to": 100, "color": "#10B981", "label": "Excellent"},
+                ],
+                "issues": issues if issues else ["No issues detected - graph health is excellent!"],
+                "recommendations": self._get_health_recommendations(score, issues),
             })
         
         return {
@@ -460,6 +569,98 @@ class AnalyticsExportService:
             "raw_data": data,
             "content_type": "application/json",  # Frontend will render the PDF
         }
+    
+    def _build_executive_summary(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Build executive summary text."""
+        overview = data.get("overview", {})
+        health = data.get("sections", {}).get("health", {})
+        blind_spots = data.get("sections", {}).get("blind_spots", {})
+        
+        node_count = overview.get("node_count", 0)
+        link_count = overview.get("link_count", 0)
+        score = health.get("score", 0)
+        grade = health.get("grade", "N/A")
+        predictions = blind_spots.get("count", 0)
+        
+        return {
+            "text": f"This knowledge graph contains {node_count:,} entities connected by {link_count:,} relationships. "
+                    f"The overall health score is {score}/100 (Grade: {grade}). "
+                    f"AI analysis has identified {predictions} potential missing connections that could enhance the graph.",
+            "highlights": [
+                f"{node_count:,} entities",
+                f"{link_count:,} relationships",
+                f"Health: {grade} ({score}%)",
+                f"{predictions} blind spots",
+            ],
+        }
+    
+    def _get_health_recommendations(self, score: float, issues: List[str]) -> List[str]:
+        """Generate recommendations based on health score and issues."""
+        recommendations = []
+        
+        if score < 60:
+            recommendations.append("Consider adding more documents to increase graph density")
+            recommendations.append("Review isolated entities and create connecting relationships")
+        elif score < 80:
+            recommendations.append("Good foundation - consider diversifying relationship types")
+            recommendations.append("Review blind spot predictions to fill knowledge gaps")
+        else:
+            recommendations.append("Excellent graph health! Continue maintaining data quality")
+            recommendations.append("Consider periodic review of new entities for accuracy")
+        
+        if "density is very low" in " ".join(issues):
+            recommendations.append("Many entities are disconnected - review for missing relationships")
+        
+        if "Very few nodes" in " ".join(issues):
+            recommendations.append("Add more documents to build a comprehensive knowledge base")
+        
+        return recommendations
+    
+    async def _get_degree_histogram_data(self, folder_id: str) -> List[Dict[str, Any]]:
+        """Get histogram bin data for degree distribution."""
+        query = """
+        MATCH (n)
+        WHERE n.folder_id = $folder_id OR n.folderId = $folder_id
+        OPTIONAL MATCH (n)-[r]-()
+        WITH count(r) as degree
+        RETURN degree, count(*) as count
+        ORDER BY degree
+        """
+        
+        try:
+            result = await self.neo4j.execute_query(query, {"folder_id": folder_id})
+            
+            # Group into bins
+            degree_counts = {}
+            for r in result.records:
+                degree = r["degree"]
+                count = r["count"]
+                # Create bins: 0, 1-2, 3-5, 6-10, 11-20, 21+
+                if degree == 0:
+                    bin_label = "0"
+                elif degree <= 2:
+                    bin_label = "1-2"
+                elif degree <= 5:
+                    bin_label = "3-5"
+                elif degree <= 10:
+                    bin_label = "6-10"
+                elif degree <= 20:
+                    bin_label = "11-20"
+                else:
+                    bin_label = "21+"
+                
+                degree_counts[bin_label] = degree_counts.get(bin_label, 0) + count
+            
+            # Order bins properly
+            bin_order = ["0", "1-2", "3-5", "6-10", "11-20", "21+"]
+            return [
+                {"bin": b, "count": degree_counts.get(b, 0)}
+                for b in bin_order
+            ]
+            
+        except Exception as e:
+            logger.error(f"Histogram query failed: {e}")
+            return []
 
 
 # Singleton

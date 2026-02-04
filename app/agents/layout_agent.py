@@ -228,7 +228,7 @@ Be precise and only include what you can clearly identify from the text."""
                 {"role": "user", "content": f"Analyze this document excerpt:\n\n{sample}"}
             ]
             
-            result = await self.ollama.chat_json(messages, self.model_name)
+            result = await self.ollama.chat_json(messages)
             
             return {
                 "title": result.get("title"),

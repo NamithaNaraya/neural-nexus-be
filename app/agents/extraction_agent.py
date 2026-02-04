@@ -6,6 +6,7 @@ CONSTRAINT: System prompts strictly forbid hallucinations;
 every claim must have ground-truth text evidence.
 """
 import logging
+import asyncio
 import uuid
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
@@ -114,46 +115,59 @@ Hallucinations are strictly forbidden. Only extract what you can directly quote 
         logger.info(f"Extracting from {len(chunks)} chunks with schema: "
                    f"{len(entity_types)} entity types, {len(rel_types)} relationship types")
         
-        for i, chunk in enumerate(chunks):
-            chunk_content = chunk.content if hasattr(chunk, 'content') else chunk.get('content', '')
-            chunk_id = chunk.chunk_id if hasattr(chunk, 'chunk_id') else chunk.get('chunk_id', str(i))
-            
-            if not chunk_content.strip():
-                continue
-            
-            try:
-                result = await self._extract_from_chunk(
-                    chunk_content=chunk_content,
-                    chunk_id=chunk_id,
-                    entity_types=entity_types,
-                    rel_types=rel_types,
-                )
+        # Limit concurrency to avoid hitting API rate limits
+        sem = asyncio.Semaphore(5)
+
+        async def _process_chunk_safe(i, chunk):
+            async with sem:
+                chunk_content = chunk.content if hasattr(chunk, 'content') else chunk.get('content', '')
+                chunk_id = chunk.chunk_id if hasattr(chunk, 'chunk_id') else chunk.get('chunk_id', str(i))
                 
-                # Process entities
-                for entity_data in result.get("entities", []):
-                    entity = ExtractedEntity(
-                        id=str(uuid.uuid4()),
-                        name=entity_data["name"],
-                        type=entity_data.get("type", "Concept"),
-                        description=entity_data.get("description", ""),
-                        properties=entity_data.get("properties", {}),
-                        source_chunk_id=chunk_id,
-                        source_text=entity_data.get("evidence", ""),
-                        confidence=0.9,
+                if not chunk_content.strip():
+                    return None
+                
+                try:
+                    return await self._extract_from_chunk(
+                        chunk_content=chunk_content,
+                        chunk_id=chunk_id,
+                        entity_types=entity_types,
+                        rel_types=rel_types,
                     )
-                    all_entities.append(entity)
-                    entity_name_to_id[entity.name.lower()] = entity.id
-                
-                # Process relationships (will link after all entities are extracted)
-                for rel_data in result.get("relationships", []):
-                    all_relationships.append({
-                        **rel_data,
-                        "source_chunk_id": chunk_id,
-                    })
-                    
-            except Exception as e:
-                logger.warning(f"Extraction failed for chunk {i}: {e}")
+                except Exception as e:
+                    logger.warning(f"Extraction failed for chunk {i}: {e}")
+                    return None
+
+        # Execute extractions in parallel
+        tasks = [_process_chunk_safe(i, chunk) for i, chunk in enumerate(chunks)]
+        results = await asyncio.gather(*tasks)
+
+        for i, result in enumerate(results):
+            if not result:
                 continue
+            
+            chunk_id = chunks[i].chunk_id if hasattr(chunks[i], 'chunk_id') else chunks[i].get('chunk_id', str(i))
+
+            # Process entities
+            for entity_data in result.get("entities", []):
+                entity = ExtractedEntity(
+                    id=str(uuid.uuid4()),
+                    name=entity_data["name"],
+                    type=entity_data.get("type", "Concept"),
+                    description=entity_data.get("description", ""),
+                    properties=entity_data.get("properties", {}),
+                    source_chunk_id=chunk_id,
+                    source_text=entity_data.get("evidence", ""),
+                    confidence=0.9,
+                )
+                all_entities.append(entity)
+                entity_name_to_id[entity.name.lower()] = entity.id
+            
+            # Process relationships (will link after all entities are extracted)
+            for rel_data in result.get("relationships", []):
+                all_relationships.append({
+                    **rel_data,
+                    "source_chunk_id": chunk_id,
+                })
         
         # Link relationships to entity IDs
         linked_relationships = []
@@ -193,15 +207,19 @@ Hallucinations are strictly forbidden. Only extract what you can directly quote 
     ) -> Dict[str, List]:
         """Extract entities and relationships from a single chunk."""
         
+        # Limit chunk size to prevent timeout
+        content_to_process = chunk_content[:3000] if len(chunk_content) > 3000 else chunk_content
+        
         prompt = f"""Extract entities and relationships from this text.
 
-ALLOWED ENTITY TYPES: {', '.join(entity_types) if entity_types else 'Any type'}
-ALLOWED RELATIONSHIP TYPES: {', '.join(rel_types) if rel_types else 'Any type'}
+ALLOWED ENTITY TYPES: {', '.join(entity_types) if entity_types else 'Person, Place, Organization, Event, Concept, Object'}
+ALLOWED RELATIONSHIP TYPES: {', '.join(rel_types) if rel_types else 'RELATED_TO, PART_OF, LOCATED_IN, WORKS_FOR, KNOWS'}
 
 TEXT:
-{chunk_content}
+{content_to_process}
 
-Remember: Only extract what is EXPLICITLY stated. Include exact quotes as evidence."""
+Remember: Only extract what is EXPLICITLY stated. Include exact quotes as evidence.
+Respond with valid JSON containing "entities" and "relationships" arrays."""
         
         try:
             messages = [
@@ -209,15 +227,23 @@ Remember: Only extract what is EXPLICITLY stated. Include exact quotes as eviden
                 {"role": "user", "content": prompt}
             ]
             
-            result = await self.ollama.chat_json(messages, self.model_name)
+            logger.debug(f"Sending chunk {chunk_id} ({len(content_to_process)} chars) to AI for extraction")
+            
+            result = await self.ollama.chat_json(messages)
+            
+            entities = result.get("entities", [])
+            relationships = result.get("relationships", [])
+            
+            logger.debug(f"Chunk {chunk_id}: extracted {len(entities)} entities, {len(relationships)} relationships")
             
             return {
-                "entities": result.get("entities", []),
-                "relationships": result.get("relationships", []),
+                "entities": entities,
+                "relationships": relationships,
             }
             
         except Exception as e:
-            logger.error(f"Chunk extraction failed: {e}")
+            logger.error(f"Chunk {chunk_id} extraction failed: {type(e).__name__}: {e}")
+            # Return empty instead of raising to allow other chunks to process
             return {"entities": [], "relationships": []}
     
     def _validate_evidence(

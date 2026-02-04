@@ -193,7 +193,7 @@ RULES:
                 {"role": "user", "content": f"Analyze this text and define the ontology:\n\n{sample_text}"}
             ]
             
-            result = await self.ollama.chat_json(messages, self.model_name)
+            result = await self.ollama.chat_json(messages)
             
             return {
                 "entity_types": result.get("entity_types", []),
@@ -230,7 +230,7 @@ Text:
                 {"role": "user", "content": prompt}
             ]
             
-            result = await self.ollama.chat_json(messages, self.model_name)
+            result = await self.ollama.chat_json(messages)
             
             # Merge with existing
             merged_entities = existing_schema.get("entity_types", [])

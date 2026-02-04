@@ -83,7 +83,7 @@ async def get_all_graph(
         RETURN n, degree
         LIMIT $limit
         """
-        nodes_result = neo4j.execute_query(nodes_query, {"limit": limit})
+        nodes_result = await neo4j.execute_query(nodes_query, {"limit": limit})
         
         nodes = []
         node_ids = set()
@@ -96,12 +96,24 @@ async def get_all_graph(
             if node_id not in node_ids:
                 node_ids.add(node_id)
                 labels = list(node.labels) if node.labels else ["Unknown"]
+                # Extract and parse conflicts if present
+                node_properties = {k: v for k, v in props.items() if k not in ["id", "name", "type", "description", "folder_id", "file_id", "conflicts"]}
+                conflicts = props.get("conflicts")
+                if conflicts and isinstance(conflicts, str):
+                    import json
+                    try:
+                        node_properties["conflicts"] = json.loads(conflicts)
+                    except:
+                        node_properties["conflicts"] = {}
+                elif conflicts:
+                    node_properties["conflicts"] = conflicts
+
                 nodes.append(NodeResponse(
                     id=node_id,
                     name=props.get("name", props.get("label", "Unknown")),
                     type=props.get("type", labels[0] if labels else "Unknown"),
                     description=props.get("description"),
-                    properties={k: v for k, v in props.items() if k not in ["id", "name", "type", "description", "folder_id", "file_id"]},
+                    properties=node_properties,
                     degree=record["degree"],
                     file_id=props.get("file_id"),
                     folder_id=props.get("folder_id"),
@@ -116,7 +128,7 @@ async def get_all_graph(
                r.weight as weight
         LIMIT $limit
         """
-        links_result = neo4j.execute_query(links_query, {"limit": limit * 2})
+        links_result = await neo4j.execute_query(links_query, {"limit": limit * 2})
         
         links = []
         for record in links_result.records:
@@ -164,7 +176,7 @@ async def get_folder_graph(
         LIMIT $limit
         """
         
-        nodes_result = neo4j.execute_query(nodes_query, {
+        nodes_result = await neo4j.execute_query(nodes_query, {
             "folder_id": folder_id,
             "min_connections": min_connections,
             "limit": limit,
@@ -181,12 +193,24 @@ async def get_folder_graph(
             if node_id not in node_ids:
                 node_ids.add(node_id)
                 labels = list(node.labels) if node.labels else ["Unknown"]
+                # Extract and parse conflicts if present
+                node_properties = {k: v for k, v in props.items() if k not in ["id", "name", "type", "description", "folder_id", "file_id", "conflicts"]}
+                conflicts = props.get("conflicts")
+                if conflicts and isinstance(conflicts, str):
+                    import json
+                    try:
+                        node_properties["conflicts"] = json.loads(conflicts)
+                    except:
+                        node_properties["conflicts"] = {}
+                elif conflicts:
+                    node_properties["conflicts"] = conflicts
+
                 nodes.append(NodeResponse(
                     id=node_id,
                     name=props.get("name", props.get("label", "Unknown")),
                     type=props.get("type", labels[0] if labels else "Unknown"),
                     description=props.get("description"),
-                    properties={k: v for k, v in props.items() if k not in ["id", "name", "type", "description", "folder_id", "file_id"]},
+                    properties=node_properties,
                     degree=record["degree"],
                     file_id=props.get("file_id"),
                     folder_id=props.get("folder_id"),
@@ -205,7 +229,7 @@ async def get_folder_graph(
         LIMIT $limit
         """
         
-        links_result = neo4j.execute_query(links_query, {
+        links_result = await neo4j.execute_query(links_query, {
             "folder_id": folder_id,
             "limit": limit * 2,
         })
@@ -244,7 +268,7 @@ async def get_file_graph(
         WITH n, count(DISTINCT r) as degree
         RETURN n, degree
         """
-        nodes_result = neo4j.execute_query(nodes_query, {"file_id": file_id})
+        nodes_result = await neo4j.execute_query(nodes_query, {"file_id": file_id})
         
         nodes = []
         node_ids = set()
@@ -276,7 +300,7 @@ async def get_file_graph(
                type(r) as rel_type,
                r.weight as weight
         """
-        links_result = neo4j.execute_query(links_query, {"file_id": file_id})
+        links_result = await neo4j.execute_query(links_query, {"file_id": file_id})
         
         links = []
         for record in links_result.records:
@@ -313,7 +337,7 @@ async def get_node_details(
         RETURN n, count(DISTINCT r) as degree
         LIMIT 1
         """
-        result = neo4j.execute_query(query, {"node_id": node_id})
+        result = await neo4j.execute_query(query, {"node_id": node_id})
         if not result.records:
             raise HTTPException(status_code=404, detail="Node not found")
             
@@ -369,7 +393,7 @@ async def expand_node(
         LIMIT 100
         """
         
-        result = neo4j.execute_query(query, {"node_id": node_id})
+        result = await neo4j.execute_query(query, {"node_id": node_id})
         
         nodes = []
         links = []
@@ -424,7 +448,7 @@ async def get_shortest_path(
             [r IN relationships(p) | elementId(r)] as link_ids,
             length(p) as hops
         """
-        result = neo4j.execute_query(query, {"source_id": source_id, "target_id": target_id})
+        result = await neo4j.execute_query(query, {"source_id": source_id, "target_id": target_id})
         
         if not result.records:
             return {"path_exists": False, "node_ids": [], "link_ids": [], "length": 0}

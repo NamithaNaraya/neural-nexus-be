@@ -19,15 +19,20 @@ celery[redis]==5.3.6
 flower==2.0.1
 
 # === AI & ML ===
-langchain==0.1.0
-langgraph==0.0.20
+langchain==0.1.13
+langchain-core==0.1.33
+langgraph==0.0.30
+langchain-google-genai==0.0.11
+langchain-community==0.0.28
 httpx==0.26.0
 numpy==1.26.3
 scikit-learn==1.4.0
+google-generativeai==0.3.2
 
 # === File Processing ===
 python-multipart==0.0.6
 pypdf2==3.0.1
+pymupdf==1.23.22
 pandas==2.1.4
 
 # === Azure Storage ===

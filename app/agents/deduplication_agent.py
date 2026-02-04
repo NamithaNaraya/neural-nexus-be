@@ -222,7 +222,7 @@ Are they the same real-world entity?"""
                 {"role": "user", "content": prompt}
             ]
             
-            result = await self.ollama.chat_json(messages, self.model_name)
+            result = await self.ollama.chat_json(messages)
             
             is_same = result.get("is_same_entity", False)
             confidence = result.get("confidence", 0.5)

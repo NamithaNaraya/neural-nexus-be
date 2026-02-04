@@ -11,6 +11,7 @@ from app.routes import query
 from app.routes import analytics
 from app.routes import sse
 from app.routes import websocket
+from app.routes import deletion
 
 __all__ = [
     "health",
@@ -23,4 +24,6 @@ __all__ = [
     "analytics",
     "sse",
     "websocket",
+    "deletion",
 ]
+

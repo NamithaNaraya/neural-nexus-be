@@ -156,7 +156,7 @@ class BlindSpotDiscovery:
         """
         
         try:
-            result = self.neo4j.execute_query(query, {"limit": limit})
+            result = await self.neo4j.execute_query(query, {"limit": limit})
             
             return [
                 {
@@ -217,7 +217,7 @@ class BlindSpotDiscovery:
         """
         
         try:
-            result = self.neo4j.execute_query(query, {"limit": limit})
+            result = await self.neo4j.execute_query(query, {"limit": limit})
             
             return [
                 {
@@ -278,7 +278,7 @@ class BlindSpotDiscovery:
         """
         
         try:
-            result = self.neo4j.execute_query(query, {"limit": limit})
+            result = await self.neo4j.execute_query(query, {"limit": limit})
             
             return [
                 {
@@ -345,7 +345,7 @@ class BlindSpotDiscovery:
         """
         
         try:
-            result = self.neo4j.execute_query(query, {"limit": limit})
+            result = await self.neo4j.execute_query(query, {"limit": limit})
             
             return [
                 {
@@ -462,7 +462,7 @@ class BlindSpotDiscovery:
         for i in range(len(folder_ids)):
             for j in range(i + 1, len(folder_ids)):
                 try:
-                    result = self.neo4j.execute_query(query, {
+                    result = await self.neo4j.execute_query(query, {
                         "folder1": folder_ids[i],
                         "folder2": folder_ids[j],
                     })

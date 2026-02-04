@@ -10,7 +10,9 @@ from pydantic import BaseModel
 import logging
 import uuid
 
+from sqlalchemy import text
 from app.core.security import get_current_user
+from app.db.connections import get_postgres_session
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -67,13 +69,50 @@ async def run_query(
         ai_service = AIService()
         rag_service = get_rag_service(neo4j, ai_service)
         
-        # Execute query
+        # 1. Fetch persistent history from PostgreSQL
+        history = []
+        if not request.clear_history:
+            async with get_postgres_session() as session:
+                hist_result = await session.execute(
+                    text("""
+                        SELECT role, message as content 
+                        FROM neural_nexus.chat_history 
+                        WHERE session_id = :session_id 
+                        ORDER BY timestamp DESC 
+                        LIMIT 10
+                    """),
+                    {"session_id": session_id}
+                )
+                # Reverse to get chronological order for LangGraph
+                history = [dict(r) for r in reversed(hist_result.fetchall())]
+
+        # 2. Execute query via LangGraph-powered RAG Service
         result = await rag_service.query(
             question=request.question,
             session_id=session_id,
+            history=history,
             scope=request.scope,
-            clear_history=request.clear_history,
         )
+        
+        # 3. Store new interaction in PostgreSQL
+        async with get_postgres_session() as session:
+            # Store User question
+            await session.execute(
+                text("""
+                    INSERT INTO neural_nexus.chat_history (user_id, session_id, role, message)
+                    VALUES (:user_id, :session_id, 'user', :message)
+                """),
+                {"user_id": current_user['id'], "session_id": session_id, "message": request.question}
+            )
+            # Store Assistant answer
+            await session.execute(
+                text("""
+                    INSERT INTO neural_nexus.chat_history (user_id, session_id, role, message)
+                    VALUES (:user_id, :session_id, 'assistant', :message)
+                """),
+                {"user_id": current_user['id'], "session_id": session_id, "message": result.get("answer", "")}
+            )
+            await session.commit()
         
         return QueryResponse(
             answer=result.get("answer", "No answer generated"),
@@ -103,16 +142,28 @@ async def run_query(
 @router.get("/chat/history/{session_id}")
 async def get_chat_history(
     session_id: str,
-    limit: int = 20,
+    limit: int = 10,  # 5 Q&A pairs
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Get chat history for a session (Sliding Window: last 5 for context)."""
-    # TODO: Query PostgreSQL for chat history
-    return {
-        "session_id": session_id,
-        "messages": [],
-        "total_count": 0,
-    }
+    async with get_postgres_session() as session:
+        result = await session.execute(
+            text("""
+                SELECT role, message, citations, timestamp
+                FROM neural_nexus.chat_history
+                WHERE session_id = :session_id AND user_id = :user_id
+                ORDER BY timestamp DESC
+                LIMIT :limit
+            """),
+            {"session_id": session_id, "user_id": current_user['id'], "limit": limit}
+        )
+        messages = [dict(r) for r in reversed(result.fetchall())]
+        
+        return {
+            "session_id": session_id,
+            "messages": messages,
+            "total_count": len(messages),
+        }
 
 
 @router.get("/chat/sessions")
@@ -120,8 +171,20 @@ async def list_chat_sessions(
     current_user: dict = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
     """List all chat sessions for the current user."""
-    # TODO: Query PostgreSQL for user's sessions
-    return []
+    async with get_postgres_session() as session:
+        result = await session.execute(
+            text("""
+                SELECT DISTINCT ON (session_id) 
+                    session_id, 
+                    message as last_message, 
+                    timestamp as last_activity
+                FROM neural_nexus.chat_history
+                WHERE user_id = :user_id
+                ORDER BY session_id, timestamp DESC
+            """),
+            {"user_id": current_user['id']}
+        )
+        return [dict(r) for r in result.fetchall()]
 
 
 @router.delete("/chat/session/{session_id}")
@@ -130,5 +193,11 @@ async def delete_chat_session(
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, str]:
     """Delete a chat session and its history."""
-    # TODO: Delete from PostgreSQL
+    async with get_postgres_session() as session:
+        await session.execute(
+            text("DELETE FROM neural_nexus.chat_history WHERE session_id = :session_id AND user_id = :user_id"),
+            {"session_id": session_id, "user_id": current_user['id']}
+        )
+        await session.commit()
+        
     return {"message": f"Session {session_id} deleted"}

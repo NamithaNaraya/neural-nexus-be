@@ -75,11 +75,12 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         # Calculate duration
         duration_ms = int((time.time() - start_time) * 1000)
         
-        # Log request
-        logger.info(
-            f"{request.method} {request.url.path} "
-            f"- {response.status_code} ({duration_ms}ms)"
-        )
+        # Log request (skip noisy endpoints)
+        if not any(path in request.url.path for path in ["/health", "/status", "/sse"]):
+            logger.info(
+                f"{request.method} {request.url.path} "
+                f"- {response.status_code} ({duration_ms}ms)"
+            )
         
         # Add timing header
         response.headers["X-Response-Time"] = f"{duration_ms}ms"

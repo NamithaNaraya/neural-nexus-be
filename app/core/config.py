@@ -38,10 +38,16 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     
     # === AI Services ===
+    LLM_PROVIDER: str = "gemini"  # "ollama" or "gemini"
+    
+    # Ollama (used for embeddings)
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "gemma2:latest"
-    OLLAMA_EMBED_MODEL: str = "mxbai-embed-large"
-    GOOGLE_API_KEY: Optional[str] = None  # Optional cloud fallback
+    OLLAMA_MODEL: str = "llama3:latest"
+    OLLAMA_EMBED_MODEL: str = "mxbai-embed-large:latest"
+    
+    # Gemini (used for extracting and chat)
+    GEMINI_MODEL: str = "gemini-1.5-pro"
+    GOOGLE_API_KEY: Optional[str] = None
     
     # === Azure Storage ===
     AZURE_STORAGE_CONNECTION_STRING: Optional[str] = None
@@ -50,7 +56,7 @@ class Settings(BaseSettings):
     # === Performance Tuning ===
     CELERY_WORKER_CONCURRENCY: int = 4
     MAX_CHUNK_PARALLEL: int = 10
-    AI_REQUEST_TIMEOUT: int = 30
+    AI_REQUEST_TIMEOUT: int = 120  # Increased for large documents
     CIRCUIT_BREAKER_THRESHOLD: int = 5
     
     # === Feature Flags ===

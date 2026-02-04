@@ -5,6 +5,7 @@ Handles all database writes:
 - Neo4j (graph structure)
 - PostgreSQL (audit logs, file metadata)
 """
+import json
 import logging
 import uuid
 from datetime import datetime
@@ -77,7 +78,7 @@ class StorageAgent:
                         ON CREATE SET
                             e.id = $entity_id,
                             e.description = $description,
-                            e.properties = $properties,
+                            e.properties = apoc.convert.toJson($properties),
                             e.embedding = $embedding,
                             e.source_text = $source_text,
                             e.confidence = $confidence,
@@ -90,7 +91,25 @@ class StorageAgent:
                                 WHEN NOT $file_id IN e.file_ids 
                                 THEN e.file_ids + $file_id 
                                 ELSE e.file_ids 
-                            END,
+                            END
+                        WITH e, apoc.convert.fromJsonMap(COALESCE(e.properties, '{}')) as existingProps, $properties as newProps, $file_id as file_id
+                        SET e.conflicts = apoc.convert.toJson(
+                                apoc.map.merge(
+                                    apoc.convert.fromJsonMap(COALESCE(e.conflicts, '{}')),
+                                    apoc.map.fromValues(
+                                        REDUCE(acc = [], k IN keys(newProps) |
+                                            CASE 
+                                                WHEN k IN keys(existingProps) AND existingProps[k] <> newProps[k]
+                                                THEN acc + [k, [
+                                                    {value: existingProps[k], source: COALESCE(e.file_ids[0], 'existing')},
+                                                    {value: newProps[k], source: file_id}
+                                                ]]
+                                                ELSE acc
+                                            END
+                                        )
+                                    )
+                                )
+                            ),
                             e.source_count = size(e.file_ids),
                             e.updated_at = datetime()
                         RETURN e.id as node_id
@@ -335,8 +354,96 @@ class StorageAgent:
                     "action": action,
                     "target_type": target_type,
                     "target_id": target_id,
-                    "details": str(details) if details else None,
+                    "details": json.dumps(details) if details else None,
                     "timestamp": datetime.utcnow(),
                 }
             )
             await session.commit()
+
+    async def store_staging(
+        self,
+        file_id: str,
+        entities: List[Any],
+        relationships: List[Any],
+    ) -> None:
+        """
+        Store extracted data in staging table.
+        """
+        # Convert entities/relationships to serializable format
+        entity_dicts = []
+        for e in entities:
+            if hasattr(e, "model_dump"):
+                entity_dicts.append(e.model_dump())
+            elif hasattr(e, "__dict__"):
+                entity_dicts.append({k: v for k, v in e.__dict__.items() if not k.startswith("_")})
+            else:
+                entity_dicts.append(e)
+
+        rel_dicts = []
+        for r in relationships:
+            if hasattr(r, "model_dump"):
+                rel_dicts.append(r.model_dump())
+            elif hasattr(r, "__dict__"):
+                rel_dicts.append({k: v for k, v in r.__dict__.items() if not k.startswith("_")})
+            else:
+                rel_dicts.append(r)
+
+        async with get_postgres_session() as session:
+            # Check if exists (upsert)
+            result = await session.execute(
+                text("SELECT id FROM neural_nexus.entity_staging WHERE file_id = :file_id"),
+                {"file_id": file_id}
+            )
+            exists = result.fetchone()
+
+            if exists:
+                await session.execute(
+                    text("""
+                        UPDATE neural_nexus.entity_staging 
+                        SET entity_data = :entity_data, 
+                            relationship_data = :relationship_data,
+                            created_at = :created_at
+                        WHERE file_id = :file_id
+                    """),
+                    {
+                        "file_id": file_id,
+                        "entity_data": json.dumps(entity_dicts),
+                        "relationship_data": json.dumps(rel_dicts),
+                        "created_at": datetime.utcnow(),
+                    }
+                )
+            else:
+                await session.execute(
+                    text("""
+                        INSERT INTO neural_nexus.entity_staging 
+                        (id, file_id, entity_data, relationship_data, created_at)
+                        VALUES (:id, :file_id, :entity_data, :relationship_data, :created_at)
+                    """),
+                    {
+                        "id": str(uuid.uuid4()),
+                        "file_id": file_id,
+                        "entity_data": json.dumps(entity_dicts),
+                        "relationship_data": json.dumps(rel_dicts),
+                        "created_at": datetime.utcnow(),
+                    }
+                )
+            await session.commit()
+        
+        logger.info(f"Stored {len(entities)} entities and {len(relationships)} relationships in staging for file {file_id}")
+
+    async def get_staging(self, file_id: str) -> Dict[str, List]:
+        """Fetch staging data for a file."""
+        async with get_postgres_session() as session:
+            result = await session.execute(
+                text("SELECT entity_data, relationship_data FROM neural_nexus.entity_staging WHERE file_id = :file_id"),
+                {"file_id": file_id}
+            )
+            row = result.fetchone()
+            if not row:
+                return {"entities": [], "relationships": []}
+            
+            return {
+                "entities": json.loads(row.entity_data) if isinstance(row.entity_data, str) else row.entity_data,
+                "relationships": json.loads(row.relationship_data) if isinstance(row.relationship_data, str) else row.relationship_data,
+            }
+

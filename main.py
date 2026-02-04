@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routes import health, auth, folders, files, upload, graph, query, analytics, sse, websocket
+from app.routes import health, auth, folders, files, upload, graph, query, analytics, sse, websocket, deletion, dashboard
 from app.db.connections import (
     init_neo4j, 
     close_neo4j, 
@@ -27,10 +27,16 @@ from app.core.middleware import RequestLoggingMiddleware
 
 # Configure logging
 logging.basicConfig(
-    level=logging.DEBUG if settings.DEBUG else logging.INFO,
+    level=logging.INFO, # Default to INFO
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Silence noisy libraries
+logging.getLogger("watchfiles").setLevel(logging.WARNING)
+logging.getLogger("neo4j").setLevel(logging.WARNING)
+if not settings.DEBUG:
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 
 @asynccontextmanager
@@ -131,6 +137,8 @@ app.include_router(query.router, prefix="/api/v1", tags=["Query"])
 app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["Analytics"])
 app.include_router(sse.router, prefix="/api/v1/sse", tags=["SSE"])
 app.include_router(websocket.router, prefix="/api/v1/ws", tags=["WebSocket"])
+app.include_router(deletion.router, prefix="/api/v1", tags=["Deletion"])
+app.include_router(dashboard.router, prefix="/api/v1/dashboard", tags=["Dashboard"])
 
 
 @app.get("/")

@@ -145,7 +145,7 @@ class ClusterComparisonService:
                 n.type as type,
                 n.description as description
             """
-            result = self.neo4j.execute_query(query, {"node_ids": node_ids})
+            result = await self.neo4j.execute_query(query, {"node_ids": node_ids})
             
         elif cluster_type == "file" and cluster_id:
             query = """
@@ -157,7 +157,7 @@ class ClusterComparisonService:
                 n.type as type,
                 n.description as description
             """
-            result = self.neo4j.execute_query(query, {"cluster_id": cluster_id})
+            result = await self.neo4j.execute_query(query, {"cluster_id": cluster_id})
             
         elif cluster_type == "folder" and cluster_id:
             query = """
@@ -169,7 +169,7 @@ class ClusterComparisonService:
                 n.type as type,
                 n.description as description
             """
-            result = self.neo4j.execute_query(query, {"cluster_id": cluster_id})
+            result = await self.neo4j.execute_query(query, {"cluster_id": cluster_id})
             
         elif cluster_type == "cluster" and cluster_id:
             # Community/cluster label
@@ -182,7 +182,7 @@ class ClusterComparisonService:
                 n.type as type,
                 n.description as description
             """
-            result = self.neo4j.execute_query(query, {"cluster_id": cluster_id})
+            result = await self.neo4j.execute_query(query, {"cluster_id": cluster_id})
         else:
             return []
         
@@ -236,7 +236,7 @@ class ClusterComparisonService:
         """
         
         try:
-            result = self.neo4j.execute_query(query, {
+            result = await self.neo4j.execute_query(query, {
                 "left_ids": left_list[:100],  # Limit for performance
                 "right_ids": right_list[:100],
             })

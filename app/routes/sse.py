@@ -60,7 +60,7 @@ async def event_generator(user_id: str, request: Request) -> AsyncGenerator[str,
 async def stream_task_events(
     user_id: str,
     request: Request,
-    current_user: dict = Depends(get_current_user),
+    token: str = None,  # Accept token as query param for EventSource
 ) -> StreamingResponse:
     """
     Stream real-time task events to the client.
@@ -69,10 +69,19 @@ async def stream_task_events(
     - Ingestion progress (phase, percentage)
     - AI response chunks (word-by-word)
     - Graph updates (new nodes, relationships)
+    
+    Note: Uses query param for token since EventSource doesn't support headers.
     """
-    # Verify user can only subscribe to their own events
-    if current_user.user_id != user_id and current_user.role != "admin":
-        user_id = current_user.user_id
+    # Validate token if provided
+    if token:
+        try:
+            from app.core.security import decode_token
+            payload = decode_token(token)
+            if payload.get("sub") != user_id:
+                # Token doesn't match user_id, use token's user_id
+                user_id = payload.get("sub", user_id)
+        except Exception as e:
+            logger.warning(f"Invalid SSE token: {e}")
     
     return StreamingResponse(
         event_generator(user_id, request),
@@ -81,6 +90,7 @@ async def stream_task_events(
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
         },
     )
 

@@ -33,13 +33,13 @@ class GraphLayoutService:
         self.driver = neo4j_driver
         self._gds_available: Optional[bool] = None
     
-    def check_gds_availability(self) -> bool:
+    async def check_gds_availability(self) -> bool:
         """Check if GDS is installed and available."""
         if self._gds_available is not None:
             return self._gds_available
         
         try:
-            result = self.driver.execute_query(
+            result = await self.driver.execute_query(
                 "CALL gds.version() YIELD version RETURN version"
             )
             if result.records:
@@ -61,23 +61,40 @@ class GraphLayoutService:
         scale: float = 500.0,
     ) -> Dict[str, LayoutPosition]:
         """
-        Calculate layout for nodes in a folder.
-        
-        Args:
-            folder_id: Folder to calculate layout for
-            algorithm: Layout algorithm (forceAtlas2, fruchtermanReingold)
-            iterations: Number of simulation iterations
-            scale: Scale factor for final positions
-            
-        Returns:
-            Dictionary mapping node IDs to positions
+        Calculate layout for nodes in a folder with 'Floating Island' offset.
         """
-        if self.check_gds_availability():
-            return await self._calculate_gds_layout(
+        # Calculate base positions
+        if await self.check_gds_availability():
+            positions = await self._calculate_gds_layout(
                 folder_id, algorithm, iterations, scale
             )
         else:
-            return await self._calculate_fallback_layout(folder_id, scale)
+            positions = await self._calculate_fallback_layout(folder_id, scale)
+            
+        # Apply 'Floating Island' offset based on folder_id
+        # This ensures that different folders appear in different regions of the graph
+        offset = self._get_folder_offset(folder_id, scale * 3)
+        
+        for node_id in positions:
+            pos = positions[node_id]
+            positions[node_id] = LayoutPosition(
+                x=pos.x + offset[0],
+                y=pos.y + offset[1],
+                z=pos.z + offset[2]
+            )
+            
+        return positions
+
+    def _get_folder_offset(self, folder_id: str, island_gap: float) -> Tuple[float, float, float]:
+        """Generate a deterministic 3D offset for a folder's 'island'."""
+        hash_bytes = hashlib.md5(folder_id.encode()).digest()
+        
+        # Use parts of the hash to create distinct X, Y, Z offsets
+        x_val = (int.from_bytes(hash_bytes[0:4], 'big') / (2**32)) - 0.5
+        y_val = (int.from_bytes(hash_bytes[4:8], 'big') / (2**32)) - 0.5
+        z_val = (int.from_bytes(hash_bytes[8:12], 'big') / (2**32)) - 0.5
+        
+        return (x_val * island_gap, y_val * island_gap, z_val * island_gap)
     
     async def _calculate_gds_layout(
         self,
@@ -103,7 +120,7 @@ class GraphLayoutService:
             RETURN graphName, nodeCount, relationshipCount
             """
             
-            self.driver.execute_query(projection_query, {
+            await self.driver.execute_query(projection_query, {
                 "graph_name": graph_name,
                 "folder_id": folder_id,
             })
@@ -134,7 +151,7 @@ class GraphLayoutService:
                        rand() * $scale AS x, rand() * $scale AS y
                 """
             
-            result = self.driver.execute_query(layout_query, {
+            result = await self.driver.execute_query(layout_query, {
                 "graph_name": graph_name,
                 "iterations": iterations,
                 "scale": scale,
@@ -159,7 +176,7 @@ class GraphLayoutService:
         finally:
             # Cleanup projected graph
             try:
-                self.driver.execute_query(
+                await self.driver.execute_query(
                     "CALL gds.graph.drop($graph_name)",
                     {"graph_name": graph_name}
                 )
@@ -190,7 +207,7 @@ class GraphLayoutService:
                    n.type AS type, COALESCE(n.name, '') AS name, degree
             """
             
-            result = self.driver.execute_query(query, {"folder_id": folder_id})
+            result = await self.driver.execute_query(query, {"folder_id": folder_id})
             
             # Group nodes by type for clustering
             type_groups: Dict[str, List[Tuple[str, str, int]]] = {}
