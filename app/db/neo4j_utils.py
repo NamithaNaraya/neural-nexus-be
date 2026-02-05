@@ -8,12 +8,38 @@ Provides base Cypher utilities and common graph operations:
 - Graph projection helpers
 """
 import logging
+import re
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 
 from app.db.connections import get_neo4j_driver
 
 logger = logging.getLogger(__name__)
+
+
+def sanitize_relationship_type(rel_type: str) -> str:
+    """
+    Convert relationship type to valid Neo4j label format.
+    
+    Neo4j relationship types should be:
+    - UPPERCASE
+    - Use underscores instead of spaces/hyphens
+    - Only contain alphanumeric characters and underscores
+    
+    Examples:
+        "participated in" -> "PARTICIPATED_IN"
+        "is-brother-of" -> "IS_BROTHER_OF"
+        "CHRONICLES" -> "CHRONICLES"
+        "family_of" -> "FAMILY_OF"
+    """
+    if not rel_type:
+        return "RELATED_TO"
+    # Replace spaces, hyphens, and other special chars with underscores
+    sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', rel_type)
+    # Collapse multiple underscores
+    sanitized = re.sub(r'_+', '_', sanitized)
+    # Strip leading/trailing underscores and uppercase
+    return sanitized.strip('_').upper() or "RELATED_TO"
 
 
 # === Index Management ===
@@ -70,25 +96,12 @@ async def create_fulltext_indexes() -> None:
         except Exception as e:
             logger.debug(f"Full-text index exists: {e}")
         
-        # Relationship search index (for Deep Search)
-        try:
-            await session.run("""
-                CREATE FULLTEXT INDEX rel_search IF NOT EXISTS
-                FOR ()-[r:RELATIONSHIP]-() ON EACH [r.description, r.type, r.category]
-            """)
-            logger.info("Created relationship full-text search index")
-        except Exception as e:
-            logger.debug(f"Relationship full-text index exists: {e}")
-        
-        # Relationship type index (for query optimization)
-        try:
-            await session.run("""
-                CREATE INDEX rel_type_idx IF NOT EXISTS 
-                FOR ()-[r:RELATIONSHIP]-() ON (r.type)
-            """)
-            logger.info("Created relationship type index")
-        except Exception as e:
-            logger.debug(f"Relationship type index exists: {e}")
+        # NOTE: Relationship full-text index removed.
+        # With dynamic relationship types (e.g., :PARTICIPATED_IN, :CHRONICLES),
+        # we use type(r) for filtering which is automatically optimized by Neo4j.
+        # Full-text search on relationship properties requires APOC in Neo4j 5.x
+        # and would need to specify all relationship types explicitly.
+        logger.info("Full-text indexes created (relationship indexes skipped for dynamic types)")
 
 
 async def create_vector_index(dimension: int = 768) -> None:
@@ -242,37 +255,79 @@ async def create_relationship(
     properties: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """
-    Create a relationship between two entities.
+    Create a relationship between two entities using dynamic relationship types.
+    
+    Uses APOC for dynamic relationship creation when available,
+    falls back to pre-sanitized Cypher query.
     
     Returns True if relationship was created.
     """
     driver = get_neo4j_driver()
     
-    query = """
-    MATCH (source:Entity {id: $source_id})
-    MATCH (target:Entity {id: $target_id})
-    CREATE (source)-[r:RELATIONSHIP {
-        type: $rel_type,
-        strength: $strength,
-        description: $description,
-        created_at: datetime()
-    }]->(target)
-    RETURN r
-    """
-    
+    # Sanitize relationship type to valid Neo4j format
+    sanitized_type = sanitize_relationship_type(rel_type)
     props = properties or {}
     
+    # Try APOC-based dynamic relationship creation first
+    apoc_query = """
+    MATCH (source:Entity {id: $source_id})
+    MATCH (target:Entity {id: $target_id})
+    CALL apoc.merge.relationship(
+        source,
+        $rel_type,
+        {strength: $strength, description: $description},
+        {created_at: datetime()},
+        target,
+        {}
+    ) YIELD rel
+    RETURN rel
+    """
+    
     async with driver.session() as session:
-        result = await session.run(
-            query,
-            source_id=source_id,
-            target_id=target_id,
-            rel_type=rel_type,
-            strength=props.get("strength", 1.0),
-            description=props.get("description", ""),
-        )
-        record = await result.single()
-        return record is not None
+        try:
+            result = await session.run(
+                apoc_query,
+                source_id=source_id,
+                target_id=target_id,
+                rel_type=sanitized_type,
+                strength=props.get("strength", 1.0),
+                description=props.get("description", ""),
+            )
+            record = await result.single()
+            return record is not None
+        except Exception as apoc_error:
+            # APOC not available, use fallback with common relationship types
+            logger.debug(f"APOC not available, using fallback: {apoc_error}")
+            
+            # Fallback: Use a parameterized query with the sanitized type
+            # Note: This requires the relationship type to be embedded in the query
+            # We use a generic query and set the type property as backup
+            fallback_query = f"""
+            MATCH (source:Entity {{id: $source_id}})
+            MATCH (target:Entity {{id: $target_id}})
+            MERGE (source)-[r:{sanitized_type}]->(target)
+            ON CREATE SET
+                r.strength = $strength,
+                r.description = $description,
+                r.created_at = datetime()
+            ON MATCH SET
+                r.updated_at = datetime()
+            RETURN r
+            """
+            
+            try:
+                result = await session.run(
+                    fallback_query,
+                    source_id=source_id,
+                    target_id=target_id,
+                    strength=props.get("strength", 1.0),
+                    description=props.get("description", ""),
+                )
+                record = await result.single()
+                return record is not None
+            except Exception as fallback_error:
+                logger.error(f"Failed to create relationship: {fallback_error}")
+                return False
 
 
 # === Graph Queries ===
@@ -290,9 +345,15 @@ async def get_folder_graph(
     
     query = """
     MATCH (e:Entity {folder_id: $folder_id})
-    OPTIONAL MATCH (e)-[r:RELATIONSHIP]->(target:Entity {folder_id: $folder_id})
-    WITH collect(DISTINCT e) as entities, collect(DISTINCT {source: e.id, target: target.id, type: r.type, strength: r.strength}) as rels
-    RETURN entities, [r IN rels WHERE r.target IS NOT NULL] as relationships
+    OPTIONAL MATCH (e)-[r]->(target:Entity {folder_id: $folder_id})
+    WITH collect(DISTINCT e) as entities, 
+         collect(DISTINCT {
+             source: e.id, 
+             target: target.id, 
+             type: type(r),
+             strength: r.strength
+         }) as rels
+    RETURN entities, [rel IN rels WHERE rel.target IS NOT NULL] as relationships
     LIMIT $limit
     """
     
@@ -315,9 +376,13 @@ async def get_file_graph(file_id: str) -> Dict[str, List]:
     
     query = """
     MATCH (e:Entity {file_id: $file_id})
-    OPTIONAL MATCH (e)-[r:RELATIONSHIP]->(target:Entity {file_id: $file_id})
+    OPTIONAL MATCH (e)-[r]->(target:Entity {file_id: $file_id})
     RETURN collect(DISTINCT e) as entities, 
-           collect(DISTINCT {source: e.id, target: target.id, type: r.type}) as relationships
+           collect(DISTINCT {
+               source: e.id, 
+               target: target.id, 
+               type: type(r)
+           }) as relationships
     """
     
     async with driver.session() as session:

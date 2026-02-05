@@ -101,7 +101,7 @@ class PermissionService:
             return PermissionLevel.NONE
         
         # Check if user is owner
-        if str(folder.owner_id) == user_id:
+        if str(folder.user_id) == user_id:
             permission = PermissionLevel.OWNER
         else:
             # Check folder permissions table
@@ -163,7 +163,7 @@ class PermissionService:
         """Get all folder IDs the user can access with at least min_level."""
         # Query folders owned by user
         result = await self.db.execute(
-            select(Folder.id).where(Folder.owner_id == user_id)
+            select(Folder.id).where(Folder.user_id == user_id)
         )
         owned_folders = [str(row[0]) for row in result.fetchall()]
         

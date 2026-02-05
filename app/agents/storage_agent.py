@@ -7,6 +7,7 @@ Handles all database writes:
 """
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Tuple
@@ -14,6 +15,7 @@ from typing import Any, Dict, List, Tuple
 from sqlalchemy import text
 
 from app.db.connections import get_neo4j_driver, get_postgres_session
+from app.db.neo4j_utils import sanitize_relationship_type
 
 logger = logging.getLogger(__name__)
 
@@ -179,41 +181,86 @@ class StorageAgent:
                     neo4j_source = entity_id_map.get(source_id, source_id)
                     neo4j_target = entity_id_map.get(target_id, target_id)
                     
-                    # Create relationship
-                    result = await session.run("""
+                    # Sanitize relationship type to valid Neo4j format
+                    sanitized_type = sanitize_relationship_type(rel_type)
+                    
+                    # Try APOC-based dynamic relationship creation first
+                    apoc_query = """
                         MATCH (source:Entity {id: $source_id, folder_id: $folder_id})
                         MATCH (target:Entity {id: $target_id, folder_id: $folder_id})
-                        MERGE (source)-[r:RELATIONSHIP {type: $rel_type}]->(target)
-                        ON CREATE SET
-                            r.description = $description,
-                            r.strength = $strength,
-                            r.source_text = $source_text,
-                            r.confidence = $confidence,
-                            r.file_ids = [$file_id],
-                            r.created_at = datetime()
-                        ON MATCH SET
-                            r.file_ids = CASE 
-                                WHEN NOT $file_id IN r.file_ids 
-                                THEN r.file_ids + $file_id 
-                                ELSE r.file_ids 
-                            END,
-                            r.updated_at = datetime()
-                        RETURN r
-                    """,
-                        source_id=neo4j_source,
-                        target_id=neo4j_target,
-                        rel_type=rel_type,
-                        description=description,
-                        strength=strength,
-                        source_text=source_text,
-                        confidence=confidence,
-                        folder_id=folder_id,
-                        file_id=file_id,
-                    )
+                        CALL apoc.merge.relationship(
+                            source,
+                            $rel_type,
+                            {},
+                            {
+                                description: $description,
+                                strength: $strength,
+                                source_text: $source_text,
+                                confidence: $confidence,
+                                file_ids: [$file_id],
+                                created_at: datetime()
+                            },
+                            target,
+                            {}
+                        ) YIELD rel
+                        RETURN rel
+                    """
                     
-                    record = await result.single()
-                    if record:
-                        created_count += 1
+                    try:
+                        result = await session.run(
+                            apoc_query,
+                            source_id=neo4j_source,
+                            target_id=neo4j_target,
+                            rel_type=sanitized_type,
+                            description=description,
+                            strength=strength,
+                            source_text=source_text,
+                            confidence=confidence,
+                            folder_id=folder_id,
+                            file_id=file_id,
+                        )
+                        record = await result.single()
+                        if record:
+                            created_count += 1
+                    except Exception as apoc_error:
+                        # APOC not available, use fallback with dynamic type in query
+                        logger.debug(f"APOC not available, using fallback: {apoc_error}")
+                        
+                        fallback_query = f"""
+                            MATCH (source:Entity {{id: $source_id, folder_id: $folder_id}})
+                            MATCH (target:Entity {{id: $target_id, folder_id: $folder_id}})
+                            MERGE (source)-[r:{sanitized_type}]->(target)
+                            ON CREATE SET
+                                r.description = $description,
+                                r.strength = $strength,
+                                r.source_text = $source_text,
+                                r.confidence = $confidence,
+                                r.file_ids = [$file_id],
+                                r.created_at = datetime()
+                            ON MATCH SET
+                                r.file_ids = CASE 
+                                    WHEN NOT $file_id IN r.file_ids 
+                                    THEN r.file_ids + $file_id 
+                                    ELSE r.file_ids 
+                                END,
+                                r.updated_at = datetime()
+                            RETURN r
+                        """
+                        
+                        result = await session.run(
+                            fallback_query,
+                            source_id=neo4j_source,
+                            target_id=neo4j_target,
+                            description=description,
+                            strength=strength,
+                            source_text=source_text,
+                            confidence=confidence,
+                            folder_id=folder_id,
+                            file_id=file_id,
+                        )
+                        record = await result.single()
+                        if record:
+                            created_count += 1
                         
                 except Exception as e:
                     logger.error(f"Failed to store relationship: {e}")

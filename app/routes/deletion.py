@@ -64,7 +64,7 @@ async def initiate_deletion(
     # For now, assume folder-level check
     if request.target_type == "folder":
         has_permission = await permission_service.check_permission(
-            str(current_user.id),
+            str(current_user["id"]),
             request.target_id,
             PermissionLevel.OWNER,  # Only owners can delete
         )
@@ -79,13 +79,13 @@ async def initiate_deletion(
     if request.target_type == "folder":
         job = await deletion_service.delete_folder(
             folder_id=request.target_id,
-            user_id=str(current_user.id),
+            user_id=str(current_user["id"]),
             background=request.background,
         )
     else:
         job = await deletion_service.delete_file(
             file_id=request.target_id,
-            user_id=str(current_user.id),
+            user_id=str(current_user["id"]),
             background=request.background,
         )
     
@@ -126,7 +126,7 @@ async def get_deletion_status(
         )
     
     # Only allow users to see their own jobs
-    if job.user_id != str(current_user.id):
+    if job.user_id != str(current_user["id"]):
         raise HTTPException(
             status_code=403,
             detail="Access denied to this deletion job"
@@ -156,7 +156,7 @@ async def list_deletion_jobs(
         List of active and recent deletion jobs
     """
     deletion_service = get_deletion_service(neo4j, db)
-    jobs = deletion_service.get_active_jobs(user_id=str(current_user.id))
+    jobs = deletion_service.get_active_jobs(user_id=str(current_user["id"]))
     
     return [
         DeletionJobResponse(
@@ -240,7 +240,7 @@ async def delete_file(
     
     job = await deletion_service.delete_file(
         file_id=file_id,
-        user_id=str(current_user.id),
+        user_id=str(current_user["id"]),
         background=background,
     )
     
@@ -276,7 +276,7 @@ async def delete_folder(
     # Check permissions
     permission_service = get_permission_service(db)
     has_permission = await permission_service.check_permission(
-        str(current_user.id),
+        str(current_user["id"]),
         folder_id,
         PermissionLevel.OWNER,
     )
@@ -290,7 +290,7 @@ async def delete_folder(
     
     job = await deletion_service.delete_folder(
         folder_id=folder_id,
-        user_id=str(current_user.id),
+        user_id=str(current_user["id"]),
         background=background,
     )
     
