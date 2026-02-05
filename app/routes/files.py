@@ -212,6 +212,64 @@ async def get_extraction_preview(
     )
 
 
+
+class ExtractionUpdate(BaseModel):
+    """Update payload for extraction data."""
+    entities: List[dict]
+    relationships: List[dict]
+
+
+@router.put("/{file_id}/extraction")
+async def update_extraction_data(
+    file_id: str,
+    update: ExtractionUpdate,
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """
+    Update the extracted entities and relationships in staging.
+    Allows users to correct data before approval.
+    """
+    user_id = current_user["id"]
+    
+    async with get_postgres_session() as session:
+        # Verify file belongs to user and is pending review
+        result = await session.execute(
+            text("""
+                SELECT f.id, f.status, f.folder_id
+                FROM neural_nexus.files f
+                JOIN neural_nexus.folders fo ON fo.id = f.folder_id
+                WHERE f.id = :file_id AND fo.user_id = :user_id
+            """),
+            {"file_id": file_id, "user_id": user_id}
+        )
+        row = result.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        if row.status != 'ready_for_review':
+            raise HTTPException(
+                status_code=400, 
+                detail=f"File is not in review mode (status: {row.status})"
+            )
+            
+    # Update staging data
+    from app.agents.storage_agent import StorageAgent
+    storage = StorageAgent()
+    
+    try:
+        await storage.store_staging(
+            file_id,
+            update.entities,
+            update.relationships
+        )
+    except Exception as e:
+        logger.error(f"Failed to update staging data: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update data")
+        
+    return {"message": "Extraction data updated successfully"}
+
+
 @router.post("/{file_id}/approve")
 async def approve_file_ingestion(
     file_id: str,

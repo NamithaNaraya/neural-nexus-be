@@ -116,7 +116,7 @@ Hallucinations are strictly forbidden. Only extract what you can directly quote 
                    f"{len(entity_types)} entity types, {len(rel_types)} relationship types")
         
         # Limit concurrency to avoid hitting API rate limits
-        sem = asyncio.Semaphore(5)
+        sem = asyncio.Semaphore(10)
 
         async def _process_chunk_safe(i, chunk):
             async with sem:

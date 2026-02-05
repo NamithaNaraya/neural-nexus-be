@@ -62,6 +62,38 @@ class NodeDetailsResponse(BaseModel):
     connection_count: int
 
 
+# === CRUD Request Models ===
+class CreateNodeRequest(BaseModel):
+    """Request to create a new node."""
+    name: str
+    type: str
+    description: Optional[str] = None
+    properties: Dict[str, Any] = {}
+    folder_id: Optional[str] = None
+    file_id: Optional[str] = None
+    color: Optional[str] = None  # Custom styling
+    size: Optional[float] = None  # Custom styling
+
+
+class UpdateNodeRequest(BaseModel):
+    """Request to update an existing node."""
+    name: Optional[str] = None
+    type: Optional[str] = None
+    description: Optional[str] = None
+    properties: Optional[Dict[str, Any]] = None
+    color: Optional[str] = None
+    size: Optional[float] = None
+
+
+class CreateRelationshipRequest(BaseModel):
+    """Request to create a relationship between two nodes."""
+    source_id: str
+    target_id: str
+    type: str
+    properties: Dict[str, Any] = {}
+    strength: float = 1.0
+
+
 # === Utilities ===
 def serialize_neo4j_values(data: Any) -> Any:
     """Recursively convert Neo4j types to JSON-serializable Python types."""
@@ -688,3 +720,365 @@ async def export_analytics(
     except Exception as e:
         logger.error(f"Analytics export failed: {e}")
         return {"error": str(e), "folder_id": folder_id}
+
+
+# === Node CRUD Operations ===
+
+@router.post("/nodes")
+async def create_node(
+    request: CreateNodeRequest,
+    current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
+) -> Dict[str, Any]:
+    """
+    Create a new node in Neo4j.
+    
+    Supports custom properties, styling (color, size), and folder/file association.
+    """
+    import uuid
+    from datetime import datetime
+    
+    try:
+        node_id = str(uuid.uuid4())
+        
+        # Build properties
+        props = {
+            "id": node_id,
+            "name": request.name,
+            "type": request.type,
+            "description": request.description or "",
+            "created_at": datetime.utcnow().isoformat(),
+            "created_by": current_user.get("id", "unknown"),
+            "is_manual": True,  # Mark as manually created
+        }
+        
+        # Add optional properties
+        if request.folder_id:
+            props["folder_id"] = request.folder_id
+        if request.file_id:
+            props["file_id"] = request.file_id
+        if request.color:
+            props["color"] = request.color
+        if request.size:
+            props["size"] = request.size
+        
+        # Merge custom properties
+        if request.properties:
+            for key, value in request.properties.items():
+                if key not in props:  # Don't overwrite core props
+                    props[key] = value
+        
+        # Create node in Neo4j
+        query = f"""
+        CREATE (n:{request.type} $props)
+        RETURN n
+        """
+        
+        result = neo4j.execute_query(query, {"props": props})
+        
+        logger.info(f"Created node: {node_id} ({request.name})")
+        
+        return {
+            "success": True,
+            "node": {
+                "id": node_id,
+                "name": request.name,
+                "type": request.type,
+                "description": request.description,
+                "properties": request.properties,
+                "color": request.color,
+                "size": request.size,
+            }
+        }
+    except Exception as e:
+        logger.error(f"Failed to create node: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/nodes/{node_id}")
+async def update_node(
+    node_id: str,
+    request: UpdateNodeRequest,
+    current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
+) -> Dict[str, Any]:
+    """
+    Update an existing node's properties.
+    
+    Only provided fields are updated (PATCH-like behavior).
+    """
+    from datetime import datetime
+    
+    try:
+        # Build SET clauses for provided fields
+        set_clauses = []
+        params = {"node_id": node_id}
+        
+        if request.name is not None:
+            set_clauses.append("n.name = $name")
+            params["name"] = request.name
+        if request.type is not None:
+            set_clauses.append("n.type = $type")
+            params["type"] = request.type
+        if request.description is not None:
+            set_clauses.append("n.description = $description")
+            params["description"] = request.description
+        if request.color is not None:
+            set_clauses.append("n.color = $color")
+            params["color"] = request.color
+        if request.size is not None:
+            set_clauses.append("n.size = $size")
+            params["size"] = request.size
+        
+        # Add updated_at timestamp
+        set_clauses.append("n.updated_at = $updated_at")
+        params["updated_at"] = datetime.utcnow().isoformat()
+        
+        # Handle custom properties
+        if request.properties:
+            for key, value in request.properties.items():
+                safe_key = key.replace(" ", "_").replace("-", "_")
+                set_clauses.append(f"n.{safe_key} = ${safe_key}")
+                params[safe_key] = value
+        
+        if not set_clauses:
+            return {"success": False, "error": "No fields to update"}
+        
+        query = f"""
+        MATCH (n) WHERE n.id = $node_id
+        SET {', '.join(set_clauses)}
+        RETURN n
+        """
+        
+        result = neo4j.execute_query(query, params)
+        
+        if not result.records:
+            raise HTTPException(status_code=404, detail="Node not found")
+        
+        logger.info(f"Updated node: {node_id}")
+        
+        return {
+            "success": True,
+            "node_id": node_id,
+            "updated_fields": list(params.keys()),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update node: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/nodes/{node_id}")
+async def delete_node(
+    node_id: str,
+    current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
+) -> Dict[str, Any]:
+    """
+    Delete a node and all its relationships from Neo4j.
+    
+    This is a destructive operation - the node cannot be recovered.
+    """
+    try:
+        # First check if node exists
+        check_query = "MATCH (n) WHERE n.id = $node_id RETURN n"
+        check_result = neo4j.execute_query(check_query, {"node_id": node_id})
+        
+        if not check_result.records:
+            raise HTTPException(status_code=404, detail="Node not found")
+        
+        # Delete node and all relationships
+        delete_query = """
+        MATCH (n) WHERE n.id = $node_id
+        DETACH DELETE n
+        RETURN count(n) as deleted
+        """
+        
+        result = neo4j.execute_query(delete_query, {"node_id": node_id})
+        
+        logger.info(f"Deleted node: {node_id}")
+        
+        return {
+            "success": True,
+            "node_id": node_id,
+            "message": "Node and all relationships deleted successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete node: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# === Relationship CRUD Operations ===
+
+@router.post("/relationships")
+async def create_relationship(
+    request: CreateRelationshipRequest,
+    current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
+) -> Dict[str, Any]:
+    """
+    Create a relationship between two existing nodes.
+    
+    The relationship type must be a valid Neo4j relationship type.
+    """
+    import uuid
+    from datetime import datetime
+    
+    try:
+        rel_id = str(uuid.uuid4())
+        
+        # Sanitize relationship type (Neo4j relationship types must be uppercase/underscore)
+        rel_type = request.type.upper().replace(" ", "_").replace("-", "_")
+        
+        # Build relationship properties
+        props = {
+            "id": rel_id,
+            "type": request.type,  # Original type string
+            "strength": request.strength,
+            "created_at": datetime.utcnow().isoformat(),
+            "created_by": current_user.get("id", "unknown"),
+            "is_manual": True,
+        }
+        
+        # Merge custom properties
+        if request.properties:
+            for key, value in request.properties.items():
+                if key not in props:
+                    props[key] = value
+        
+        # Create relationship
+        query = f"""
+        MATCH (source), (target)
+        WHERE source.id = $source_id AND target.id = $target_id
+        CREATE (source)-[r:{rel_type} $props]->(target)
+        RETURN r, source.name as source_name, target.name as target_name
+        """
+        
+        result = neo4j.execute_query(query, {
+            "source_id": request.source_id,
+            "target_id": request.target_id,
+            "props": props,
+        })
+        
+        if not result.records:
+            raise HTTPException(status_code=404, detail="One or both nodes not found")
+        
+        record = result.records[0]
+        
+        logger.info(f"Created relationship: {record['source_name']} --[{request.type}]--> {record['target_name']}")
+        
+        return {
+            "success": True,
+            "relationship": {
+                "id": rel_id,
+                "source_id": request.source_id,
+                "target_id": request.target_id,
+                "type": request.type,
+                "strength": request.strength,
+                "source_name": record["source_name"],
+                "target_name": record["target_name"],
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to create relationship: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/relationships/{relationship_id}")
+async def delete_relationship(
+    relationship_id: str,
+    current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
+) -> Dict[str, Any]:
+    """
+    Delete a relationship by its ID.
+    """
+    try:
+        # Delete relationship by ID property
+        query = """
+        MATCH ()-[r]->()
+        WHERE r.id = $rel_id
+        DELETE r
+        RETURN count(r) as deleted
+        """
+        
+        result = neo4j.execute_query(query, {"rel_id": relationship_id})
+        
+        deleted_count = result.records[0]["deleted"] if result.records else 0
+        
+        if deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Relationship not found")
+        
+        logger.info(f"Deleted relationship: {relationship_id}")
+        
+        return {
+            "success": True,
+            "relationship_id": relationship_id,
+            "message": "Relationship deleted successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete relationship: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/node-types")
+async def get_node_types(
+    current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
+) -> Dict[str, Any]:
+    """
+    Get all node types (labels) in the database for dropdown selection.
+    """
+    try:
+        query = """
+        CALL db.labels() YIELD label
+        RETURN collect(label) as types
+        """
+        result = neo4j.execute_query(query, {})
+        
+        types = result.records[0]["types"] if result.records else []
+        
+        # Add common defaults if missing
+        default_types = ["Person", "Organization", "Concept", "Event", "Location", "Document", "Topic"]
+        all_types = list(set(types + default_types))
+        all_types.sort()
+        
+        return {"types": all_types}
+    except Exception as e:
+        logger.error(f"Failed to get node types: {e}")
+        return {"types": ["Person", "Organization", "Concept", "Event", "Location"]}
+
+
+@router.get("/relationship-types")
+async def get_relationship_types(
+    current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
+) -> Dict[str, Any]:
+    """
+    Get all relationship types in the database for dropdown selection.
+    """
+    try:
+        query = """
+        CALL db.relationshipTypes() YIELD relationshipType
+        RETURN collect(relationshipType) as types
+        """
+        result = neo4j.execute_query(query, {})
+        
+        types = result.records[0]["types"] if result.records else []
+        
+        # Add common defaults
+        default_types = ["RELATED_TO", "BELONGS_TO", "PART_OF", "CREATED_BY", "WORKS_AT", "LOCATED_IN", "KNOWS"]
+        all_types = list(set(types + default_types))
+        all_types.sort()
+        
+        return {"types": all_types}
+    except Exception as e:
+        logger.error(f"Failed to get relationship types: {e}")
+        return {"types": ["RELATED_TO", "BELONGS_TO", "PART_OF"]}
