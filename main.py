@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 # Silence noisy libraries
 logging.getLogger("watchfiles").setLevel(logging.WARNING)
 logging.getLogger("neo4j").setLevel(logging.WARNING)
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)  # Silence SQL queries
+logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 if not settings.DEBUG:
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 

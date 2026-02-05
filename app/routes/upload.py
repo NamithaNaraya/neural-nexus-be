@@ -104,7 +104,7 @@ async def _process_file_async(
             folder_id=folder_id,
             user_id=user_id,
             file_type=file_type,
-            auto_approve=False,  # Require human review for flagged items
+            auto_approve=False,  # Pause for review before committing to Neo4j
             progress_callback=progress_callback,
         )
         

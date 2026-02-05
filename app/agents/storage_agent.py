@@ -55,20 +55,31 @@ class StorageAgent:
         driver = get_neo4j_driver()
         entity_id_map = {}
         
+        def get_value(obj, key, default=None):
+            """Safely get value from dict or dataclass."""
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            elif hasattr(obj, key):
+                return getattr(obj, key, default)
+            return default
+        
         async with driver.session() as session:
             for entity in entities:
                 try:
-                    # Extract entity data
-                    entity_id = entity.id if hasattr(entity, 'id') else entity.get('id', str(uuid.uuid4()))
-                    name = entity.name if hasattr(entity, 'name') else entity.get('name', '')
-                    entity_type = entity.type if hasattr(entity, 'type') else entity.get('type', 'Concept')
-                    description = entity.description if hasattr(entity, 'description') else entity.get('description', '')
-                    properties = entity.properties if hasattr(entity, 'properties') else entity.get('properties', {})
-                    embedding = entity.embedding if hasattr(entity, 'embedding') else entity.get('embedding')
-                    source_text = entity.source_text if hasattr(entity, 'source_text') else entity.get('source_text', '')
-                    confidence = entity.confidence if hasattr(entity, 'confidence') else entity.get('confidence', 1.0)
+                    # Extract entity data using helper
+                    entity_id = get_value(entity, 'id', str(uuid.uuid4()))
+                    name = get_value(entity, 'name', '')
+                    entity_type = get_value(entity, 'type', 'Concept')
+                    description = get_value(entity, 'description', '')
+                    properties = get_value(entity, 'properties', {})
+                    embedding = get_value(entity, 'embedding', None)
+                    source_text = get_value(entity, 'source_text', '')
+                    confidence = get_value(entity, 'confidence', 1.0)
                     
-                    # Create entity node
+                    # Convert properties dict to JSON string (no APOC needed)
+                    properties_json = json.dumps(properties) if properties else '{}'
+                    
+                    # Create entity node - simplified without APOC
                     result = await session.run("""
                         MERGE (e:Entity {
                             name: $name,
@@ -78,7 +89,7 @@ class StorageAgent:
                         ON CREATE SET
                             e.id = $entity_id,
                             e.description = $description,
-                            e.properties = apoc.convert.toJson($properties),
+                            e.properties = $properties_json,
                             e.embedding = $embedding,
                             e.source_text = $source_text,
                             e.confidence = $confidence,
@@ -91,25 +102,7 @@ class StorageAgent:
                                 WHEN NOT $file_id IN e.file_ids 
                                 THEN e.file_ids + $file_id 
                                 ELSE e.file_ids 
-                            END
-                        WITH e, apoc.convert.fromJsonMap(COALESCE(e.properties, '{}')) as existingProps, $properties as newProps, $file_id as file_id
-                        SET e.conflicts = apoc.convert.toJson(
-                                apoc.map.merge(
-                                    apoc.convert.fromJsonMap(COALESCE(e.conflicts, '{}')),
-                                    apoc.map.fromValues(
-                                        REDUCE(acc = [], k IN keys(newProps) |
-                                            CASE 
-                                                WHEN k IN keys(existingProps) AND existingProps[k] <> newProps[k]
-                                                THEN acc + [k, [
-                                                    {value: existingProps[k], source: COALESCE(e.file_ids[0], 'existing')},
-                                                    {value: newProps[k], source: file_id}
-                                                ]]
-                                                ELSE acc
-                                            END
-                                        )
-                                    )
-                                )
-                            ),
+                            END,
                             e.source_count = size(e.file_ids),
                             e.updated_at = datetime()
                         RETURN e.id as node_id
@@ -118,7 +111,7 @@ class StorageAgent:
                         name=name,
                         type=entity_type,
                         description=description,
-                        properties=properties,
+                        properties_json=properties_json,
                         embedding=embedding,
                         source_text=source_text,
                         confidence=confidence,
@@ -162,17 +155,25 @@ class StorageAgent:
         driver = get_neo4j_driver()
         created_count = 0
         
+        def get_value(obj, key, default=None):
+            """Safely get value from dict or dataclass."""
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            elif hasattr(obj, key):
+                return getattr(obj, key, default)
+            return default
+        
         async with driver.session() as session:
             for rel in relationships:
                 try:
-                    # Extract relationship data
-                    source_id = rel.source_entity_id if hasattr(rel, 'source_entity_id') else rel.get('source_entity_id')
-                    target_id = rel.target_entity_id if hasattr(rel, 'target_entity_id') else rel.get('target_entity_id')
-                    rel_type = rel.relationship_type if hasattr(rel, 'relationship_type') else rel.get('relationship_type', 'RELATED_TO')
-                    description = rel.description if hasattr(rel, 'description') else rel.get('description', '')
-                    strength = rel.strength if hasattr(rel, 'strength') else rel.get('strength', 1.0)
-                    source_text = rel.source_text if hasattr(rel, 'source_text') else rel.get('source_text', '')
-                    confidence = rel.confidence if hasattr(rel, 'confidence') else rel.get('confidence', 1.0)
+                    # Extract relationship data using helper
+                    source_id = get_value(rel, 'source_entity_id')
+                    target_id = get_value(rel, 'target_entity_id')
+                    rel_type = get_value(rel, 'relationship_type', 'RELATED_TO')
+                    description = get_value(rel, 'description', '')
+                    strength = get_value(rel, 'strength', 1.0)
+                    source_text = get_value(rel, 'source_text', '')
+                    confidence = get_value(rel, 'confidence', 1.0)
                     
                     # Map to Neo4j IDs
                     neo4j_source = entity_id_map.get(source_id, source_id)
@@ -243,14 +244,22 @@ class StorageAgent:
         driver = get_neo4j_driver()
         stored_count = 0
         
+        def get_value(obj, key, default=None):
+            """Safely get value from dict or dataclass."""
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            elif hasattr(obj, key):
+                return getattr(obj, key, default)
+            return default
+        
         async with driver.session() as session:
             for chunk in chunks:
                 try:
-                    chunk_id = chunk.chunk_id if hasattr(chunk, 'chunk_id') else chunk.get('chunk_id', str(uuid.uuid4()))
-                    content = chunk.content if hasattr(chunk, 'content') else chunk.get('content', '')
-                    embedding = chunk.embedding if hasattr(chunk, 'embedding') else chunk.get('embedding')
-                    section_type = chunk.section_type if hasattr(chunk, 'section_type') else chunk.get('section_type', 'paragraph')
-                    section_title = chunk.section_title if hasattr(chunk, 'section_title') else chunk.get('section_title')
+                    chunk_id = get_value(chunk, 'chunk_id', str(uuid.uuid4()))
+                    content = get_value(chunk, 'content', '')
+                    embedding = get_value(chunk, 'embedding', None)
+                    section_type = get_value(chunk, 'section_type', 'paragraph')
+                    section_title = get_value(chunk, 'section_title', None)
                     
                     await session.run("""
                         CREATE (c:Chunk {
@@ -430,6 +439,9 @@ class StorageAgent:
             await session.commit()
         
         logger.info(f"Stored {len(entities)} entities and {len(relationships)} relationships in staging for file {file_id}")
+        # Debug: log first entity to verify format
+        if entity_dicts:
+            logger.info(f"[STAGING DEBUG] Sample entity: {entity_dicts[0].get('name', 'N/A')} ({entity_dicts[0].get('type', 'N/A')})")
 
     async def get_staging(self, file_id: str) -> Dict[str, List]:
         """Fetch staging data for a file."""
@@ -440,10 +452,16 @@ class StorageAgent:
             )
             row = result.fetchone()
             if not row:
+                logger.warning(f"[GET_STAGING DEBUG] No staging data found for file {file_id}")
                 return {"entities": [], "relationships": []}
             
+            entities = json.loads(row.entity_data) if isinstance(row.entity_data, str) else row.entity_data
+            relationships = json.loads(row.relationship_data) if isinstance(row.relationship_data, str) else row.relationship_data
+            
+            logger.info(f"[GET_STAGING DEBUG] Retrieved {len(entities)} entities and {len(relationships)} relationships for file {file_id}")
+            
             return {
-                "entities": json.loads(row.entity_data) if isinstance(row.entity_data, str) else row.entity_data,
-                "relationships": json.loads(row.relationship_data) if isinstance(row.relationship_data, str) else row.relationship_data,
+                "entities": entities,
+                "relationships": relationships,
             }
 

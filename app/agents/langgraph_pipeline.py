@@ -119,12 +119,26 @@ async def extraction_node(state: GraphState) -> Dict[str, Any]:
     
     if state.get("progress_callback"):
         await _report_progress(state, "extraction", 4, "Extracting entities and relationships...")
-        
+    
+    logger.info(f"[EXTRACTION DEBUG] Processing {len(state.get('chunks', []))} chunks")
+    
     result = await agent.extract(state["chunks"], state["schema"])
     
+    entities = result.get("entities", [])
+    relationships = result.get("relationships", [])
+    
+    logger.info(f"[EXTRACTION DEBUG] Extracted {len(entities)} entities and {len(relationships)} relationships")
+    
+    if entities:
+        # Log a sample of entities for debugging
+        sample_names = [e.name if hasattr(e, 'name') else e.get('name', 'Unknown') for e in entities[:5]]
+        logger.info(f"[EXTRACTION DEBUG] Sample entities: {sample_names}")
+    else:
+        logger.warning("[EXTRACTION DEBUG] No entities extracted! Check AI service and schema.")
+    
     return {
-        "entities": result.get("entities", []),
-        "relationships": result.get("relationships", [])
+        "entities": entities,
+        "relationships": relationships
     }
 
 async def deduplication_node(state: GraphState) -> Dict[str, Any]:
@@ -157,7 +171,15 @@ async def validation_node(state: GraphState) -> Dict[str, Any]:
     )
     
     # Determine if human review is needed
-    requires_review = (not state["auto_approve"]) or (result.flagged_count > 0 or len(result.issues) > 0)
+    # If auto_approve=True, NEVER require review (direct commit to Neo4j)
+    # If auto_approve=False, ALWAYS require review so user can see data before commit
+    if state.get("auto_approve", False):
+        requires_review = False
+        logger.info("[VALIDATION] Auto-approve enabled - proceeding directly to storage")
+    else:
+        requires_review = True  # Always require review when auto_approve=False
+        logger.info(f"[VALIDATION] Review required - user will approve before Neo4j commit "
+                   f"({len(result.validated_entities)} entities, {len(result.validated_relationships)} relationships)")
     
     return {
         "entities": result.validated_entities,
@@ -171,20 +193,30 @@ async def human_review_node(state: GraphState) -> Dict[str, Any]:
     logger.info("LangGraph: Entering Human Review Node")
     storage = StorageAgent()
     
+    entities = state.get("entities", [])
+    relationships = state.get("relationships", [])
+    
+    logger.info(f"[HUMAN REVIEW DEBUG] Preparing to stage {len(entities)} entities and {len(relationships)} relationships")
+    
+    if not entities:
+        logger.warning("[HUMAN REVIEW DEBUG] No entities to store in staging!")
+    
     # Update file status to ready_for_review
     await storage.update_file_status(
         state["file_id"], 
         "ready_for_review",
-        node_count=len(state["entities"]),
-        relationship_count=len(state["relationships"]),
+        node_count=len(entities),
+        relationship_count=len(relationships),
     )
     
     # Store in staging
     await storage.store_staging(
         file_id=state["file_id"],
-        entities=state["entities"],
-        relationships=state["relationships"],
+        entities=entities,
+        relationships=relationships,
     )
+    
+    logger.info(f"[HUMAN REVIEW DEBUG] Staging data stored for file {state['file_id']}")
     
     if state.get("progress_callback"):
         await _report_progress(state, "human_review", 7, "Ready for human review")
@@ -213,18 +245,36 @@ async def storage_node(state: GraphState) -> Dict[str, Any]:
     storage = StorageAgent()
     graph_service = get_graph_service()
     
+    entities = state.get("entities", [])
+    relationships = state.get("relationships", [])
+    
+    logger.info(f"[STORAGE DEBUG] Storing {len(entities)} entities and {len(relationships)} relationships to Neo4j")
+    
     if state.get("progress_callback"):
         await _report_progress(state, "storage", 8, "Committing to database...")
+    
+    if not entities:
+        logger.warning("[STORAGE DEBUG] No entities to store! The extraction phase may have failed.")
+        # Still update file status to completed with 0 counts
+        await storage.update_file_status(
+            state["file_id"],
+            "completed",
+            node_count=0,
+            relationship_count=0,
+        )
+        return {"entity_id_map": {}, "status": "completed"}
         
     # Store entities
     entity_id_map = await storage.store_entities(
-        state["entities"], state["file_id"], state["folder_id"], state["user_id"]
+        entities, state["file_id"], state["folder_id"], state["user_id"]
     )
+    logger.info(f"[STORAGE DEBUG] Stored {len(entity_id_map)} entities to Neo4j")
     
     # Store relationships
     rel_count = await storage.store_relationships(
-        state["relationships"], entity_id_map, state["file_id"], state["folder_id"]
+        relationships, entity_id_map, state["file_id"], state["folder_id"]
     )
+    logger.info(f"[STORAGE DEBUG] Stored {rel_count} relationships to Neo4j")
     
     # Store chunks
     chunk_count = await storage.store_chunks(
@@ -252,8 +302,11 @@ async def storage_node(state: GraphState) -> Dict[str, Any]:
         }
     )
     
-    # Run FastRP
-    await graph_service.run_fastrp_node_embeddings(state["folder_id"])
+    # Run FastRP (optional, may fail if GDS not installed)
+    try:
+        await graph_service.run_fastrp_node_embeddings(state["folder_id"])
+    except Exception as e:
+        logger.warning(f"FastRP failed (optional): {e}")
     
     if state.get("progress_callback"):
         await _report_progress(state, "completed", 8, "Ingestion complete")

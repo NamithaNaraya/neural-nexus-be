@@ -62,6 +62,21 @@ class NodeDetailsResponse(BaseModel):
     connection_count: int
 
 
+# === Utilities ===
+def serialize_neo4j_values(data: Any) -> Any:
+    """Recursively convert Neo4j types to JSON-serializable Python types."""
+    if isinstance(data, dict):
+        return {k: serialize_neo4j_values(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [serialize_neo4j_values(item) for item in data]
+    elif hasattr(data, "iso_format"):  # Neo4j DateTime, Date, Time, Duration
+        return data.iso_format()
+    elif hasattr(data, "to_native"):  # Some Neo4j types like Point might have this or similar
+        return data.to_native()
+    else:
+        return data
+
+
 # === Routes ===
 @router.get("/all", response_model=GraphResponse)
 async def get_all_graph(
@@ -107,6 +122,9 @@ async def get_all_graph(
                         node_properties["conflicts"] = {}
                 elif conflicts:
                     node_properties["conflicts"] = conflicts
+                
+                # Sanitize properties for serialization
+                node_properties = serialize_neo4j_values(node_properties)
 
                 nodes.append(NodeResponse(
                     id=node_id,
@@ -124,7 +142,7 @@ async def get_all_graph(
         MATCH (a)-[r]->(b)
         RETURN COALESCE(a.id, a.entity_id, elementId(a)) as source,
                COALESCE(b.id, b.entity_id, elementId(b)) as target,
-               type(r) as rel_type,
+               COALESCE(r.type, type(r)) as rel_type,
                r.weight as weight
         LIMIT $limit
         """
@@ -205,6 +223,9 @@ async def get_folder_graph(
                 elif conflicts:
                     node_properties["conflicts"] = conflicts
 
+                # Sanitize properties for serialization
+                node_properties = serialize_neo4j_values(node_properties)
+
                 nodes.append(NodeResponse(
                     id=node_id,
                     name=props.get("name", props.get("label", "Unknown")),
@@ -223,7 +244,7 @@ async def get_folder_graph(
           AND (b.folder_id = $folder_id OR b.folderId = $folder_id)
         RETURN COALESCE(a.id, a.entity_id, elementId(a)) as source,
                COALESCE(b.id, b.entity_id, elementId(b)) as target,
-               type(r) as rel_type,
+               COALESCE(r.type, type(r)) as rel_type,
                r.weight as weight,
                r.description as description
         LIMIT $limit
@@ -279,12 +300,13 @@ async def get_file_graph(
             if node_id not in node_ids:
                 node_ids.add(node_id)
                 labels = list(node.labels) if node.labels else ["Unknown"]
+                raw_properties = {k: v for k, v in props.items() if k not in ["id", "name", "type", "description", "folder_id", "file_id"]}
                 nodes.append(NodeResponse(
                     id=node_id,
                     name=props.get("name", props.get("label", "Unknown")),
                     type=props.get("type", labels[0] if labels else "Unknown"),
                     description=props.get("description"),
-                    properties={k: v for k, v in props.items() if k not in ["id", "name", "type", "description", "folder_id", "file_id"]},
+                    properties=serialize_neo4j_values(raw_properties),
                     degree=record["degree"],
                     file_id=props.get("file_id"),
                     folder_id=props.get("folder_id"),
@@ -297,7 +319,7 @@ async def get_file_graph(
           AND (b.file_id = $file_id OR b.fileId = $file_id)
         RETURN COALESCE(a.id, a.entity_id, elementId(a)) as source,
                COALESCE(b.id, b.entity_id, elementId(b)) as target,
-               type(r) as rel_type,
+               COALESCE(r.type, type(r)) as rel_type,
                r.weight as weight
         """
         links_result = await neo4j.execute_query(links_query, {"file_id": file_id})
@@ -350,12 +372,14 @@ async def get_node_details(
         # This assumes we have a relationship or property tracking source
         source_files = [props.get("file_id")] if props.get("file_id") else []
         
+        raw_properties = {k: v for k, v in props.items() if k not in ["id", "name", "type", "description"]}
+        
         return NodeDetailsResponse(
             id=node_id,
             name=props.get("name", "Unknown"),
             type=labels[0] if labels else "Unknown",
             description=props.get("description", "No description available"),
-            properties={k: v for k, v in props.items() if k not in ["id", "name", "type", "description"]},
+            properties=serialize_neo4j_values(raw_properties),
             source_files=source_files,
             created_at=props.get("created_at", ""),
             created_by=props.get("created_by", "system"),
@@ -406,12 +430,13 @@ async def expand_node(
             
             if n_id not in node_ids:
                 node_ids.add(n_id)
+                raw_properties = {k: v for k, v in props.items() if k not in ["id", "name", "type"]}
                 nodes.append(NodeResponse(
                     id=n_id,
                     name=props.get("name", "Unknown"),
                     type=list(neighbor.labels)[0] if neighbor.labels else "Unknown",
                     degree=record["degree"],
-                    properties={k: v for k, v in props.items() if k not in ["id", "name", "type"]}
+                    properties=serialize_neo4j_values(raw_properties)
                 ))
             
             for rel in record["rels"]:

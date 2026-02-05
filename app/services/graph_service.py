@@ -64,7 +64,11 @@ class GraphService:
                 return True
                 
             except Exception as e:
-                logger.error(f"Failed to run FastRP: {e}")
+                error_str = str(e)
+                if "ProcedureNotFound" in error_str and "gds" in error_str:
+                    logger.warning("Neo4j GDS plugin not detected. Skipping FastRP embeddings.")
+                else:
+                    logger.error(f"Failed to run FastRP: {e}")
                 # Don't raise, as this is an enrichment step
                 return False
             finally:

@@ -6,6 +6,7 @@ Upload is handled in upload.py
 """
 from typing import Optional, List
 from datetime import datetime
+import json
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 import logging
@@ -141,17 +142,24 @@ async def get_extraction_preview(
                         e.name as name,
                         e.type as type,
                         e.description as description,
-                        apoc.convert.fromJsonMap(COALESCE(e.properties, '{}')) as properties
+                        e.properties as properties
                     LIMIT 200
                 """, file_id=file_id)
                 
                 async for record in entity_result:
+                    # Parse properties JSON string if needed
+                    props = record["properties"]
+                    if isinstance(props, str):
+                        try:
+                            props = json.loads(props)
+                        except:
+                            props = {}
                     entities.append({
                         "id": record["id"],
                         "name": record["name"],
                         "type": record["type"] or "Unknown",
                         "description": record["description"],
-                        "properties": record["properties"] or {},
+                        "properties": props or {},
                     })
                 
                 # Get relationships for this file
@@ -240,6 +248,7 @@ async def approve_file_ingestion(
             )
         
         folder_id = str(row.folder_id)
+        filename = row.filename
 
     # 1. Fetch staging data
     from app.agents.storage_agent import StorageAgent
@@ -254,23 +263,65 @@ async def approve_file_ingestion(
     entities = staging_data.get("entities", [])
     relationships = staging_data.get("relationships", [])
     
+    logger.info(f"[APPROVAL DEBUG] File {file_id}: Found {len(entities)} entities and {len(relationships)} relationships in staging")
+    
     if not entities:
-        logger.warning(f"No entities found in staging for file {file_id}, but status was ready_for_review")
+        logger.warning(f"No entities found in staging for file {file_id}. This could mean:")
+        logger.warning("  1. The extraction phase failed to produce entities")
+        logger.warning("  2. The staging table was not populated during the pipeline")
+        logger.warning("  3. The AI service returned empty results")
+        # We still update the status to completed, but with 0 counts
+        async with get_postgres_session() as session:
+            await session.execute(
+                text("""
+                    UPDATE neural_nexus.files 
+                    SET status = 'completed', 
+                        node_count = 0,
+                        relationship_count = 0,
+                        processed_at = :now,
+                        error_message = 'No entities extracted from document'
+                    WHERE id = :file_id
+                """),
+                {"file_id": file_id, "now": now}
+            )
+            await session.execute(
+                text("DELETE FROM neural_nexus.entity_staging WHERE file_id = :file_id"),
+                {"file_id": file_id}
+            )
+            await session.commit()
+        
+        return {
+            "message": "File approved but no entities were extracted",
+            "file_id": file_id,
+            "filename": filename,
+            "status": "completed",
+            "entities_stored": 0,
+            "relationships_stored": 0,
+            "warning": "The AI extraction did not find any entities in this document."
+        }
     
     try:
-        # 2. Embedding (since it was skipped in pipeline)
-        # We need the original chunks to embed them, but for now we might only have entities
-        # If chunks aren't in staging, we'll just skip them or fetch from Neo4j if they were stored
-        embedded_entities = await embedding_agent.embed_entities(entities)
+        # 2. Embedding (optional - skip if Ollama not available)
+        try:
+            logger.info(f"[APPROVAL DEBUG] Generating embeddings for {len(entities)} entities")
+            embedded_entities = await embedding_agent.embed_entities(entities)
+            logger.info(f"[APPROVAL DEBUG] Embeddings generated successfully")
+        except Exception as e:
+            logger.warning(f"Embedding failed (continuing without embeddings): {e}")
+            embedded_entities = entities  # Use entities without embeddings
         
         # 3. Final Storage in Neo4j
+        logger.info(f"[APPROVAL DEBUG] Storing {len(embedded_entities)} entities to Neo4j")
         entity_id_map = await storage.store_entities(
             embedded_entities, file_id, folder_id, user_id
         )
+        logger.info(f"[APPROVAL DEBUG] stored {len(entity_id_map)} entities, entity_id_map: {list(entity_id_map.keys())[:5]}...")
         
+        logger.info(f"[APPROVAL DEBUG] Storing {len(relationships)} relationships to Neo4j")
         rel_count = await storage.store_relationships(
             relationships, entity_id_map, file_id, folder_id
         )
+        logger.info(f"[APPROVAL DEBUG] Stored {rel_count} relationships")
         
         # 4. Update status and counts in Postgres
         async with get_postgres_session() as session:
@@ -314,10 +365,10 @@ async def approve_file_ingestion(
     return {
         "message": "File approved and 100% committed to knowledge graph",
         "file_id": file_id,
-        "filename": row.filename,
+        "filename": filename,
         "status": "completed",
-        "entities_stored": len(entities),
-        "relationships_stored": len(relationships)
+        "entities_stored": len(entity_id_map),
+        "relationships_stored": rel_count
     }
 
 
