@@ -82,6 +82,9 @@ def decode_access_token(token: str) -> Optional[dict]:
         logger.debug(f"JWT decode error: {e}")
         return None
 
+# Alias for compatibility with older imports
+decode_token = decode_access_token
+
 
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     """

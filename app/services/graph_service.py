@@ -42,32 +42,46 @@ class GraphService:
         return False
 
     # === GDS Embeddings ===
-    async def run_fastrp_node_embeddings(self, folder_id: str) -> bool:
+    async def run_fastrp_node_embeddings(
+        self, 
+        folder_id: str, 
+        entity_types: Optional[List[str]] = None
+    ) -> bool:
         """
         Run FastRP algorithm to generate structural node embeddings.
         
         This generates embeddings based on the graph topology within a folder.
+        Optionally filter by entity types for type-specific embeddings.
+        
+        Args:
+            folder_id: The folder to run FastRP on
+            entity_types: Optional list of entity types to include (e.g., ["Person", "Organization"])
         """
-        logger.info(f"Running FastRP for folder {folder_id}")
+        logger.info(f"Running FastRP for folder {folder_id}" + (f" with types {entity_types}" if entity_types else ""))
         
         projection_name = f"graph_{folder_id.replace('-', '_')}"
+        
+        # Build type filter clause
+        type_filter = ""
+        if entity_types:
+            type_filter = " AND n.type IN $entity_types"
         
         async with self.driver.session() as session:
             try:
                 # 1. Clean up old projection if it exists
                 await session.run("CALL gds.graph.drop($name, false)", name=projection_name)
                 
-                # 2. Create projection with all relationship types
-                await session.run("""
+                # 2. Create projection with optional type filtering
+                await session.run(f"""
                     CALL gds.graph.project.cypher(
                         $projection_name,
-                        'MATCH (n:Entity) WHERE n.folder_id = $folder_id RETURN id(n) AS id',
+                        'MATCH (n:Entity) WHERE n.folder_id = $folder_id{type_filter} RETURN id(n) AS id',
                         'MATCH (a:Entity)-[r]->(b:Entity) 
-                         WHERE a.folder_id = $folder_id AND b.folder_id = $folder_id 
+                         WHERE a.folder_id = $folder_id AND b.folder_id = $folder_id{type_filter.replace("n.", "a.") + type_filter.replace("n.", "b.") if entity_types else ""}
                          RETURN id(a) AS source, id(b) AS target, type(r) AS type',
-                        {parameters: {folder_id: $folder_id}}
+                        {{parameters: {{folder_id: $folder_id, entity_types: $entity_types}}}}
                     )
-                """, projection_name=projection_name, folder_id=folder_id)
+                """, projection_name=projection_name, folder_id=folder_id, entity_types=entity_types or [])
                 
                 # 3. Run FastRP
                 await session.run("""
@@ -97,27 +111,41 @@ class GraphService:
                 except:
                     pass
 
-    async def run_node2vec_embeddings(self, folder_id: str) -> bool:
+
+    async def run_node2vec_embeddings(
+        self, 
+        folder_id: str,
+        entity_types: Optional[List[str]] = None
+    ) -> bool:
         """
         Run Node2Vec for random walk-based embeddings (alternative to FastRP).
+        
+        Args:
+            folder_id: The folder to run Node2Vec on
+            entity_types: Optional list of entity types to include
         """
-        logger.info(f"Running Node2Vec for folder {folder_id}")
+        logger.info(f"Running Node2Vec for folder {folder_id}" + (f" with types {entity_types}" if entity_types else ""))
         projection_name = f"n2v_{folder_id.replace('-', '_')}"
+        
+        # Build type filter clause
+        type_filter = ""
+        if entity_types:
+            type_filter = " AND n.type IN $entity_types"
         
         async with self.driver.session() as session:
             try:
                 await session.run("CALL gds.graph.drop($name, false)", name=projection_name)
                 
-                await session.run("""
+                await session.run(f"""
                     CALL gds.graph.project.cypher(
                         $projection_name,
-                        'MATCH (n:Entity) WHERE n.folder_id = $folder_id RETURN id(n) AS id',
+                        'MATCH (n:Entity) WHERE n.folder_id = $folder_id{type_filter} RETURN id(n) AS id',
                         'MATCH (a:Entity)-[r]->(b:Entity) 
-                         WHERE a.folder_id = $folder_id AND b.folder_id = $folder_id 
+                         WHERE a.folder_id = $folder_id AND b.folder_id = $folder_id{type_filter.replace("n.", "a.") + type_filter.replace("n.", "b.") if entity_types else ""}
                          RETURN id(a) AS source, id(b) AS target',
-                        {parameters: {folder_id: $folder_id}}
+                        {{parameters: {{folder_id: $folder_id, entity_types: $entity_types}}}}
                     )
-                """, projection_name=projection_name, folder_id=folder_id)
+                """, projection_name=projection_name, folder_id=folder_id, entity_types=entity_types or [])
                 
                 await session.run("""
                     CALL gds.node2vec.write(
@@ -143,6 +171,7 @@ class GraphService:
                     await session.run("CALL gds.graph.drop($name, false)", name=projection_name)
                 except:
                     pass
+
 
     # === APOC Batch Operations ===
     async def batch_update_property(
