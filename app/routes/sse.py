@@ -15,45 +15,72 @@ import logging
 
 from app.core.security import get_current_user
 from app.db.connections import get_redis_client
+from app.core.pubsub import manager as local_pubsub
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-
 async def event_generator(user_id: str, request: Request) -> AsyncGenerator[str, None]:
     """
     Generate SSE events for a user.
-    
-    Listens to Redis pub/sub for user-specific events.
+    Uses LocalPubSub for immediate delivery and attempts Redis subscription as secondary.
     """
+    channel = f"user:{user_id}:events"
+    queue = await local_pubsub.subscribe(channel)
+    
     try:
-        redis = get_redis_client()
-        pubsub = redis.pubsub()
-        await pubsub.subscribe(f"user:{user_id}:events")
-        
+        # Attempt Redis subscription if possible, but don't crash if it fails
+        redis_pubsub = None
+        try:
+            redis = get_redis_client()
+            redis_pubsub = redis.pubsub()
+            await redis_pubsub.subscribe(channel)
+            logger.info(f"✅ Subscribed to Redis channel {channel}")
+        except Exception as e:
+            logger.warning(f"⚠️ Redis sub failed (using Local fallback): {e}")
+
         # Send initial connection event
         yield f"data: {json.dumps({'type': 'connected', 'user_id': user_id})}\n\n"
         
         while True:
-            # Check if client disconnected
             if await request.is_disconnected():
                 break
             
-            # Get message from Redis
-            message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-            
-            if message and message["type"] == "message":
-                data = message["data"]
-                yield f"data: {data}\n\n"
-            
-            # Send heartbeat every 30 seconds
-            await asyncio.sleep(0.1)
+            try:
+                # 1. Check Local Queue (Instant)
+                try:
+                    local_msg = await asyncio.wait_for(queue.get(), timeout=0.5)
+                    yield f"data: {local_msg}\n\n"
+                except asyncio.TimeoutError:
+                    pass
+
+                # 2. Check Redis (if available)
+                if redis_pubsub:
+                    redis_msg = await redis_pubsub.get_message(ignore_subscribe_messages=True, timeout=0.1)
+                    if redis_msg and redis_msg["type"] == "message":
+                        data = redis_msg["data"]
+                        if isinstance(data, bytes):
+                            data = data.decode('utf-8')
+                        yield f"data: {data}\n\n"
+                
+                # 3. Heartbeat
+                yield ": keepalive\n\n"
+                yield f"data: {json.dumps({'type': 'ping'})}\n\n"
+                
+            except Exception as e:
+                logger.warning(f"Transient loop error: {e}")
+                await asyncio.sleep(1)
             
     except Exception as e:
         logger.error(f"SSE error for user {user_id}: {e}")
         yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
     finally:
-        await pubsub.unsubscribe(f"user:{user_id}:events")
+        await local_pubsub.unsubscribe(channel, queue)
+        if redis_pubsub:
+            try:
+                await redis_pubsub.unsubscribe(channel)
+            except:
+                pass
 
 
 @router.get("/tasks/{user_id}")
@@ -64,21 +91,15 @@ async def stream_task_events(
 ) -> StreamingResponse:
     """
     Stream real-time task events to the client.
-    
-    Events include:
-    - Ingestion progress (phase, percentage)
-    - AI response chunks (word-by-word)
-    - Graph updates (new nodes, relationships)
-    
-    Note: Uses query param for token since EventSource doesn't support headers.
     """
     # Validate token if provided
     if token:
         try:
             from app.core.security import decode_token
             payload = decode_token(token)
-            if payload.get("sub") != user_id:
-                # Token doesn't match user_id, use token's user_id
+            if payload and payload.get("sub") == user_id:
+                pass # Valid
+            elif payload:
                 user_id = payload.get("sub", user_id)
         except Exception as e:
             logger.warning(f"Invalid SSE token: {e}")
@@ -98,18 +119,24 @@ async def stream_task_events(
 async def publish_event(user_id: str, event_type: str, data: dict) -> None:
     """
     Publish an event to a user's SSE stream.
-    
-    Call this from other parts of the application to send real-time updates.
+    Publishes to BOTH LocalPubSub and Redis to ensure delivery.
     """
+    channel = f"user:{user_id}:events"
+    event = json.dumps({
+        "type": event_type,
+        **data,
+    })
+    
+    # 1. Publish Locally (Instant, no network required)
+    await local_pubsub.publish(channel, event)
+    
+    # 2. Publish to Redis (if available)
     try:
         redis = get_redis_client()
-        event = json.dumps({
-            "type": event_type,
-            **data,
-        })
-        await redis.publish(f"user:{user_id}:events", event)
+        await redis.publish(channel, event)
     except Exception as e:
-        logger.error(f"Failed to publish event: {e}")
+        # Silently fail Redis publish, we already sent it locally
+        logger.debug(f"Redis publish skipped: {e}")
 
 
 # Helper functions for common events

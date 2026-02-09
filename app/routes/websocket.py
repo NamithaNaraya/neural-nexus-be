@@ -82,33 +82,32 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-@router.websocket("/{user_id}")
+@router.websocket("")
+@router.websocket("/")
 async def websocket_endpoint(
     websocket: WebSocket,
-    user_id: str,
+    user_id: str = Query(None),
     token: str = Query(None),
 ):
     """
     WebSocket endpoint for real-time collaboration.
-    
-    Client -> Server Events:
-    - node_select: User selected a node
-    - node_hover: User hovering over a node
-    - camera_sync: Camera position update
-    - join_room: Join a folder collaboration room
-    - leave_room: Leave a room
-    - ping: Heartbeat
-    
-    Server -> Client Events:
-    - node_selected: Another user selected a node
-    - node_hovered: Another user hovering
-    - camera_update: Another user's camera
-    - collaborator_joined: New collaborator in room
-    - collaborator_left: Collaborator left room
-    - graph_updated: Graph data changed
-    - pong: Heartbeat response
     """
-    # TODO: Validate token before accepting
+    # Extract user_id from token if not provided
+    if not user_id and token:
+        try:
+            from app.core.security import decode_token
+            payload = decode_token(token)
+            user_id = payload.get("sub")
+        except Exception as e:
+            logger.warning(f"WebSocket token validation failed: {e}")
+            await websocket.close(code=4003) # Forbidden
+            return
+
+    if not user_id:
+        logger.warning("WebSocket connection attempt without user_id")
+        await websocket.close(code=4003)
+        return
+
     await manager.connect(websocket, user_id)
     
     try:
