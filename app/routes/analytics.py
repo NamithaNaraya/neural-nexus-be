@@ -68,10 +68,21 @@ async def list_available_algorithms() -> Dict[str, Any]:
 
 
 # === Helper: Create GDS Graph Projection ===
-async def ensure_gds_projection(folder_id: Optional[str] = None, include_weights: bool = True) -> str:
+async def ensure_gds_projection(
+    folder_id: Optional[str] = None, 
+    node_ids: Optional[List[str]] = None,
+    include_weights: bool = True
+) -> str:
     """Create a temporary GDS graph projection for algorithms."""
     driver = get_neo4j_driver()
-    graph_name = f"neural_nexus_{folder_id or 'all'}"
+    
+    # Generate unique graph name based on scope
+    if node_ids:
+        import hashlib
+        node_hash = hashlib.md5(",".join(sorted(node_ids)).encode()).hexdigest()[:8]
+        graph_name = f"subgraph_{node_hash}"
+    else:
+        graph_name = f"neural_nexus_{folder_id or 'all'}"
     
     async with driver.session() as session:
         # Check if projection exists
@@ -85,7 +96,20 @@ async def ensure_gds_projection(folder_id: Optional[str] = None, include_weights
             return graph_name
         
         # Create new projection
-        if folder_id:
+        if node_ids:
+            # Selection-scoped projection
+            await session.run("""
+                CALL gds.graph.project.cypher(
+                    $name,
+                    'MATCH (n:Entity) WHERE n.id IN $node_ids RETURN id(n) AS id, labels(n) AS labels',
+                    'MATCH (a:Entity)-[r]->(b:Entity) 
+                     WHERE a.id IN $node_ids AND b.id IN $node_ids 
+                     RETURN id(a) AS source, id(b) AS target, type(r) AS type, 
+                            coalesce(r.strength, 1.0) AS weight',
+                    {parameters: {node_ids: $node_ids}}
+                )
+            """, name=graph_name, node_ids=node_ids)
+        elif folder_id:
             # Folder-scoped projection
             await session.run("""
                 CALL gds.graph.project.cypher(
@@ -131,6 +155,7 @@ async def cleanup_gds_projection(graph_name: str):
 @router.get("/centrality/pagerank")
 async def run_pagerank(
     folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
     top_k: int = Query(default=10, le=100),
     damping_factor: float = Query(default=0.85, ge=0.1, le=0.99),
     max_iterations: int = Query(default=20, le=100),
@@ -138,7 +163,7 @@ async def run_pagerank(
 ) -> Dict[str, Any]:
     """Run PageRank algorithm using Neo4j GDS for accurate centrality scores."""
     driver = get_neo4j_driver()
-    graph_name = await ensure_gds_projection(folder_id)
+    graph_name = await ensure_gds_projection(folder_id, node_ids)
     
     try:
         async with driver.session() as session:
@@ -183,13 +208,14 @@ async def run_pagerank(
 @router.get("/centrality/betweenness")
 async def run_betweenness(
     folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
     top_k: int = Query(default=10, le=100),
     sampling_size: int = Query(default=0, ge=0, description="0 = exact, >0 = sample size for approximation"),
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Run Betweenness Centrality using Neo4j GDS to find critical bridge nodes."""
     driver = get_neo4j_driver()
-    graph_name = await ensure_gds_projection(folder_id)
+    graph_name = await ensure_gds_projection(folder_id, node_ids)
     
     try:
         async with driver.session() as session:
@@ -246,13 +272,14 @@ async def run_betweenness(
 @router.get("/centrality/closeness")
 async def run_closeness(
     folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
     top_k: int = Query(default=10, le=100),
     use_wasserman_faust: bool = Query(default=True, description="Normalize for disconnected graphs"),
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Run Closeness Centrality using Neo4j GDS to find nodes closest to all others."""
     driver = get_neo4j_driver()
-    graph_name = await ensure_gds_projection(folder_id)
+    graph_name = await ensure_gds_projection(folder_id, node_ids)
     
     try:
         async with driver.session() as session:
@@ -293,12 +320,13 @@ async def run_closeness(
 @router.get("/community/louvain")
 async def run_louvain(
     folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
     include_intermediate: bool = Query(default=False),
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Run Louvain community detection using Neo4j GDS."""
     driver = get_neo4j_driver()
-    graph_name = await ensure_gds_projection(folder_id)
+    graph_name = await ensure_gds_projection(folder_id, node_ids)
     
     try:
         async with driver.session() as session:
@@ -347,12 +375,13 @@ async def run_louvain(
 @router.get("/community/leiden")
 async def run_leiden(
     folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
     gamma: float = Query(default=1.0, ge=0.1, le=10.0, description="Resolution parameter"),
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Run Leiden community detection (improved Louvain) using Neo4j GDS."""
     driver = get_neo4j_driver()
-    graph_name = await ensure_gds_projection(folder_id)
+    graph_name = await ensure_gds_projection(folder_id, node_ids)
     
     try:
         async with driver.session() as session:
@@ -398,13 +427,14 @@ async def run_leiden(
 @router.get("/similarity/nodes")
 async def run_node_similarity(
     folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
     top_k: int = Query(default=10, le=100),
     similarity_cutoff: float = Query(default=0.1, ge=0.0, le=1.0),
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Find similar node pairs using GDS Node Similarity (Jaccard)."""
     driver = get_neo4j_driver()
-    graph_name = await ensure_gds_projection(folder_id)
+    graph_name = await ensure_gds_projection(folder_id, node_ids)
     
     try:
         async with driver.session() as session:

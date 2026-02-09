@@ -104,16 +104,24 @@ async def create_fulltext_indexes() -> None:
         logger.info("Full-text indexes created (relationship indexes skipped for dynamic types)")
 
 
-async def create_vector_index(dimension: int = 768) -> None:
+async def create_vector_index(dimension: int = 1024, force_recreate: bool = False) -> None:
     """
     Create vector embedding index for semantic search.
     
     Args:
-        dimension: Embedding vector dimension (default 768 for mxbai-embed-large)
+        dimension: Embedding vector dimension (default 1024 for mxbai-embed-large)
+        force_recreate: If True, drops the existing index first.
     """
     driver = get_neo4j_driver()
     
     async with driver.session() as session:
+        if force_recreate:
+            try:
+                await session.run("DROP INDEX embedding_idx IF EXISTS")
+                logger.info("Dropped existing vector index for recreation")
+            except Exception as e:
+                logger.warning(f"Failed to drop vector index: {e}")
+
         try:
             await session.run(f"""
                 CREATE VECTOR INDEX embedding_idx IF NOT EXISTS

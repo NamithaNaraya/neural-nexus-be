@@ -107,42 +107,75 @@ class HybridRAGService:
     # --- Node Implementation Methods ---
 
     async def _vector_search_node(self, state: RAGState) -> Dict[str, Any]:
-        params = {"query": state["enhanced_question"], "top_k": 10}
+        raw_question = state["question"].lower()
+        
+        # 1. Semantic Vector Search
+        # Generate embedding for the question
+        question_embedding = await self.ai.embed(state["question"])
+        
+        # 2. Scope handling
+        params = {
+            "terms": [w.strip("?,.!") for w in raw_question.split() if len(w) > 2][:10],
+            "embedding": question_embedding,
+            "top_k": 10
+        }
         scope_filter = ""
         
         if state["scope"]:
             s = state["scope"]
             if s.get("type") == "folder":
-                scope_filter = "AND (n.folder_id = $scope_id OR n.folderId = $scope_id)"
+                scope_filter = "AND node.folder_id = $scope_id"
                 params["scope_id"] = s.get("id")
             elif s.get("type") == "file":
-                scope_filter = "AND (n.file_id = $scope_id OR n.fileId = $scope_id)"
+                scope_filter = "AND node.file_id = $scope_id"
                 params["scope_id"] = s.get("id")
+            elif s.get("type") == "selection":
+                node_ids = s.get("id").split(",")
+                scope_filter = "AND (node.id IN $node_ids OR elementId(node) IN $node_ids)"
+                params["node_ids"] = node_ids
 
-        # Vector/Text search query
+        # 3. Hybrid Query: Combine Vector Search with Lexical Fallback
+        # We use a UNION to get results from both methods for maximum recall
         query = f"""
-        MATCH (n:Entity)
-        WHERE (toLower(n.name) CONTAINS toLower($query) OR toLower(n.description) CONTAINS toLower($query))
-        {scope_filter}
+        // Vector Search
+        CALL db.index.vector.queryNodes('embedding_idx', $top_k, $embedding) YIELD node, score
+        WHERE node.name IS NOT NULL {scope_filter}
         RETURN 
-            COALESCE(n.id, elementId(n)) as node_id,
-            n.name as name,
-            n.description as description,
-            n.type as type,
-            1.0 as score
+            COALESCE(node.id, elementId(node)) as node_id,
+            node.name as name,
+            COALESCE(node.description, '') as description,
+            labels(node)[0] as type,
+            score
+        
+        UNION
+        
+        // Lexical (Keyword) Search
+        MATCH (node)
+        WHERE node.name IS NOT NULL
+        AND (
+            ANY(term IN $terms WHERE toLower(node.name) CONTAINS term OR toLower(node.description) CONTAINS term)
+        )
+        {scope_filter.replace('node.', 'node')} 
+        RETURN 
+            COALESCE(node.id, elementId(node)) as node_id,
+            node.name as name,
+            COALESCE(node.description, '') as description,
+            labels(node)[0] as type,
+            0.8 as score // Boost keywords slightly less than vector matches
+            
+        ORDER BY score DESC
         LIMIT 10
         """
         
         try:
-            # Note: Using session.run or similar depending on neo4j driver version
-            # Assuming self.neo4j is a driver instance
             async with self.neo4j.session() as session:
                 result = await session.run(query, params)
                 records = await result.data()
                 
             return {"vector_results": records}
         except Exception as e:
-            logger.error(f"Vector search node failed: {e}")
+            logger.error(f"Hybrid search failed: {e}")
+            # Fallback to simple matching if vector index is not ready
             return {"vector_results": [], "error": str(e)}
 
     async def _graph_expansion_node(self, state: RAGState) -> Dict[str, Any]:
@@ -192,7 +225,13 @@ class HybridRAGService:
             for rel in state["graph_context"]["relationships"][:10]:
                 context += f"- {rel}\n"
                 
-        system_prompt = "You are a Knowledge Graph assistant. Answer based ONLY on the context. If unknown, say so."
+        system_prompt = (
+            "You are a Knowledge Graph AI Assistant for Neural Nexus. "
+            "Your goal is to help users navigate and understand their knowledge graph. "
+            "If the context contains relevant information, use it to answer the question accurately, citing nodes where possible. "
+            "If the context is empty or irrelevant and the user is just greeting you (e.g., 'hey', 'hello'), respond politely and offer assistance. "
+            "If the user asks a factual question not covered by the context, explain that you couldn't find that specific information in the current graph."
+        )
         user_prompt = f"Context:\n{context}\n\nQuestion: {state['question']}"
         
         try:

@@ -84,7 +84,7 @@ async def run_query(
                     {"session_id": session_id}
                 )
                 # Reverse to get chronological order for LangGraph
-                history = [dict(r) for r in reversed(hist_result.fetchall())]
+                history = [dict(r) for r in reversed(hist_result.mappings().all())]
 
         # 2. Execute query via LangGraph-powered RAG Service
         result = await rag_service.query(
@@ -157,7 +157,7 @@ async def get_chat_history(
             """),
             {"session_id": session_id, "user_id": current_user['id'], "limit": limit}
         )
-        messages = [dict(r) for r in reversed(result.fetchall())]
+        messages = [dict(r) for r in reversed(result.mappings().all())]
         
         return {
             "session_id": session_id,
@@ -184,7 +184,7 @@ async def list_chat_sessions(
             """),
             {"user_id": current_user['id']}
         )
-        return [dict(r) for r in result.fetchall()]
+        return [dict(r) for r in result.mappings().all()]
 
 
 @router.delete("/chat/session/{session_id}")
