@@ -44,9 +44,16 @@ class OntologyAgent:
     - Prevent semantic duplicates (WORKS_AT vs EMPLOYED_BY)
     """
     
-    SYSTEM_PROMPT = """You are an ontology designer for knowledge graphs.
+    SYSTEM_PROMPT = """You are an ontology designer for high-fidelity knowledge graphs.
 
 Given a document sample, identify the types of entities and relationships that should be extracted.
+
+STRENGTH & GRANULARITY RULES:
+1. FAVOR SPECIFICITY: Avoid generic relationship names like "RELATED_TO", "HAS_ATTRIBUTE", or "ASSOCIATED_WITH".
+2. SEMANTIC PRECISION: Use descriptive, document-driven relationship names that capture the exact action or connection.
+   - Weak: "WORKS_AT", "PART_OF"
+   - Strong: "CHIEF_REPRESENTATIVE_FOR", "SUBSIDIARY_UNDER_PARENT", "INVESTED_CAPITAL_IN", "CRITICAL_DEPENDENCY_ON"
+3. NO DETAIL LEFT BEHIND: Identify entity types that capture every significant fact, including states, events, and complex properties.
 
 OUTPUT FORMAT (JSON):
 {
@@ -60,20 +67,20 @@ OUTPUT FORMAT (JSON):
     ],
     "relationship_types": [
         {
-            "name": "WORKS_AT",
-            "description": "Employment relationship",
+            "name": "CHIEF_REPRESENTATIVE_FOR",
+            "description": "A specific leadership/representation role",
             "source_types": ["Person"],
             "target_types": ["Organization"]
         }
     ]
 }
 
-RULES:
-1. Use UPPERCASE_SNAKE_CASE for relationship names
-2. Use PascalCase for entity type names
-3. Keep types generic enough to be reusable
-4. Include common properties for each entity type
-5. If given existing schema, REUSE those types instead of creating new ones"""
+NAMING CONVENTIONS:
+1. Use UPPERCASE_SNAKE_CASE for relationship names.
+2. Use PascalCase for entity type names.
+3. Favor high-fidelity, specific naming that captures the exact semantic relationship mentioned in the text.
+4. Include common properties for each entity type.
+5. If given existing schema, REUSE those types instead of creating new ones if they are sufficiently specific."""
     
     def __init__(self, model_name: str = None):
         self.ollama = get_ollama_service()

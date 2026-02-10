@@ -53,38 +53,40 @@ class ExtractionAgent:
     - Avoid hallucinations - only extract what's in the text
     """
     
-    SYSTEM_PROMPT = """You are a precise knowledge extraction agent for building knowledge graphs.
+    SYSTEM_PROMPT = """You are a high-precision knowledge extraction agent for building exhaustive knowledge graphs.
 
-STRICT RULES:
-1. ONLY extract entities and relationships that are EXPLICITLY mentioned in the text.
-2. NEVER infer or assume information not directly stated.
-3. For EVERY entity and relationship, provide the exact quote from the text as evidence.
-4. If you're uncertain about a fact, DO NOT include it.
-5. Use the provided entity types and relationship types from the schema.
+STRICT EXTRACTION RULES:
+1. EXHAUSTIVE EXTRACTION: Do not leave any significant detail behind. Every fact, state, event, or complex property mentioned in the text must be converted into a node, entity, or relationship.
+2. SEMANTIC STRENGTH: Prioritize specific, highly descriptive relationship names that capture the exact logic of the text. 
+   - DO NOT use "RELATED_TO" if a more descriptive name like "PARTICIPATES_IN", "GOVERNS", or "DERIVES_FROM" is applicable.
+   - Match the strength and wording used in the document exactly.
+3. GROUND TRUTH: Every claim must have an exact quote as evidence. Hallucinations are strictly forbidden.
+4. DETAIL CONVERSION: If a descriptive detail exists that doesn't fit standard entity types, create a "Detail", "Fact", or "Attribute" node to ensure it is captured in the graph.
+5. NO INFERENCE: Extract only what is EXPLICITLY stated.
 
 OUTPUT FORMAT (JSON):
 {
     "entities": [
         {
-            "name": "John Smith",
-            "type": "Person",
-            "description": "A software engineer at TechCorp",
-            "properties": {"occupation": "software engineer"},
-            "evidence": "John Smith, a software engineer at TechCorp, presented..."
+            "name": "Project Alpha Development Cost",
+            "type": "Metric",
+            "description": "The estimated budget for Phase 4",
+            "properties": {"value": "$5M", "status": "approved"},
+            "evidence": "Project Alpha's development cost for Phase 4 is estimated at $5M and has been approved."
         }
     ],
     "relationships": [
         {
-            "source": "John Smith",
-            "target": "TechCorp",
-            "type": "WORKS_AT",
-            "description": "Employment relationship",
-            "evidence": "John Smith, a software engineer at TechCorp"
+            "source": "Project Alpha",
+            "target": "Project Alpha Development Cost",
+            "type": "HAS_ESTIMATED_COST",
+            "description": "Budget attribution",
+            "evidence": "Project Alpha's development cost..."
         }
     ]
 }
 
-Hallucinations are strictly forbidden. Only extract what you can directly quote from the text."""
+Only extract what you can directly quote from the text. Favor high-fidelity nodes over loose text properties where possible to make the graph more stable and interconnected."""
     
     def __init__(self, model_name: str = None):
         self.ollama = get_ollama_service()

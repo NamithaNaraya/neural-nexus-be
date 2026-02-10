@@ -17,6 +17,8 @@ from app.db.connections import get_neo4j, get_postgres_session
 from app.core.security import get_current_user
 from app.services.deletion_service import get_deletion_service, DeletionStatus
 from app.services.permission_service import get_permission_service, PermissionLevel
+from app.services.cache_service import get_cache_service, CacheService
+from app.services.gds_service import get_gds_service, GDSService
 
 router = APIRouter(prefix="/deletion", tags=["deletion"])
 logger = logging.getLogger(__name__)
@@ -46,6 +48,8 @@ async def initiate_deletion(
     background_tasks: BackgroundTasks,
     neo4j=Depends(get_neo4j),
     db=Depends(get_postgres_session),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
     current_user=Depends(get_current_user),
 ) -> DeletionJobResponse:
     """
@@ -74,7 +78,7 @@ async def initiate_deletion(
                 detail="Only folder owners can delete folders"
             )
     
-    deletion_service = get_deletion_service(neo4j, db)
+    deletion_service = get_deletion_service(neo4j, db, cache, gds)
     
     if request.target_type == "folder":
         job = await deletion_service.delete_folder(
@@ -105,6 +109,8 @@ async def get_deletion_status(
     job_id: str,
     neo4j=Depends(get_neo4j),
     db=Depends(get_postgres_session),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
     current_user=Depends(get_current_user),
 ) -> DeletionJobResponse:
     """
@@ -116,7 +122,7 @@ async def get_deletion_status(
     Returns:
         Current job status and progress
     """
-    deletion_service = get_deletion_service(neo4j, db)
+    deletion_service = get_deletion_service(neo4j, db, cache, gds)
     job = deletion_service.get_job_status(job_id)
     
     if not job:
@@ -147,6 +153,8 @@ async def get_deletion_status(
 async def list_deletion_jobs(
     neo4j=Depends(get_neo4j),
     db=Depends(get_postgres_session),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
     current_user=Depends(get_current_user),
 ) -> List[DeletionJobResponse]:
     """
@@ -155,7 +163,7 @@ async def list_deletion_jobs(
     Returns:
         List of active and recent deletion jobs
     """
-    deletion_service = get_deletion_service(neo4j, db)
+    deletion_service = get_deletion_service(neo4j, db, cache, gds)
     jobs = deletion_service.get_active_jobs(user_id=str(current_user["id"]))
     
     return [
@@ -177,6 +185,8 @@ async def get_entity_references(
     entity_id: str,
     neo4j=Depends(get_neo4j),
     db=Depends(get_postgres_session),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
     current_user=Depends(get_current_user),
 ) -> Dict[str, Any]:
     """
@@ -191,7 +201,7 @@ async def get_entity_references(
     Returns:
         Reference count and list of referencing files
     """
-    deletion_service = get_deletion_service(neo4j, db)
+    deletion_service = get_deletion_service(neo4j, db, cache, gds)
     ref_count = await deletion_service.ref_counter.get_reference_count(entity_id)
     
     # Get list of files referencing this entity
@@ -224,6 +234,8 @@ async def delete_file(
     background: bool = True,
     neo4j=Depends(get_neo4j),
     db=Depends(get_postgres_session),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
     current_user=Depends(get_current_user),
 ) -> DeletionJobResponse:
     """
@@ -236,7 +248,7 @@ async def delete_file(
     Returns:
         Deletion job details
     """
-    deletion_service = get_deletion_service(neo4j, db)
+    deletion_service = get_deletion_service(neo4j, db, cache, gds)
     
     job = await deletion_service.delete_file(
         file_id=file_id,
@@ -261,6 +273,8 @@ async def delete_folder(
     background: bool = True,
     neo4j=Depends(get_neo4j),
     db=Depends(get_postgres_session),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
     current_user=Depends(get_current_user),
 ) -> DeletionJobResponse:
     """

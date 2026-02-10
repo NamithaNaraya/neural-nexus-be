@@ -116,12 +116,14 @@ class DeletionService:
     Uses APOC for batch operations when available.
     """
     
-    def __init__(self, neo4j_driver, db_session):
+    def __init__(self, neo4j_driver, db_session, cache_service=None, gds_service=None):
         self.driver = neo4j_driver
         self.db = db_session
         self.ref_counter = ReferenceCounter(neo4j_driver)
         self.active_jobs: Dict[str, DeletionJob] = {}
         self._has_apoc = None
+        self.cache = cache_service
+        self.gds = gds_service
     
     async def _check_apoc_available(self) -> bool:
         """Check if APOC procedures are available."""
@@ -222,6 +224,12 @@ class DeletionService:
             job.message = "Deletion complete"
             job.progress = 1.0
             job.completed_at = datetime.utcnow()
+            
+            # Invalidate all caches after completion
+            if self.cache:
+                await self.cache.invalidate_all()
+            if self.gds:
+                await self.gds.invalidate_all()
             
             logger.info(
                 f"File deletion complete: {file_id}, "
@@ -432,9 +440,9 @@ class DeletionService:
 _deletion_service: Optional[DeletionService] = None
 
 
-def get_deletion_service(neo4j_driver, db_session) -> DeletionService:
+def get_deletion_service(neo4j_driver, db_session, cache_service=None, gds_service=None) -> DeletionService:
     """Get or create deletion service instance."""
     global _deletion_service
     if _deletion_service is None:
-        _deletion_service = DeletionService(neo4j_driver, db_session)
+        _deletion_service = DeletionService(neo4j_driver, db_session, cache_service, gds_service)
     return _deletion_service

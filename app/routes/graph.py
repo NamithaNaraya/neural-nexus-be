@@ -10,6 +10,8 @@ from pydantic import BaseModel
 import logging
 
 from app.core.security import get_current_user
+from app.services.cache_service import get_cache_service, CacheService
+from app.services.gds_service import get_gds_service, GDSService
 from app.db.connections import get_neo4j
 
 router = APIRouter()
@@ -110,17 +112,57 @@ def serialize_neo4j_values(data: Any) -> Any:
 
 
 # === Routes ===
+
+@router.get("/nodes/search")
+async def search_nodes_for_crud(
+    q: str = Query(..., min_length=2),
+    folder_id: Optional[str] = None,
+    limit: int = Query(default=5, le=20),
+    current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
+) -> Dict[str, Any]:
+    """
+    Search for existing entities by name to prevent duplicates during CRUD.
+    """
+    try:
+        where_clause = "WHERE n.name =~ $regex"
+        params = {"regex": f"(?i).*{q}.*"}
+        
+        if folder_id:
+            where_clause += " AND (n.folder_id = $folder_id OR n.folderId = $folder_id)"
+            params["folder_id"] = folder_id
+            
+        query = f"""
+        MATCH (n:Entity)
+        {where_clause}
+        RETURN n.id as id, n.name as name, n.type as type, n.description as description
+        LIMIT $limit
+        """
+        
+        result = await neo4j.execute_query(query, {**params, "limit": limit})
+        nodes = [dict(record) for record in result.records]
+        
+        return {"nodes": nodes, "count": len(nodes)}
+    except Exception as e:
+        logger.error(f"Node search failed: {e}")
+        return {"nodes": [], "count": 0}
+
+
 @router.get("/all", response_model=GraphResponse)
 async def get_all_graph(
     current_user: dict = Depends(get_current_user),
     limit: int = Query(default=10000, le=100000),
     neo4j = Depends(get_neo4j),
+    cache = Depends(get_cache_service),
 ) -> GraphResponse:
     """
     Get all nodes across all folders (Floating Island view).
-    
-    Limited to prevent browser overload.
     """
+    cache_key = f"all_{limit}"
+    cached_data = await cache.get_cached_graph(cache_key)
+    if cached_data:
+        return GraphResponse(**cached_data)
+
     try:
         # Query nodes with degree
         nodes_query = """
@@ -192,7 +234,9 @@ async def get_all_graph(
                     strength=record["weight"] or 1.0,
                 ))
         
-        return GraphResponse(nodes=nodes, links=links, total_nodes=len(nodes), total_links=len(links))
+        response = GraphResponse(nodes=nodes, links=links, total_nodes=len(nodes), total_links=len(links))
+        await cache.set_cached_graph(cache_key, response.model_dump())
+        return response
     except Exception as e:
         logger.error(f"Error fetching all graph: {e}")
         return GraphResponse(nodes=[], links=[], total_nodes=0, total_links=0)
@@ -206,8 +250,14 @@ async def get_folder_graph(
     min_connections: int = Query(default=0),
     limit: int = Query(default=1000, le=10000),
     neo4j = Depends(get_neo4j),
+    cache = Depends(get_cache_service),
 ) -> GraphResponse:
     """Get graph data for all files in a folder."""
+    cache_key = f"folder_{folder_id}_{node_type}_{min_connections}_{limit}"
+    cached_data = await cache.get_cached_graph(cache_key)
+    if cached_data:
+        return GraphResponse(**cached_data)
+
     try:
         # Build type filter
         type_filter = ""
@@ -299,7 +349,9 @@ async def get_folder_graph(
                     strength=record["weight"] or 1.0,
                 ))
         
-        return GraphResponse(nodes=nodes, links=links, total_nodes=len(nodes), total_links=len(links))
+        response = GraphResponse(nodes=nodes, links=links, total_nodes=len(nodes), total_links=len(links))
+        await cache.set_cached_graph(cache_key, response.model_dump())
+        return response
     except Exception as e:
         logger.error(f"Error fetching folder graph: {e}")
         return GraphResponse(nodes=[], links=[], total_nodes=0, total_links=0)
@@ -310,8 +362,14 @@ async def get_file_graph(
     file_id: str,
     current_user: dict = Depends(get_current_user),
     neo4j = Depends(get_neo4j),
+    cache = Depends(get_cache_service),
 ) -> GraphResponse:
     """Get graph data for a specific file."""
+    cache_key = f"file_{file_id}"
+    cached_data = await cache.get_cached_graph(cache_key)
+    if cached_data:
+        return GraphResponse(**cached_data)
+
     try:
         # Query nodes
         nodes_query = """
@@ -368,7 +426,9 @@ async def get_file_graph(
                     strength=record["weight"] or 1.0,
                 ))
                 
-        return GraphResponse(nodes=nodes, links=links, total_nodes=len(nodes), total_links=len(links))
+        response = GraphResponse(nodes=nodes, links=links, total_nodes=len(nodes), total_links=len(links))
+        await cache.set_cached_graph(cache_key, response.model_dump())
+        return response
     except Exception as e:
         logger.error(f"Error fetching file graph: {e}")
         return GraphResponse(nodes=[], links=[], total_nodes=0, total_links=0)
@@ -729,6 +789,8 @@ async def create_node(
     request: CreateNodeRequest,
     current_user: dict = Depends(get_current_user),
     neo4j = Depends(get_neo4j),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """
     Create a new node in Neo4j.
@@ -768,13 +830,11 @@ async def create_node(
                 if key not in props:  # Don't overwrite core props
                     props[key] = value
         
-        # Create node in Neo4j
-        query = f"""
-        CREATE (n:{request.type} $props)
-        RETURN n
-        """
+        result = await neo4j.execute_query(query, {"props": props})
         
-        result = neo4j.execute_query(query, {"props": props})
+        # Invalidate cache
+        await cache.invalidate_all()
+        await gds.invalidate_all()
         
         logger.info(f"Created node: {node_id} ({request.name})")
         
@@ -801,12 +861,10 @@ async def update_node(
     request: UpdateNodeRequest,
     current_user: dict = Depends(get_current_user),
     neo4j = Depends(get_neo4j),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
-    """
-    Update an existing node's properties.
-    
-    Only provided fields are updated (PATCH-like behavior).
-    """
+    """Update an existing entity node."""
     from datetime import datetime
     
     try:
@@ -850,10 +908,14 @@ async def update_node(
         RETURN n
         """
         
-        result = neo4j.execute_query(query, params)
+        result = await neo4j.execute_query(query, params)
         
         if not result.records:
             raise HTTPException(status_code=404, detail="Node not found")
+        
+        # Invalidate cache
+        await cache.invalidate_all()
+        await gds.invalidate_all()
         
         logger.info(f"Updated node: {node_id}")
         
@@ -874,16 +936,14 @@ async def delete_node(
     node_id: str,
     current_user: dict = Depends(get_current_user),
     neo4j = Depends(get_neo4j),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
-    """
-    Delete a node and all its relationships from Neo4j.
-    
-    This is a destructive operation - the node cannot be recovered.
-    """
+    """Create a new entity node."""
     try:
         # First check if node exists
         check_query = "MATCH (n) WHERE n.id = $node_id RETURN n"
-        check_result = neo4j.execute_query(check_query, {"node_id": node_id})
+        check_result = await neo4j.execute_query(check_query, {"node_id": node_id})
         
         if not check_result.records:
             raise HTTPException(status_code=404, detail="Node not found")
@@ -895,7 +955,11 @@ async def delete_node(
         RETURN count(n) as deleted
         """
         
-        result = neo4j.execute_query(delete_query, {"node_id": node_id})
+        result = await neo4j.execute_query(delete_query, {"node_id": node_id})
+        
+        # Invalidate cache
+        await cache.invalidate_all()
+        await gds.invalidate_all()
         
         logger.info(f"Deleted node: {node_id}")
         
@@ -918,12 +982,10 @@ async def create_relationship(
     request: CreateRelationshipRequest,
     current_user: dict = Depends(get_current_user),
     neo4j = Depends(get_neo4j),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
-    """
-    Create a relationship between two existing nodes.
-    
-    The relationship type must be a valid Neo4j relationship type.
-    """
+    """Create a new relationship."""
     import uuid
     from datetime import datetime
     
@@ -957,11 +1019,15 @@ async def create_relationship(
         RETURN r, source.name as source_name, target.name as target_name
         """
         
-        result = neo4j.execute_query(query, {
+        result = await neo4j.execute_query(query, {
             "source_id": request.source_id,
             "target_id": request.target_id,
             "props": props,
         })
+        
+        # Invalidate cache
+        await cache.invalidate_all()
+        await gds.invalidate_all()
         
         if not result.records:
             raise HTTPException(status_code=404, detail="One or both nodes not found")
@@ -994,10 +1060,10 @@ async def delete_relationship(
     relationship_id: str,
     current_user: dict = Depends(get_current_user),
     neo4j = Depends(get_neo4j),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
-    """
-    Delete a relationship by its ID.
-    """
+    """Delete a relationship."""
     try:
         # Delete relationship by ID property
         query = """
@@ -1007,7 +1073,11 @@ async def delete_relationship(
         RETURN count(r) as deleted
         """
         
-        result = neo4j.execute_query(query, {"rel_id": relationship_id})
+        result = await neo4j.execute_query(query, {"rel_id": relationship_id})
+        
+        # Invalidate cache
+        await cache.invalidate_all()
+        await gds.invalidate_all()
         
         deleted_count = result.records[0]["deleted"] if result.records else 0
         
@@ -1041,7 +1111,7 @@ async def get_node_types(
         CALL db.labels() YIELD label
         RETURN collect(label) as types
         """
-        result = neo4j.execute_query(query, {})
+        result = await neo4j.execute_query(query, {})
         
         types = result.records[0]["types"] if result.records else []
         
@@ -1069,7 +1139,7 @@ async def get_relationship_types(
         CALL db.relationshipTypes() YIELD relationshipType
         RETURN collect(relationshipType) as types
         """
-        result = neo4j.execute_query(query, {})
+        result = await neo4j.execute_query(query, {})
         
         types = result.records[0]["types"] if result.records else []
         

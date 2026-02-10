@@ -108,21 +108,18 @@ class HybridRAGService:
 
     async def _vector_search_node(self, state: RAGState) -> Dict[str, Any]:
         raw_question = state["question"].lower()
-        
-        # 1. Semantic Vector Search
-        # Generate embedding for the question
         question_embedding = await self.ai.embed(state["question"])
         
-        # 2. Scope handling
+        # 1. Scope handling
         params = {
             "terms": [w.strip("?,.!") for w in raw_question.split() if len(w) > 2][:10],
             "embedding": question_embedding,
             "top_k": 10
         }
         scope_filter = ""
-        
         if state["scope"]:
             s = state["scope"]
+            logger.info(f"[RAG] Applying scope filter: {s}")
             if s.get("type") == "folder":
                 scope_filter = "AND node.folder_id = $scope_id"
                 params["scope_id"] = s.get("id")
@@ -133,11 +130,16 @@ class HybridRAGService:
                 node_ids = s.get("id").split(",")
                 scope_filter = "AND (node.id IN $node_ids OR elementId(node) IN $node_ids)"
                 params["node_ids"] = node_ids
+        else:
+            logger.info("[RAG] No scope filter applied (Global Search)")
 
-        # 3. Hybrid Query: Combine Vector Search with Lexical Fallback
-        # We use a UNION to get results from both methods for maximum recall
-        query = f"""
-        // Vector Search
+        # 2. Independent Search Steps
+        all_results = []
+        vector_results = []
+        lexical_results = []
+
+        # -- Step A: Vector Search (Semantic) --
+        vector_query = f"""
         CALL db.index.vector.queryNodes('embedding_idx', $top_k, $embedding) YIELD node, score
         WHERE node.name IS NOT NULL {scope_filter}
         RETURN 
@@ -146,37 +148,64 @@ class HybridRAGService:
             COALESCE(node.description, '') as description,
             labels(node)[0] as type,
             score
-        
-        UNION
-        
-        // Lexical (Keyword) Search
-        MATCH (node)
+        """
+        try:
+            async with self.neo4j.session() as session:
+                result = await session.run(vector_query, params)
+                vector_results = await result.data()
+                logger.debug(f"[RAG] Cypher Params: { {k: v for k, v in params.items() if k != 'embedding'} }")
+                logger.info(f"[RAG] Vector search found {len(vector_results)} matches.")
+        except Exception as e:
+            logger.warning(f"[RAG] Vector index search failed (index might not be ready): {e}")
+
+        # -- Step B: Lexical Search (Keyword) --
+        lexical_query = f"""
+        MATCH (node:Entity)
         WHERE node.name IS NOT NULL
         AND (
             ANY(term IN $terms WHERE toLower(node.name) CONTAINS term OR toLower(node.description) CONTAINS term)
         )
-        {scope_filter.replace('node.', 'node')} 
+        {scope_filter} 
         RETURN 
             COALESCE(node.id, elementId(node)) as node_id,
             node.name as name,
             COALESCE(node.description, '') as description,
             labels(node)[0] as type,
-            0.8 as score // Boost keywords slightly less than vector matches
-            
-        ORDER BY score DESC
+            0.85 as score
         LIMIT 10
         """
-        
         try:
             async with self.neo4j.session() as session:
-                result = await session.run(query, params)
-                records = await result.data()
-                
-            return {"vector_results": records}
+                result = await session.run(lexical_query, params)
+                lexical_results = await result.data()
+                logger.info(f"[RAG] Lexical search found {len(lexical_results)} matches.")
         except Exception as e:
-            logger.error(f"Hybrid search failed: {e}")
-            # Fallback to simple matching if vector index is not ready
-            return {"vector_results": [], "error": str(e)}
+            logger.error(f"[RAG] Lexical search failed: {e}")
+
+        # 3. Combine and Deduplicate
+        seen_ids = set()
+        
+        # Prioritize vector results
+        for r in vector_results:
+            if r["node_id"] not in seen_ids:
+                all_results.append(r)
+                seen_ids.add(r["node_id"])
+
+        # Add lexical results if not already present
+        for r in lexical_results:
+            if r["node_id"] not in seen_ids:
+                all_results.append(r)
+                seen_ids.add(r["node_id"])
+
+        # Sort by score and limit
+        all_results.sort(key=lambda x: x["score"], reverse=True)
+        final_results = all_results[:10]
+        
+        logger.info(f"[RAG] Total unique context matches: {len(final_results)}")
+        if not final_results:
+            logger.warning(f"[RAG] No information found for question: '{state['question']}'")
+
+        return {"vector_results": final_results}
 
     async def _graph_expansion_node(self, state: RAGState) -> Dict[str, Any]:
         if not state["vector_results"]:

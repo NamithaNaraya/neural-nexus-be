@@ -28,6 +28,7 @@ from app.algorithms import (
     StructuralHoles,
     TopicClustering,
 )
+from app.services.gds_service import get_gds_service, GDSService
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -67,88 +68,7 @@ async def list_available_algorithms() -> Dict[str, Any]:
     }
 
 
-# === Helper: Create GDS Graph Projection ===
-async def ensure_gds_projection(
-    folder_id: Optional[str] = None, 
-    node_ids: Optional[List[str]] = None,
-    include_weights: bool = True
-) -> str:
-    """Create a temporary GDS graph projection for algorithms."""
-    driver = get_neo4j_driver()
-    
-    # Generate unique graph name based on scope
-    if node_ids:
-        import hashlib
-        node_hash = hashlib.md5(",".join(sorted(node_ids)).encode()).hexdigest()[:8]
-        graph_name = f"subgraph_{node_hash}"
-    else:
-        graph_name = f"neural_nexus_{folder_id or 'all'}"
-    
-    async with driver.session() as session:
-        # Check if projection exists
-        check = await session.run(
-            "CALL gds.graph.exists($name) YIELD exists RETURN exists",
-            name=graph_name
-        )
-        record = await check.single()
-        
-        if record and record["exists"]:
-            return graph_name
-        
-        # Create new projection
-        if node_ids:
-            # Selection-scoped projection
-            await session.run("""
-                CALL gds.graph.project.cypher(
-                    $name,
-                    'MATCH (n:Entity) WHERE n.id IN $node_ids RETURN id(n) AS id, labels(n) AS labels',
-                    'MATCH (a:Entity)-[r]->(b:Entity) 
-                     WHERE a.id IN $node_ids AND b.id IN $node_ids 
-                     RETURN id(a) AS source, id(b) AS target, type(r) AS type, 
-                            coalesce(r.strength, 1.0) AS weight',
-                    {parameters: {node_ids: $node_ids}}
-                )
-            """, name=graph_name, node_ids=node_ids)
-        elif folder_id:
-            # Folder-scoped projection
-            await session.run("""
-                CALL gds.graph.project.cypher(
-                    $name,
-                    'MATCH (n:Entity) WHERE n.folder_id = $folder_id RETURN id(n) AS id, labels(n) AS labels',
-                    'MATCH (a:Entity)-[r]->(b:Entity) 
-                     WHERE a.folder_id = $folder_id AND b.folder_id = $folder_id 
-                     RETURN id(a) AS source, id(b) AS target, type(r) AS type, 
-                            coalesce(r.strength, 1.0) AS weight',
-                    {parameters: {folder_id: $folder_id}}
-                )
-            """, name=graph_name, folder_id=folder_id)
-        else:
-            # Full graph projection
-            await session.run("""
-                CALL gds.graph.project(
-                    $name,
-                    'Entity',
-                    {
-                        _ALL_: {
-                            type: '*',
-                            orientation: 'UNDIRECTED',
-                            properties: {weight: {property: 'strength', defaultValue: 1.0}}
-                        }
-                    }
-                )
-            """, name=graph_name)
-    
-    return graph_name
-
-
-async def cleanup_gds_projection(graph_name: str):
-    """Drop a GDS projection after use."""
-    driver = get_neo4j_driver()
-    async with driver.session() as session:
-        try:
-            await session.run("CALL gds.graph.drop($name, false)", name=graph_name)
-        except Exception:
-            pass  # Ignore if doesn't exist
+# === Analytics Routes ===
 
 
 # === GDS Centrality Algorithms ===
@@ -160,10 +80,11 @@ async def run_pagerank(
     damping_factor: float = Query(default=0.85, ge=0.1, le=0.99),
     max_iterations: int = Query(default=20, le=100),
     current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Run PageRank algorithm using Neo4j GDS for accurate centrality scores."""
     driver = get_neo4j_driver()
-    graph_name = await ensure_gds_projection(folder_id, node_ids)
+    graph_name = await gds.ensure_projection(folder_id, node_ids)
     
     try:
         async with driver.session() as session:
@@ -212,10 +133,11 @@ async def run_betweenness(
     top_k: int = Query(default=10, le=100),
     sampling_size: int = Query(default=0, ge=0, description="0 = exact, >0 = sample size for approximation"),
     current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Run Betweenness Centrality using Neo4j GDS to find critical bridge nodes."""
     driver = get_neo4j_driver()
-    graph_name = await ensure_gds_projection(folder_id, node_ids)
+    graph_name = await gds.ensure_projection(folder_id, node_ids)
     
     try:
         async with driver.session() as session:
@@ -276,10 +198,11 @@ async def run_closeness(
     top_k: int = Query(default=10, le=100),
     use_wasserman_faust: bool = Query(default=True, description="Normalize for disconnected graphs"),
     current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Run Closeness Centrality using Neo4j GDS to find nodes closest to all others."""
     driver = get_neo4j_driver()
-    graph_name = await ensure_gds_projection(folder_id, node_ids)
+    graph_name = await gds.ensure_projection(folder_id, node_ids)
     
     try:
         async with driver.session() as session:
@@ -323,10 +246,11 @@ async def run_louvain(
     node_ids: Optional[List[str]] = Query(default=None),
     include_intermediate: bool = Query(default=False),
     current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Run Louvain community detection using Neo4j GDS."""
     driver = get_neo4j_driver()
-    graph_name = await ensure_gds_projection(folder_id, node_ids)
+    graph_name = await gds.ensure_projection(folder_id, node_ids)
     
     try:
         async with driver.session() as session:
@@ -378,10 +302,11 @@ async def run_leiden(
     node_ids: Optional[List[str]] = Query(default=None),
     gamma: float = Query(default=1.0, ge=0.1, le=10.0, description="Resolution parameter"),
     current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Run Leiden community detection (improved Louvain) using Neo4j GDS."""
     driver = get_neo4j_driver()
-    graph_name = await ensure_gds_projection(folder_id, node_ids)
+    graph_name = await gds.ensure_projection(folder_id, node_ids)
     
     try:
         async with driver.session() as session:
@@ -431,10 +356,11 @@ async def run_node_similarity(
     top_k: int = Query(default=10, le=100),
     similarity_cutoff: float = Query(default=0.1, ge=0.0, le=1.0),
     current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
-    """Find similar node pairs using GDS Node Similarity (Jaccard)."""
+    """Find similar node pairs using GDS Node Similarity (Jaccard).."""
     driver = get_neo4j_driver()
-    graph_name = await ensure_gds_projection(folder_id, node_ids)
+    graph_name = await gds.ensure_projection(folder_id, node_ids)
     
     try:
         async with driver.session() as session:
@@ -496,10 +422,11 @@ async def find_shortest_path(
     target_id: str,
     folder_id: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Find shortest path between two nodes using GDS Dijkstra."""
     driver = get_neo4j_driver()
-    graph_name = await ensure_gds_projection(folder_id)
+    graph_name = await gds.ensure_projection(folder_id)
     
     try:
         async with driver.session() as session:
