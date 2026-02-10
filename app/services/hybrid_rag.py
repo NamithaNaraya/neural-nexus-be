@@ -112,7 +112,7 @@ class HybridRAGService:
         
         # 1. Scope handling
         params = {
-            "terms": [w.strip("?,.!") for w in raw_question.split() if len(w) > 2][:10],
+            "terms": [w.strip("?,.!") .lower() for w in raw_question.split() if len(w) > 2][:10],
             "embedding": question_embedding,
             "top_k": 10
         }
@@ -160,7 +160,7 @@ class HybridRAGService:
 
         # -- Step B: Lexical Search (Keyword) --
         lexical_query = f"""
-        MATCH (node:Entity)
+        MATCH (node)
         WHERE node.name IS NOT NULL
         AND (
             ANY(term IN $terms WHERE toLower(node.name) CONTAINS term OR toLower(node.description) CONTAINS term)
@@ -172,7 +172,7 @@ class HybridRAGService:
             COALESCE(node.description, '') as description,
             labels(node)[0] as type,
             0.85 as score
-        LIMIT 10
+        LIMIT 20
         """
         try:
             async with self.neo4j.session() as session:
@@ -199,7 +199,7 @@ class HybridRAGService:
 
         # Sort by score and limit
         all_results.sort(key=lambda x: x["score"], reverse=True)
-        final_results = all_results[:10]
+        final_results = all_results[:20]
         
         logger.info(f"[RAG] Total unique context matches: {len(final_results)}")
         if not final_results:
@@ -209,11 +209,22 @@ class HybridRAGService:
 
     async def _graph_expansion_node(self, state: RAGState) -> Dict[str, Any]:
         if not state["vector_results"]:
-            return {"graph_context": {"nodes": [], "relationships": []}}
+            return {"graph_context": {"nodes": [], "relationships": [], "backbone_types": []}}
             
-        node_ids = [r["node_id"] for r in state["vector_results"][:5]]
+        # seed nodes for expansion (include 20+ to ensure deep strategic paths aren't missed)
+        node_ids = [r["node_id"] for r in state["vector_results"][:20]]
         
-        query = """
+        # Query 0: Identify dynamic 'backbone' relationships (most frequent in the graph)
+        backbone_query = """
+        CALL db.relationshipTypes() YIELD relationshipType
+        MATCH ()-[r]-() WHERE type(r) = relationshipType
+        RETURN relationshipType, count(r) as freq
+        ORDER BY freq DESC
+        LIMIT 8
+        """
+
+        # Query 1: Direct Neighbors
+        neighbors_query = """
         UNWIND $node_ids AS nodeId
         MATCH (n)
         WHERE n.id = nodeId OR elementId(n) = nodeId
@@ -222,27 +233,61 @@ class HybridRAGService:
             n.name as source_name,
             type(r) as rel_type,
             related.name as related_name
-        LIMIT 20
+        LIMIT 30
+        """
+        
+        # Query 2: Pathfinding between top entities
+        path_query = """
+        MATCH (n)
+        WHERE (n.id IN $node_ids OR elementId(n) IN $node_ids)
+        WITH collect(n) as seedNodes
+        UNWIND seedNodes as n1
+        UNWIND seedNodes as n2
+        WITH n1, n2 WHERE elementId(n1) < elementId(n2)
+        // STRATEGIC PATHFINDING: Increased depth to 10 for very far relationships
+        MATCH p = shortestPath((n1)-[*..10]-(n2))
+        RETURN [node in nodes(p) | node.name] as names, [rel in relationships(p) | type(rel)] as types
+        LIMIT 15
         """
         
         try:
-            async with self.neo4j.session() as session:
-                result = await session.run(query, {"node_ids": node_ids})
-                records = await result.data()
-                
             nodes = set()
             rels = []
-            for r in records:
-                source = r["source_name"]
-                rel = r["rel_type"]
-                target = r["related_name"]
+            
+            async with self.neo4j.session() as session:
+                # Get Neighbors
+                res1 = await session.run(neighbors_query, {"node_ids": node_ids})
+                records1 = await res1.data()
                 
-                nodes.add(source)
-                if target:
-                    nodes.add(target)
-                    rels.append(f"{source} -[{rel}]-> {target}")
-                    
-            return {"graph_context": {"nodes": list(nodes), "relationships": rels}}
+                for r in records1:
+                    source = r["source_name"]
+                    rel = r["rel_type"]
+                    target = r["related_name"]
+                    nodes.add(source)
+                    if target:
+                        nodes.add(target)
+                        rels.append(f"{source} -[{rel}]-> {target}")
+                
+                # Get Paths
+                res2 = await session.run(path_query, {"node_ids": node_ids})
+                records2 = await res2.data()
+                
+                for r in records2:
+                    names = r["names"]
+                    types = r["types"]
+                    path_str = ""
+                    for i in range(len(types)):
+                        path_str += f"{names[i]} -[{types[i]}]-> "
+                    path_str += names[-1]
+                    rels.append(f"INDIRECT PATH: {path_str}")
+                    for name in names: nodes.add(name)
+
+                # Get Backbone (Dynamic Relevance)
+                res0 = await session.run(backbone_query)
+                backbone_records = await res0.data()
+                backbone_types = [r["relationshipType"] for r in backbone_records]
+                
+            return {"graph_context": {"nodes": list(nodes), "relationships": rels, "backbone_types": backbone_types}}
         except Exception as e:
             logger.error(f"Graph expansion node failed: {e}")
             return {"graph_context": {"nodes": [], "relationships": []}}
@@ -250,21 +295,26 @@ class HybridRAGService:
     async def _answer_generation_node(self, state: RAGState) -> Dict[str, Any]:
         # Context formatting
         context = "Analyzed Entities & Attributes:\n"
-        for r in state["vector_results"][:5]:
+        for r in state["vector_results"][:15]:
             # Provide more complete context for the AI
-            context += f"- {r['name']} [{r['type']}]: {r['description'][:500]}\n"
+            type_label = r.get('type') or 'Entity'
+            context += f"- {r['name']} [{type_label}]: {r['description'][:500]}\n"
             
         if state["graph_context"].get("relationships"):
-            context += "\nStructural Connections (Knowledge Graph Path):\n"
-            for rel in state["graph_context"]["relationships"][:15]:
+            context += "\nStructural Connections (Deep Path Discovery):\n"
+            for rel in state["graph_context"]["relationships"][:20]:
                 context += f"- {rel}\n"
+        
+        backbone = ", ".join(state["graph_context"].get("backbone_types", []))
+        if backbone:
+            context += f"\nDomain Backbone (Primary Structural Relationships): {backbone}\n"
                 
         system_prompt = (
-            "You are the Neural Nexus Intelligence Engine. Your role is to synthesize graph-based research into clear, premium insights. "
-            "1. BE SYNTHETIC: If the context doesn't contain a direct answer but has related structural data, explain what IS there (e.g., 'While the specific use isn't detailed, Shatavari is structurally linked to...') instead of leading with a negative. "
-            "2. BE ACCURATE: Cite specific entities and relationships from the context. "
-            "3. BE PROFESSIONAL: Use a high-agency, helpful tone. "
-            "4. FALLBACK: Only claim ignorance if the search results are truly empty or irrelevant."
+            "You are the Neural Nexus Strategic Intelligence Engine. Your role is to uncover and synthesize deep structural connections within the knowledge graph. "
+            "1. STRATEGIC PATHFINDING: Trace 'INDIRECT PATHS' to connect entities that aren't directly linked. Search up to 10 levels deep if necessary. "
+            "2. DYNAMIC DOMAIN RELEVANCE: Prioritize connections using 'Domain Backbone' relationship types. These are the mandatory structural ties for this specific dataset. "
+            "3. BE SYNTHETIC: Explain the logical chain of connection (e.g., 'Entity A is connected to Entity B because of their shared relationship with Entity C'). "
+            "4. BE ACCURATE & PROFESSIONAL: Cite specific path segments. Only claim ignorance if the search results are empty."
         )
         user_prompt = f"Context:\n{context}\n\nQuestion: {state['question']}"
         
@@ -276,13 +326,13 @@ class HybridRAGService:
             
             citations = [
                 {"node_id": r["node_id"], "node_name": r["name"], "score": r["score"]}
-                for r in state["vector_results"][:5]
+                for r in state["vector_results"][:15]
             ]
             
             return {
                 "answer": answer,
                 "citations": citations,
-                "related_nodes": [r["node_id"] for r in state["vector_results"][:5]]
+                "related_nodes": [r["node_id"] for r in state["vector_results"][:15]]
             }
         except Exception as e:
             return {"answer": f"Error generating answer: {e}", "citations": []}
