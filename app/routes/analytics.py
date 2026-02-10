@@ -106,12 +106,9 @@ async def run_pagerank(
             # Calculate insights
             if records:
                 top_node = records[0]
-                scores = [r["score"] for r in records]
-                avg_score = sum(scores) / len(scores)
-                max_score = max(scores)
-                insight = f"'{top_node['name']}' ({top_node['type']}) is the most influential node with PageRank {top_node['score']:.4f}. Top-{top_k} average: {avg_score:.4f}, max: {max_score:.4f}."
+                insight = f"'{top_node['name']}' is currently the most influential entity in this dataset. Its high connectivity indicates it serves as a primary hub, significantly anchoring the surrounding knowledge graph."
             else:
-                insight = "No nodes found for PageRank analysis."
+                insight = "No significant influence hubs were identified in the current selection."
             
             return {
                 "algorithm": "pagerank",
@@ -172,11 +169,11 @@ async def run_betweenness(
                 high_betweenness = [r for r in records if r["score"] > 0]
                 if high_betweenness:
                     top = high_betweenness[0]
-                    insight = f"'{top['name']}' is the most critical bridge node with betweenness {top['score']:.2f}. It lies on the shortest paths between many other nodes."
+                    insight = f"'{top['name']}' acts as a vital bridge between isolated groups in your data. It plays a critical role in information flow, serving as a necessary pathway for cross-module communication."
                 else:
-                    insight = "No significant bridge nodes found - the graph may be densely connected."
+                    insight = "Your data appears to be very densely connected, with no single entity acting as a unique bottleneck or bridge."
             else:
-                insight = "No nodes found for betweenness analysis."
+                insight = "No clear bridge entities were detected."
             
             return {
                 "algorithm": "betweenness",
@@ -222,9 +219,9 @@ async def run_closeness(
             
             if records:
                 top = records[0]
-                insight = f"'{top['name']}' has the highest closeness centrality ({top['score']:.4f}), meaning it can reach all other nodes most efficiently."
+                insight = f"'{top['name']}' is the most centrally positioned entity. It has the shortest paths to all other information in this set, making it the most efficient point for broadcasting or gathering data."
             else:
-                insight = "No nodes with closeness > 0 found."
+                insight = "Could not identify a central focus point in this specific dataset fragment."
             
             return {
                 "algorithm": "closeness",
@@ -279,7 +276,7 @@ async def run_louvain(
             community_sizes = sorted([(cid, len(members)) for cid, members in communities.items()], 
                                     key=lambda x: -x[1])
             
-            insight = f"Found {len(communities)} communities. Largest has {community_sizes[0][1]} members." if communities else "No communities found."
+            insight = f"The engine successfully mapped {len(communities)} distinct thematic clusters. The largest group represents a dense hub of {community_sizes[0][1]} related entities working in unison." if communities else "No distinct community structures were identified in this selection."
             
             return {
                 "algorithm": "louvain",

@@ -166,10 +166,32 @@ def _extract_file_content(file_bytes: bytes, file_type: str) -> str:
         # Try different encodings
         for encoding in ['utf-8', 'latin-1', 'cp1252']:
             try:
-                return file_bytes.decode(encoding)
-            except UnicodeDecodeError:
+                content = file_bytes.decode(encoding)
+                if file_type in ['csv', 'tsv']:
+                    # Simple validation for CSV/TSV
+                    import io
+                    import pandas as pd
+                    sep = ',' if file_type == 'csv' else '\t'
+                    df = pd.read_csv(io.StringIO(content), sep=sep)
+                    return df.to_string(index=False)
+                return content
+            except Exception:
                 continue
-        raise ValueError("Could not decode file content")
+        raise ValueError("Could not decode or parse file content")
+    
+    elif file_type == 'xlsx':
+        try:
+            import io
+            import pandas as pd
+            # Use pandas to read Excel
+            df = pd.read_excel(io.BytesIO(file_bytes))
+            # Convert to string for the extraction pipeline
+            # Note: For multi-sheet, we only take the first sheet by default
+            return df.to_string(index=False)
+        except ImportError:
+            raise ValueError("Excel support requires 'openpyxl'. Please install it.")
+        except Exception as e:
+            raise ValueError(f"Failed to parse Excel file: {e}")
     
     elif file_type == 'pdf':
         # TODO: Implement PDF extraction

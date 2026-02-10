@@ -233,10 +233,14 @@ class HybridRAGService:
             nodes = set()
             rels = []
             for r in records:
-                nodes.add(r["source_name"])
-                if r["related_name"]:
-                    nodes.add(r["related_name"])
-                    rels.append(f"{r['source_name']} -[{r['rel_type']}]-> {r['related_name']}")
+                source = r["source_name"]
+                rel = r["rel_type"]
+                target = r["related_name"]
+                
+                nodes.add(source)
+                if target:
+                    nodes.add(target)
+                    rels.append(f"{source} -[{rel}]-> {target}")
                     
             return {"graph_context": {"nodes": list(nodes), "relationships": rels}}
         except Exception as e:
@@ -245,21 +249,22 @@ class HybridRAGService:
 
     async def _answer_generation_node(self, state: RAGState) -> Dict[str, Any]:
         # Context formatting
-        context = "Relevant Entities:\n"
+        context = "Analyzed Entities & Attributes:\n"
         for r in state["vector_results"][:5]:
-            context += f"- {r['name']} ({r['type']}): {r['description'][:150]}\n"
+            # Provide more complete context for the AI
+            context += f"- {r['name']} [{r['type']}]: {r['description'][:500]}\n"
             
         if state["graph_context"].get("relationships"):
-            context += "\nRelationships:\n"
-            for rel in state["graph_context"]["relationships"][:10]:
+            context += "\nStructural Connections (Knowledge Graph Path):\n"
+            for rel in state["graph_context"]["relationships"][:15]:
                 context += f"- {rel}\n"
                 
         system_prompt = (
-            "You are a Knowledge Graph AI Assistant for Neural Nexus. "
-            "Your goal is to help users navigate and understand their knowledge graph. "
-            "If the context contains relevant information, use it to answer the question accurately, citing nodes where possible. "
-            "If the context is empty or irrelevant and the user is just greeting you (e.g., 'hey', 'hello'), respond politely and offer assistance. "
-            "If the user asks a factual question not covered by the context, explain that you couldn't find that specific information in the current graph."
+            "You are the Neural Nexus Intelligence Engine. Your role is to synthesize graph-based research into clear, premium insights. "
+            "1. BE SYNTHETIC: If the context doesn't contain a direct answer but has related structural data, explain what IS there (e.g., 'While the specific use isn't detailed, Shatavari is structurally linked to...') instead of leading with a negative. "
+            "2. BE ACCURATE: Cite specific entities and relationships from the context. "
+            "3. BE PROFESSIONAL: Use a high-agency, helpful tone. "
+            "4. FALLBACK: Only claim ignorance if the search results are truly empty or irrelevant."
         )
         user_prompt = f"Context:\n{context}\n\nQuestion: {state['question']}"
         
