@@ -198,6 +198,9 @@ class File(Base):
     relationship_count: Mapped[int] = mapped_column(
         default=0,
     )
+    progress: Mapped[int] = mapped_column(
+        default=0,
+    )
     error_message: Mapped[Optional[str]] = mapped_column(
         Text,
         nullable=True,

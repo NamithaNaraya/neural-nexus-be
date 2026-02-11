@@ -97,8 +97,14 @@ Output JSON:
         new_entities = []
         matched_entity_ids = {match[0] for match in existing_matches}
         
+        def gv(obj, key, default=None):
+            """Safe get for dict or object."""
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
         for entity in batch_dedup["unique_entities"]:
-            entity_id = entity.id if hasattr(entity, 'id') else entity.get('id')
+            entity_id = gv(entity, 'id')
             if entity_id not in matched_entity_ids:
                 new_entities.append(entity)
         
@@ -124,23 +130,29 @@ Output JSON:
         merge_map = {}  # old_id -> canonical_id
         seen = {}  # (name_lower, type) -> canonical_entity
         
+        def gv(obj, key, default=None):
+            if isinstance(obj, dict): return obj.get(key, default)
+            return getattr(obj, key, default)
+
         for entity in entities:
-            name = entity.name if hasattr(entity, 'name') else entity.get('name', '')
-            entity_type = entity.type if hasattr(entity, 'type') else entity.get('type', '')
-            entity_id = entity.id if hasattr(entity, 'id') else entity.get('id')
+            name = gv(entity, 'name', '')
+            entity_type = gv(entity, 'type', '')
+            entity_id = gv(entity, 'id')
             
             key = (name.lower().strip(), entity_type.lower())
             
             if key in seen:
                 # Duplicate found - merge into existing
                 canonical = seen[key]
-                canonical_id = canonical.id if hasattr(canonical, 'id') else canonical.get('id')
+                canonical_id = gv(canonical, 'id')
                 merge_map[entity_id] = canonical_id
                 
                 # Merge properties if entity has additional info
-                if hasattr(entity, 'properties') and entity.properties:
-                    if hasattr(canonical, 'properties'):
-                        canonical.properties.update(entity.properties)
+                props = gv(entity, 'properties')
+                if props:
+                    canonical_props = gv(canonical, 'properties')
+                    if canonical_props is not None:
+                        canonical_props.update(props)
                     
             else:
                 # New unique entity
@@ -168,9 +180,13 @@ Output JSON:
             
             async with driver.session() as session:
                 for entity in entities:
-                    name = entity.name if hasattr(entity, 'name') else entity.get('name', '')
-                    entity_type = entity.type if hasattr(entity, 'type') else entity.get('type', '')
-                    entity_id = entity.id if hasattr(entity, 'id') else entity.get('id')
+                    def gv(obj, key, default=None):
+                        if isinstance(obj, dict): return obj.get(key, default)
+                        return getattr(obj, key, default)
+
+                    name = gv(entity, 'name', '')
+                    entity_type = gv(entity, 'type', '')
+                    entity_id = gv(entity, 'id')
                     
                     # Query for potential matches
                     result = await session.run("""
@@ -200,11 +216,15 @@ Output JSON:
         entity2: Any,
     ) -> Tuple[bool, float]:
         """Use AI to determine if two entities should be merged."""
-        name1 = entity1.name if hasattr(entity1, 'name') else entity1.get('name', '')
-        desc1 = entity1.description if hasattr(entity1, 'description') else entity1.get('description', '')
+        def gv(obj, key, default=None):
+            if isinstance(obj, dict): return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        name1 = gv(entity1, 'name', '')
+        desc1 = gv(entity1, 'description', '')
         
-        name2 = entity2.name if hasattr(entity2, 'name') else entity2.get('name', '')
-        desc2 = entity2.description if hasattr(entity2, 'description') else entity2.get('description', '')
+        name2 = gv(entity2, 'name', '')
+        desc2 = gv(entity2, 'description', '')
         
         prompt = f"""Compare these two entities:
 
@@ -247,25 +267,29 @@ Are they the same real-world entity?"""
         
         updated = []
         for rel in relationships:
-            # Get current IDs
-            if hasattr(rel, 'source_entity_id'):
-                source_id = rel.source_entity_id
-                target_id = rel.target_entity_id
-            else:
-                source_id = rel.get('source_entity_id')
-                target_id = rel.get('target_entity_id')
+            def gv(obj, key, default=None):
+                if isinstance(obj, dict): return obj.get(key, default)
+                return getattr(obj, key, default)
+
+            def sv(obj, key, val):
+                if isinstance(obj, dict): obj[key] = val
+                else: setattr(obj, key, val)
+
+            # Get current IDs (support multiple field names)
+            source_id = gv(rel, 'source_entity_id') or gv(rel, 'source_id')
+            target_id = gv(rel, 'target_entity_id') or gv(rel, 'target_id')
             
             # Map to canonical IDs
             canonical_source = full_merge_map.get(source_id, source_id)
             canonical_target = full_merge_map.get(target_id, target_id)
             
-            # Update relationship
-            if hasattr(rel, 'source_entity_id'):
-                rel.source_entity_id = canonical_source
-                rel.target_entity_id = canonical_target
+            # Update relationship (support multiple field names)
+            if gv(rel, 'source_entity_id') is not None:
+                sv(rel, 'source_entity_id', canonical_source)
+                sv(rel, 'target_entity_id', canonical_target)
             else:
-                rel['source_entity_id'] = canonical_source
-                rel['target_entity_id'] = canonical_target
+                sv(rel, 'source_id', canonical_source)
+                sv(rel, 'target_id', canonical_target)
             
             updated.append(rel)
         

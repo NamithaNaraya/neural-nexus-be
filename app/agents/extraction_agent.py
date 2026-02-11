@@ -34,7 +34,9 @@ class ExtractedRelationship:
     """Represents a relationship extracted from text."""
     source_entity_id: str
     target_entity_id: str
-    relationship_type: str
+    source_name: str
+    target_name: str
+    type: str # Matching frontend expectation
     description: str = None
     strength: float = 1.0
     source_chunk_id: str = None
@@ -184,7 +186,9 @@ Only extract what you can directly quote from the text. Favor high-fidelity node
                 linked_relationships.append(ExtractedRelationship(
                     source_entity_id=source_id,
                     target_entity_id=target_id,
-                    relationship_type=rel.get("type", "RELATED_TO"),
+                    source_name=rel.get("source", ""),
+                    target_name=rel.get("target", ""),
+                    type=rel.get("type", "RELATED_TO"),
                     description=rel.get("description", ""),
                     source_chunk_id=rel.get("source_chunk_id"),
                     source_text=rel.get("evidence", ""),

@@ -171,7 +171,7 @@ class StorageAgent:
                     # Extract relationship data using helper
                     source_id = get_value(rel, 'source_entity_id')
                     target_id = get_value(rel, 'target_entity_id')
-                    rel_type = get_value(rel, 'relationship_type', 'RELATED_TO')
+                    rel_type = get_value(rel, 'type') or get_value(rel, 'relationship_type', 'RELATED_TO')
                     description = get_value(rel, 'description', '')
                     strength = get_value(rel, 'strength', 1.0)
                     source_text = get_value(rel, 'source_text', '')

@@ -183,33 +183,75 @@ async def get_extraction_preview(
                         "target_id": record["target_id"],
                         "target_name": record["target_name"],
                     })
+
+        # Build summary
+        def gv(obj, key, default=None):
+            """Safe get for dict or object."""
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        # Hydrate relationships with names if missing (for staging data or older files)
+        if entities and relationships:
+            entity_map = {gv(e, "id"): gv(e, "name") for e in entities if gv(e, "id")}
+            for rel in relationships:
+                def sv(obj, key, val):
+                    """Safe set for dict or object."""
+                    if isinstance(obj, dict):
+                        obj[key] = val
+                    else:
+                        setattr(obj, key, val)
+
+                # Map source/target names if missing but IDs exist
+                if not gv(rel, "source_name") and gv(rel, "source_entity_id"):
+                    sv(rel, "source_name", entity_map.get(gv(rel, "source_entity_id"), "Unknown"))
+                if not gv(rel, "target_name") and gv(rel, "target_entity_id"):
+                    sv(rel, "target_name", entity_map.get(gv(rel, "target_entity_id"), "Unknown"))
+                
+                # Support both 'type' and 'relationship_type' field names
+                if not gv(rel, "type") and gv(rel, "relationship_type"):
+                    sv(rel, "type", gv(rel, "relationship_type"))
+                elif not gv(rel, "type"):
+                    sv(rel, "type", "RELATED_TO")
+
+                # Also ensure source_entity_id / target_entity_id are present
+                if not gv(rel, "source_entity_id") and gv(rel, "source_id"):
+                    sv(rel, "source_entity_id", gv(rel, "source_id"))
+                if not gv(rel, "target_entity_id") and gv(rel, "target_id"):
+                    sv(rel, "target_entity_id", gv(rel, "target_id"))
+
+        type_counts = {}
+        for entity in entities:
+            t = gv(entity, "type", "Unknown")
+            type_counts[t] = type_counts.get(t, 0) + 1
+        
+        rel_type_counts = {}
+        for rel in relationships:
+            t = gv(rel, "type", "RELATED_TO")
+            rel_type_counts[t] = rel_type_counts.get(t, 0) + 1
+            
+        return ExtractionPreview(
+            file_id=file_id,
+            filename=filename,
+            entities=entities,
+            relationships=relationships,
+            summary={
+                "total_entities": len(entities),
+                "total_relationships": len(relationships),
+                "entity_types": type_counts,
+                "relationship_types": rel_type_counts,
+            }
+        )
                 
     except Exception as e:
         logger.error(f"Failed to fetch extraction preview: {e}")
-    
-    # Build summary
-    type_counts = {}
-    for entity in entities:
-        t = entity.get("type", "Unknown")
-        type_counts[t] = type_counts.get(t, 0) + 1
-    
-    rel_type_counts = {}
-    for rel in relationships:
-        t = rel.get("type", "RELATED_TO")
-        rel_type_counts[t] = rel_type_counts.get(t, 0) + 1
-    
-    return ExtractionPreview(
-        file_id=file_id,
-        filename=filename,
-        entities=entities,
-        relationships=relationships,
-        summary={
-            "total_entities": len(entities),
-            "total_relationships": len(relationships),
-            "entity_types": type_counts,
-            "relationship_types": rel_type_counts,
-        }
-    )
+        return ExtractionPreview(
+            file_id=file_id,
+            filename=filename,
+            entities=[],
+            relationships=[],
+            summary={"total_entities": 0, "total_relationships": 0, "entity_types": {}, "relationship_types": {}}
+        )
 
 
 
@@ -542,6 +584,7 @@ class FileStatusResponse(BaseModel):
     status: str
     node_count: int
     relationship_count: int
+    progress: int
     error_message: Optional[str]
 
 
@@ -556,7 +599,7 @@ async def get_file_status(
     async with get_postgres_session() as session:
         result = await session.execute(
             text("""
-                SELECT f.id, f.status, f.node_count, f.relationship_count, f.error_message
+                SELECT f.id, f.status, f.node_count, f.relationship_count, f.progress, f.error_message
                 FROM neural_nexus.files f
                 JOIN neural_nexus.folders fo ON fo.id = f.folder_id
                 WHERE f.id = :file_id AND fo.user_id = :user_id
@@ -573,6 +616,7 @@ async def get_file_status(
         status=row.status,
         node_count=row.node_count or 0,
         relationship_count=row.relationship_count or 0,
+        progress=row.progress or 0,
         error_message=row.error_message,
     )
 

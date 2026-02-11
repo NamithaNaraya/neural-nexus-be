@@ -41,8 +41,16 @@ class UploadStatus(BaseModel):
     current_phase: str
     node_count: int
     relationship_count: int
+    progress: int
     message: str
     error_message: str = None
+
+
+class UploadTextRequest(BaseModel):
+    """Request for direct text ingestion."""
+    filename: str
+    content: str
+    folder_id: str
 
 
 async def _create_file_record(
@@ -87,6 +95,14 @@ async def _process_file_async(
     async def progress_callback(progress):
         """Send progress updates via SSE."""
         try:
+            # Update database status for UI polling
+            async with get_postgres_session() as session:
+                await session.execute(
+                    text("UPDATE neural_nexus.files SET progress = :progress, status = :status WHERE id = :file_id"),
+                    {"progress": progress.progress_percent, "status": "processing", "file_id": file_id}
+                )
+                await session.commit()
+
             await publish_ingestion_progress(
                 user_id=user_id,
                 file_id=file_id,
@@ -123,15 +139,27 @@ async def _process_file_async(
             duration_seconds=(datetime.utcnow() - final_state.get("start_time")).total_seconds()
         )
         
-        # Send completion event
-        await publish_ingestion_progress(
-            user_id=user_id,
+        # Update database with final result
+        from app.agents.storage_agent import StorageAgent
+        storage = StorageAgent()
+        await storage.update_file_status(
             file_id=file_id,
-            phase="completed" if result.success else "failed",
-            progress=100 if result.success else 0,
-            message=f"Completed: {result.entity_count} entities, {result.relationship_count} relationships" 
-                    if result.success else f"Failed: {result.error_message}",
+            status="ready_for_review" if result.requires_review else ("completed" if result.success else "failed"),
+            node_count=result.entity_count,
+            relationship_count=result.relationship_count,
+            error_message=result.error_message
         )
+        
+        # Explicitly set progress to 100 on completion
+        if result.success:
+            async with get_postgres_session() as session:
+                await session.execute(
+                    text("UPDATE neural_nexus.files SET progress = 100 WHERE id = :file_id"),
+                    {"file_id": file_id}
+                )
+                await session.commit()
+        
+        logger.info(f"Pipeline finished for file {file_id}: success={result.success}")
         
         if result.success:
             logger.info(f"Pipeline completed for file {file_id}: "
@@ -298,6 +326,71 @@ async def upload_file(
         )
 
 
+@router.post("/upload/text", response_model=UploadResponse)
+async def upload_text(
+    background_tasks: BackgroundTasks,
+    request: UploadTextRequest,
+    current_user: dict = Depends(get_current_user),
+) -> UploadResponse:
+    """
+    Ingest text content directly.
+    Similar to file upload, but content is provided as a string.
+    """
+    content = request.content
+    filename = request.filename
+    folder_id = request.folder_id
+    user_id = current_user['id']
+    
+    if not content.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Content cannot be empty",
+        )
+    
+    # Generate file ID
+    file_id = str(uuid.uuid4())
+    file_size = len(content.encode('utf-8'))
+    file_type = "txt"
+    
+    try:
+        # Create file record
+        await _create_file_record(
+            file_id=file_id,
+            filename=filename,
+            folder_id=folder_id,
+            user_id=user_id,
+            file_type=file_type,
+            file_size=file_size,
+        )
+        
+        # Start background processing
+        background_tasks.add_task(
+            _process_file_async,
+            content,
+            file_id,
+            folder_id,
+            user_id,
+            file_type,
+        )
+        
+        logger.info(f"Text ingested: {filename} by user {user_id}, starting pipeline")
+        
+        return UploadResponse(
+            file_id=file_id,
+            filename=filename,
+            folder_id=folder_id,
+            status="pending",
+            message="Text ingested successfully. Processing started.",
+        )
+        
+    except Exception as e:
+        logger.error(f"Text ingestion failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process text ingestion: {str(e)}",
+        )
+
+
 @router.get("/upload/status/{file_id}", response_model=UploadStatus)
 async def get_upload_status(
     file_id: str,
@@ -341,45 +434,6 @@ async def get_upload_status(
         message=message,
         error_message=row.error_message,
     )
-
-
-@router.post("/upload/{file_id}/approve")
-async def approve_upload(
-    file_id: str,
-    current_user: dict = Depends(get_current_user),
-) -> Dict[str, Any]:
-    """Approve a file that's ready for review and commit to database."""
-    
-    async with get_postgres_session() as session:
-        result = await session.execute(
-            text("""
-                SELECT status FROM neural_nexus.files WHERE id = :file_id
-            """),
-            {"file_id": file_id}
-        )
-        row = result.fetchone()
-        
-        if not row:
-            raise HTTPException(status_code=404, detail="File not found")
-        
-        if row.status != "ready_for_review":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot approve file with status '{row.status}'. Must be 'ready_for_review'."
-            )
-        
-        # Update to completed
-        await session.execute(
-            text("""
-                UPDATE neural_nexus.files 
-                SET status = 'completed', processed_at = :processed_at
-                WHERE id = :file_id
-            """),
-            {"file_id": file_id, "processed_at": datetime.utcnow()}
-        )
-        await session.commit()
-    
-    return {"message": "File approved and committed to knowledge graph", "file_id": file_id}
 
 
 @router.delete("/upload/{file_id}")

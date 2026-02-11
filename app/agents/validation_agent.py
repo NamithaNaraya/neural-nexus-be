@@ -6,7 +6,7 @@ CONSTRAINT: Prompted to prioritize finding errors/hallucinations
 over simple confirmation.
 """
 import logging
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
 from dataclasses import dataclass
 
 from app.services.ai_service import get_ollama_service
@@ -97,11 +97,17 @@ PRIORITY: Find errors over confirming validity. Be strict!"""
         """
         logger.info(f"Validating {len(entities)} entities, {len(relationships)} relationships")
         
+        def gv(obj, key, default=None):
+            """Safe get for dict or object."""
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
         # Build chunk lookup
         chunk_map = {}
         for chunk in chunks:
-            chunk_id = chunk.chunk_id if hasattr(chunk, 'chunk_id') else chunk.get('chunk_id')
-            content = chunk.content if hasattr(chunk, 'content') else chunk.get('content', '')
+            chunk_id = gv(chunk, 'chunk_id')
+            content = gv(chunk, 'content', '')
             chunk_map[chunk_id] = content
         
         all_issues = []
@@ -147,13 +153,13 @@ PRIORITY: Find errors over confirming validity. Be strict!"""
         
         # Validate relationships
         valid_entity_ids = {
-            e.id if hasattr(e, 'id') else e.get('id')
-            for e in validated_entities
+            gv(e, 'id') for e in validated_entities if gv(e, 'id')
         }
         
         for rel in relationships:
-            source_id = rel.source_entity_id if hasattr(rel, 'source_entity_id') else rel.get('source_entity_id')
-            target_id = rel.target_entity_id if hasattr(rel, 'target_entity_id') else rel.get('target_entity_id')
+            # Check source/target IDs (support multiple field names)
+            source_id = gv(rel, 'source_entity_id') or gv(rel, 'source_id')
+            target_id = gv(rel, 'target_entity_id') or gv(rel, 'target_id')
             
             # Skip if either entity was removed
             if source_id not in valid_entity_ids or target_id not in valid_entity_ids:
@@ -175,8 +181,7 @@ PRIORITY: Find errors over confirming validity. Be strict!"""
         avg_confidence = 0.0
         if validated_entities:
             avg_confidence = sum(
-                e.confidence if hasattr(e, 'confidence') else e.get('confidence', 0.9)
-                for e in validated_entities
+                gv(e, 'confidence', 0.9) for e in validated_entities
             ) / len(validated_entities)
         
         logger.info(f"Validation complete: {len(validated_entities)} entities, "
@@ -199,12 +204,16 @@ PRIORITY: Find errors over confirming validity. Be strict!"""
         chunk_map: Dict[str, str],
     ) -> Dict[str, Any]:
         """Validate a single entity."""
-        name = entity.name if hasattr(entity, 'name') else entity.get('name', '')
-        entity_type = entity.type if hasattr(entity, 'type') else entity.get('type', '')
-        description = entity.description if hasattr(entity, 'description') else entity.get('description', '')
-        evidence = entity.source_text if hasattr(entity, 'source_text') else entity.get('source_text', '')
-        chunk_id = entity.source_chunk_id if hasattr(entity, 'source_chunk_id') else entity.get('source_chunk_id')
-        entity_id = entity.id if hasattr(entity, 'id') else entity.get('id')
+        def gv(obj, key, default=None):
+            if isinstance(obj, dict): return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        name = gv(entity, 'name', '')
+        entity_type = gv(entity, 'type', '')
+        description = gv(entity, 'description', '')
+        evidence = gv(entity, 'source_text', '')
+        chunk_id = gv(entity, 'source_chunk_id')
+        entity_id = gv(entity, 'id')
         
         # Get source text
         source_text = chunk_map.get(chunk_id, "")
@@ -262,9 +271,14 @@ PRIORITY: Find errors over confirming validity. Be strict!"""
         chunk_map: Dict[str, str],
     ) -> Dict[str, Any]:
         """Validate a single relationship."""
-        rel_type = rel.relationship_type if hasattr(rel, 'relationship_type') else rel.get('relationship_type', '')
-        evidence = rel.source_text if hasattr(rel, 'source_text') else rel.get('source_text', '')
-        chunk_id = rel.source_chunk_id if hasattr(rel, 'source_chunk_id') else rel.get('source_chunk_id')
+        def gv(obj, key, default=None):
+            if isinstance(obj, dict): return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        # Support both 'type' and 'relationship_type'
+        rel_type = gv(rel, 'type') or gv(rel, 'relationship_type', '')
+        evidence = gv(rel, 'source_text', '')
+        chunk_id = gv(rel, 'source_chunk_id')
         
         # Get source text
         source_text = chunk_map.get(chunk_id, "")
