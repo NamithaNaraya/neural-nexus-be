@@ -36,6 +36,7 @@ class RAGState(TypedDict):
     history: List[Dict[str, str]]
     enhanced_question: str
     vector_results: List[Dict[str, Any]]
+    strategic_results: List[Dict[str, Any]]
     graph_context: Dict[str, Any]
     
     # Outputs
@@ -45,6 +46,7 @@ class RAGState(TypedDict):
     
     # Metadata
     error: Optional[str]
+    schema: Optional[Dict[str, Any]]
 
 # Node Implementations
 async def context_loading_node(state: RAGState) -> Dict[str, Any]:
@@ -84,6 +86,7 @@ class HybridRAGService:
     def __init__(self, neo4j_driver, ai_service):
         self.neo4j = neo4j_driver
         self.ai = ai_service
+        self.schema_cache = None
         self.graph = self._build_graph()
         
     def _build_graph(self):
@@ -92,13 +95,15 @@ class HybridRAGService:
         # Add nodes (using instance methods to access neo4j/ai)
         workflow.add_node("load_context", context_loading_node)
         workflow.add_node("vector_search", self._vector_search_node)
+        workflow.add_node("strategic_scout", self._strategic_scout_node)
         workflow.add_node("graph_expansion", self._graph_expansion_node)
         workflow.add_node("generate_answer", self._answer_generation_node)
         
         # Set edges
         workflow.set_entry_point("load_context")
         workflow.add_edge("load_context", "vector_search")
-        workflow.add_edge("vector_search", "graph_expansion")
+        workflow.add_edge("vector_search", "strategic_scout")
+        workflow.add_edge("strategic_scout", "graph_expansion")
         workflow.add_edge("graph_expansion", "generate_answer")
         workflow.add_edge("generate_answer", END)
         
@@ -207,6 +212,85 @@ class HybridRAGService:
 
         return {"vector_results": final_results}
 
+    async def _strategic_scout_node(self, state: RAGState) -> Dict[str, Any]:
+        """
+        Step 3: Strategic Scout - Generate and execute problem-specific Cypher.
+        Uncovers multi-hop pathways and structural insights dynamically.
+        """
+        logger.info(f"[RAG] Strategic Scout analyzing question: {state['question']}")
+        
+        # 1. Get/Refresh Schema
+        if not self.schema_cache:
+            try:
+                async with self.neo4j.session() as s:
+                    # db.labels() returns a list of strings
+                    res1 = await s.run("CALL db.labels()")
+                    labels_data = await res1.data()
+                    labels = [list(r.values())[0] for r in labels_data]
+                    
+                    # db.relationshipTypes() returns a list of strings
+                    res2 = await s.run("CALL db.relationshipTypes()")
+                    rels_data = await res2.data()
+                    rels = [list(r.values())[0] for r in rels_data]
+                    
+                    self.schema_cache = {"labels": labels, "relationships": rels}
+                    logger.info(f"[RAG] Schema cached: {len(labels)} labels, {len(rels)} relationships.")
+            except Exception as e:
+                logger.warning(f"Failed to fetch schema: {e}")
+                self.schema_cache = {"labels": [], "relationships": []}
+
+        # 2. Identify core entities from vector search
+        entities = [r["name"] for r in state["vector_results"][:5]]
+        entity_hint = f"Relevant entities in play: {', '.join(entities)}"
+
+        # 3. Generate Cypher via LLM
+        scout_prompt = f"""
+        You are the Neural Nexus Strategic Scout. Your task is to generate a READ-ONLY Cypher query to answer complex multi-hop questions.
+        
+        SCHEMA:
+        - Labels: {self.schema_cache['labels']}
+        - Relationships: {self.schema_cache['relationships']}
+        
+        {entity_hint}
+        
+        HISTORICAL STRATEGIC PATTERNS (FEW-SHOT):
+        - Q: "Show the chain for Shatavari from herb to outcomes."
+          A: MATCH (h:Herb {{name:'Shatavari'}}) OPTIONAL MATCH (h)-[:HAS_QUALITY]->(q:Quality) OPTIONAL MATCH path=(q)-[:FACILITATES_EFFECT]->(:Effect)-[:ENABLES_KARMA]->(:Karma)-[:LEADS_TO_OUTCOME]->(:Outcome) RETURN h, q, path
+          
+        - Q: "Which qualities of Shatavari contribute most to outcomes?"
+          A: MATCH (h:Herb {{name:'Shatavari'}})-[:HAS_QUALITY]->(q:Quality)-[:FACILITATES_EFFECT]->(:Effect)-[:ENABLES_KARMA]->(:Karma)-[:LEADS_TO_OUTCOME]->(o:Outcome) RETURN q.name AS quality, count(*) AS paths ORDER BY paths DESC
+          
+        QUESTION: {state['question']}
+        
+        RULES:
+        1. Output ONLY a JSON object: {{"reasoning": "...", "cypher": "..."}}
+        2. Use only labels and relationships from the SCHEMA.
+        3. Keep the query efficient (LIMIT 50).
+        4. If the question is simple/factual, return an empty cypher string.
+        """
+        
+        try:
+            prediction = await self.ai.chat_json([
+                {"role": "system", "content": "You generate high-precision Cypher for graph analytics."},
+                {"role": "user", "content": scout_prompt}
+            ])
+            
+            cypher = prediction.get("cypher")
+            if not cypher or cypher.strip() == "":
+                return {"strategic_results": []}
+                
+            logger.info(f"[RAG] Executing Strategic Cypher: {cypher}")
+            
+            async with self.neo4j.session() as s:
+                result = await s.run(cypher)
+                records = await result.data()
+                logger.info(f"[RAG] Strategic Scout found {len(records)} structural insights.")
+                return {"strategic_results": records[:10]}
+                
+        except Exception as e:
+            logger.error(f"Strategic Scout failed: {e}")
+            return {"strategic_results": []}
+
     async def _graph_expansion_node(self, state: RAGState) -> Dict[str, Any]:
         if not state["vector_results"]:
             return {"graph_context": {"nodes": [], "relationships": [], "backbone_types": []}}
@@ -300,23 +384,28 @@ class HybridRAGService:
             type_label = r.get('type') or 'Entity'
             context += f"- {r['name']} [{type_label}]: {r['description'][:500]}\n"
             
+        if state.get("strategic_results"):
+            context += "\nStrategic Structural Insights (Dynamic Pathway Analysis):\n"
+            context += json.dumps(state["strategic_results"], indent=2) + "\n"
+            
         if state["graph_context"].get("relationships"):
-            context += "\nStructural Connections (Deep Path Discovery):\n"
-            for rel in state["graph_context"]["relationships"][:20]:
+            context += "\nStructural Connections (Neighborhood Expansion):\n"
+            for rel in state["graph_context"]["relationships"][:15]:
                 context += f"- {rel}\n"
-        
+
         backbone = ", ".join(state["graph_context"].get("backbone_types", []))
         if backbone:
             context += f"\nDomain Backbone (Primary Structural Relationships): {backbone}\n"
                 
         system_prompt = (
-            "You are the Neural Nexus Strategic Intelligence Engine. Your role is to uncover and synthesize deep structural connections within the knowledge graph. "
-            "1. STRATEGIC PATHFINDING: Trace 'INDIRECT PATHS' to connect entities that aren't directly linked. Search up to 10 levels deep if necessary. "
-            "2. DYNAMIC DOMAIN RELEVANCE: Prioritize connections using 'Domain Backbone' relationship types. These are the mandatory structural ties for this specific dataset. "
-            "3. BE SYNTHETIC: Explain the logical chain of connection (e.g., 'Entity A is connected to Entity B because of their shared relationship with Entity C'). "
-            "4. BE ACCURATE & PROFESSIONAL: Cite specific path segments. Only claim ignorance if the search results are empty."
+            "You are the Neural Nexus, a high-level Intelligence Expert. Your mission is to provide concise, summarized, and punchy answers that get straight to the point. "
+            "1. CONCISE INTELLIGENCE: Do not be long-winded. Summarize the findings into the essential 'Aha!' moments. Focus on the core connections. "
+            "2. PUNCHY STRUCTURE: Use short bullet points and brief bold headers. Eliminate all conversational 'fluff'. "
+            "3. THE 'WHY' IN ONE SENTENCE: Explain the logic of the connection quickly. (e.g., 'X connects to Y because of Z'). "
+            "4. GRAPH-DRIVEN: Use the 'Strategic Structural Insights' to provide the absolute direct path from start to finish. "
+            "5. HUMAN CLARITY: Ensure the answer is instantly understandable. Warm, professional, but incredibly efficient."
         )
-        user_prompt = f"Context:\n{context}\n\nQuestion: {state['question']}"
+        user_prompt = f"Context (Strategic Structural Insights & Knowledge):\n{context}\n\nQuestion: {state['question']}"
         
         try:
             answer = await self.ai.chat([
@@ -351,6 +440,7 @@ class HybridRAGService:
             "history": history or [],
             "scope": scope,
             "vector_results": [],
+            "strategic_results": [],
             "graph_context": {},
             "answer": "",
             "citations": [],
