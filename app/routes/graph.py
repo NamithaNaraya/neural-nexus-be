@@ -28,6 +28,7 @@ class NodeResponse(BaseModel):
     properties: Dict[str, Any] = {}
     degree: int = 0
     file_id: Optional[str] = None
+    file_ids: List[str] = []
     folder_id: Optional[str] = None
     x: Optional[float] = None
     y: Optional[float] = None
@@ -166,7 +167,7 @@ async def get_all_graph(
     try:
         # Query nodes with degree
         nodes_query = """
-        MATCH (n)
+        MATCH (n:Entity)
         OPTIONAL MATCH (n)-[r]-()
         WITH n, count(DISTINCT r) as degree
         RETURN n, degree
@@ -207,7 +208,8 @@ async def get_all_graph(
                     description=props.get("description"),
                     properties=node_properties,
                     degree=record["degree"],
-                    file_id=props.get("file_id"),
+                    file_id=props.get("file_id") or (props.get("file_ids")[0] if props.get("file_ids") else None),
+                    file_ids=props.get("file_ids") or ([] if not props.get("file_id") else [props.get("file_id")]),
                     folder_id=props.get("folder_id"),
                 ))
         
@@ -266,7 +268,7 @@ async def get_folder_graph(
         
         # Query nodes
         nodes_query = f"""
-        MATCH (n)
+        MATCH (n:Entity)
         WHERE n.folder_id = $folder_id OR n.folderId = $folder_id
         {type_filter}
         OPTIONAL MATCH (n)-[r]-()
@@ -315,7 +317,8 @@ async def get_folder_graph(
                     description=props.get("description"),
                     properties=node_properties,
                     degree=record["degree"],
-                    file_id=props.get("file_id"),
+                    file_id=props.get("file_id") or (props.get("file_ids")[0] if props.get("file_ids") else None),
+                    file_ids=props.get("file_ids") or ([] if not props.get("file_id") else [props.get("file_id")]),
                     folder_id=props.get("folder_id"),
                 ))
         
@@ -373,8 +376,8 @@ async def get_file_graph(
     try:
         # Query nodes
         nodes_query = """
-        MATCH (n)
-        WHERE n.file_id = $file_id OR n.fileId = $file_id
+        MATCH (n:Entity)
+        WHERE $file_id IN n.file_ids OR n.file_id = $file_id OR n.fileId = $file_id
         OPTIONAL MATCH (n)-[r]-()
         WITH n, count(DISTINCT r) as degree
         RETURN n, degree
@@ -398,15 +401,17 @@ async def get_file_graph(
                     description=props.get("description"),
                     properties=serialize_neo4j_values(raw_properties),
                     degree=record["degree"],
-                    file_id=props.get("file_id"),
+                    file_id=props.get("file_id") or (props.get("file_ids")[0] if props.get("file_ids") else None),
+                    file_ids=props.get("file_ids") or ([] if not props.get("file_id") else [props.get("file_id")]),
                     folder_id=props.get("folder_id"),
                 ))
         
         # Query relationships
         links_query = """
         MATCH (a)-[r]->(b)
-        WHERE (a.file_id = $file_id OR a.fileId = $file_id)
-          AND (b.file_id = $file_id OR b.fileId = $file_id)
+        WHERE ($file_id IN a.file_ids OR a.file_id = $file_id OR a.fileId = $file_id)
+          AND ($file_id IN b.file_ids OR b.file_id = $file_id OR b.fileId = $file_id)
+          AND ($file_id IN r.file_ids OR r.file_id = $file_id)
         RETURN COALESCE(a.id, a.entity_id, elementId(a)) as source,
                COALESCE(b.id, b.entity_id, elementId(b)) as target,
                COALESCE(r.type, type(r)) as rel_type,
@@ -447,8 +452,13 @@ async def get_node_details(
         query = """
         MATCH (n)
         WHERE n.id = $node_id OR n.entity_id = $node_id OR elementId(n) = $node_id
+        
+        # Get filenames for all associated file_ids
+        OPTIONAL MATCH (n)<-[:CONTAINS|MENTIONS]-(f:File)
+        WITH n, collect(DISTINCT f.filename) as filenames, collect(DISTINCT f.id) as fids
+        
         OPTIONAL MATCH (n)-[r]-()
-        RETURN n, count(DISTINCT r) as degree
+        RETURN n, count(DISTINCT r) as degree, filenames, fids
         LIMIT 1
         """
         result = await neo4j.execute_query(query, {"node_id": node_id})
@@ -460,9 +470,10 @@ async def get_node_details(
         props = dict(node)
         labels = list(node.labels)
         
-        # Get source files (if tracking enabled)
-        # This assumes we have a relationship or property tracking source
-        source_files = [props.get("file_id")] if props.get("file_id") else []
+        # Prefer names from CONTAINS relationship, fallback to internal properties
+        source_files = record["filenames"] if record["filenames"] else []
+        if not source_files and props.get("file_id"):
+             source_files = [props.get("file_id")]
         
         raw_properties = {k: v for k, v in props.items() if k not in ["id", "name", "type", "description"]}
         
@@ -830,6 +841,12 @@ async def create_node(
                 if key not in props:  # Don't overwrite core props
                     props[key] = value
         
+        # Create node
+        query = """
+        CREATE (n:Entity $props)
+        RETURN n
+        """
+        
         result = await neo4j.execute_query(query, {"props": props})
         
         # Invalidate cache
@@ -939,7 +956,7 @@ async def delete_node(
     cache: CacheService = Depends(get_cache_service),
     gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
-    """Create a new entity node."""
+    """Delete an entity node."""
     try:
         # First check if node exists
         check_query = "MATCH (n) WHERE n.id = $node_id RETURN n"

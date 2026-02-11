@@ -448,6 +448,15 @@ async def approve_file_ingestion(
                 {"file_id": file_id}
             )
             
+        # 6. Invalidate Cache
+        try:
+            from app.services.cache_service import get_cache_service
+            cache_service = get_cache_service()
+            await cache_service.invalidate_all()
+            logger.info(f"Invalidated all graph caches for file approval: {file_id}")
+        except Exception as e:
+            logger.error(f"Failed to invalidate cache: {e}")
+            
             await session.commit()
             
         # 6. Run FastRP or other analytics

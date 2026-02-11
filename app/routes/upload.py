@@ -53,6 +53,14 @@ class UploadTextRequest(BaseModel):
     folder_id: str
 
 
+class UploadCypherRequest(BaseModel):
+    """Request for direct Cypher ingestion."""
+    query: str
+    folder_id: str
+    filename: str = "Direct Cypher Ingestion"
+    file_id: str = None  # Optional: append to existing file context
+
+
 async def _create_file_record(
     file_id: str,
     filename: str,
@@ -388,6 +396,89 @@ async def upload_text(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to process text ingestion: {str(e)}",
+        )
+
+
+@router.post("/upload/cypher", response_model=UploadResponse)
+async def upload_cypher(
+    background_tasks: BackgroundTasks,
+    request: UploadCypherRequest,
+    current_user: dict = Depends(get_current_user),
+) -> UploadResponse:
+    """
+    Ingest data directly via Cypher query.
+    Bypasses AI extraction but automatically generates embeddings for new nodes.
+    Normalizes labels, syncs to PostgreSQL, and runs FastRP.
+    """
+    from app.services.managed_cypher_service import get_managed_cypher_service
+    
+    query = request.query
+    folder_id = request.folder_id
+    filename = request.filename
+    user_id = current_user['id']
+    file_id = request.file_id or str(uuid.uuid4())
+    
+    try:
+        # 1. Create file record if it's a new ingestion
+        if not request.file_id:
+            await _create_file_record(
+                file_id=file_id,
+                filename=filename,
+                folder_id=folder_id,
+                user_id=user_id,
+                file_type="cypher",
+                file_size=len(query.encode('utf-8')),
+            )
+        
+        # 2. Execute via ManagedCypherService (handles label normalization + PostgreSQL staging sync)
+        managed_service = get_managed_cypher_service()
+        result = await managed_service.execute_managed_query(
+            query=query,
+            file_id=file_id,
+            folder_id=folder_id,
+            user_id=user_id
+        )
+        
+        # 3. Update file status with both node and relationship counts
+        from app.agents.storage_agent import StorageAgent
+        storage = StorageAgent()
+        await storage.update_file_status(
+            file_id=file_id,
+            status="completed",
+            node_count=result["node_count"],
+            relationship_count=result.get("relationship_count", 0),
+        )
+        
+        # 4. Run FastRP Embeddings (for structure)
+        try:
+            from app.services.graph_service import get_graph_service
+            graph_service = get_graph_service()
+            await graph_service.run_fastrp_node_embeddings(folder_id)
+        except Exception as e:
+            logger.warning(f"FastRP failed for Cypher ingestion (optional): {e}")
+            
+        logger.info(f"Managed Cypher ingestion successful: {file_id}")
+        
+        return UploadResponse(
+            file_id=file_id,
+            filename=filename,
+            folder_id=folder_id,
+            status="completed",
+            message=result["message"] + " FastRP updated.",
+        )
+        
+    except Exception as e:
+        logger.error(f"Cypher ingestion failed: {e}")
+        # Update file status to failed if record was created
+        try:
+            storage = StorageAgent()
+            await storage.update_file_status(file_id, "failed", error_message=str(e))
+        except:
+            pass
+            
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process Cypher ingestion: {str(e)}",
         )
 
 

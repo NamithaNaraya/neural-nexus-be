@@ -201,8 +201,15 @@ class StorageAgent:
                                 created_at: datetime()
                             },
                             target,
-                            {}
+                            {
+                                updated_at: datetime()
+                            }
                         ) YIELD rel
+                        SET rel.file_ids = CASE 
+                            WHEN rel.file_ids IS NULL THEN [$file_id]
+                            WHEN NOT $file_id IN rel.file_ids THEN rel.file_ids + $file_id
+                            ELSE rel.file_ids
+                        END
                         RETURN rel
                     """
                     
