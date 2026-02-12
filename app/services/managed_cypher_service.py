@@ -110,17 +110,9 @@ class ManagedCypherService:
             except Exception as e:
                 logger.warning(f"APOC UUID generation failed, will fallback to Python: {e}")
 
-            # 4. Link File to Entities for deletion support and reference counting
-            try:
-                await session.run("""
-                    MATCH (f:File {id: $file_id})
-                    MATCH (n:Entity)
-                    WHERE $file_id IN n.file_ids OR n.file_id = $file_id
-                    MERGE (f)-[:CONTAINS]->(n)
-                """, {"file_id": file_id})
-                logger.info(f"Linked File {file_id} to its entities via :CONTAINS")
-            except Exception as e:
-                logger.warning(f"Failed to link File to entities: {e}")
+            # 4. File-to-Entity association is handled via the file_ids array on entities
+            # (No :File nodes exist in Neo4j — ownership is tracked via e.file_ids property)
+            logger.info(f"Entities for file {file_id} are tracked via file_ids array")
 
             # 5. Normalize names and types from original labels, catch missing IDs
             result = await session.run("""

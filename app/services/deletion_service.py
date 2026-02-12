@@ -178,44 +178,37 @@ class DeletionService:
         return job
     
     async def _execute_file_deletion(self, job: DeletionJob):
-        """Execute file deletion with reference counting."""
+        """Execute file deletion with reference counting via file_ids array."""
         try:
             job.status = DeletionStatus.IN_PROGRESS
-            job.message = "Analyzing entity references..."
+            job.message = "Cleaning graph entities..."
             job.progress = 0.1
             
             file_id = job.target_id
             
-            # Get entities to delete vs preserve
-            deletable = await self.ref_counter.get_deletable_entities(file_id)
-            shared = await self.ref_counter.get_shared_entities(file_id)
-            
-            job.stats["nodes_preserved"] = len(shared)
-            job.message = f"Found {len(deletable)} unique entities, {len(shared)} shared"
-            job.progress = 0.3
-            
-            # Delete file-to-entity relationships for shared entities
-            if shared:
-                await self._detach_shared_entities(file_id, list(shared))
-                job.message = f"Detached {len(shared)} shared entities"
-                job.progress = 0.5
-            
-            # Delete unique entities with their relationships
-            if deletable:
-                has_apoc = await self._check_apoc_available()
-                if has_apoc:
-                    deleted = await self._batch_delete_entities_apoc(list(deletable))
-                else:
-                    deleted = await self._batch_delete_entities_native(list(deletable))
+            # Remove file_id from entity file_ids arrays and delete entities with no remaining references
+            async with self.driver.session() as neo_session:
+                result = await neo_session.run("""
+                    MATCH (e:Entity)
+                    WHERE $file_id IN e.file_ids
+                    SET e.file_ids = [x IN e.file_ids WHERE x <> $file_id]
+                    WITH e, size(e.file_ids) as remaining
+                    WHERE remaining = 0
+                    DETACH DELETE e
+                    RETURN count(e) as deleted
+                """, file_id=file_id)
+                record = await result.single()
+                deleted_count = record["deleted"] if record else 0
+                job.stats["nodes_deleted"] = deleted_count
                 
-                job.stats["nodes_deleted"] = deleted["nodes"]
-                job.stats["relationships_deleted"] = deleted["relationships"]
-                job.message = f"Deleted {deleted['nodes']} entities"
-                job.progress = 0.8
+                # Delete chunks for this file
+                await neo_session.run(
+                    "MATCH (c:Chunk {file_id: $file_id}) DELETE c",
+                    file_id=file_id
+                )
             
-            # Delete the file node itself
-            await self._delete_file_node(file_id)
-            job.progress = 0.9
+            job.message = f"Deleted {deleted_count} entities"
+            job.progress = 0.8
             
             # Delete from PostgreSQL
             await self._delete_file_from_sql(file_id)
@@ -233,8 +226,7 @@ class DeletionService:
             
             logger.info(
                 f"File deletion complete: {file_id}, "
-                f"deleted {job.stats['nodes_deleted']} nodes, "
-                f"preserved {job.stats['nodes_preserved']} shared nodes"
+                f"deleted {job.stats['nodes_deleted']} nodes"
             )
             
         except Exception as e:
@@ -374,49 +366,85 @@ class DeletionService:
             
             folder_id = job.target_id
             
-            # Get all files in folder
-            query = """
-            MATCH (folder:Folder {id: $folder_id})-[:CONTAINS]->(f:File)
-            RETURN f.id as file_id
-            """
-            async with self.driver.session() as session:
-                result = await session.run(query, folder_id=folder_id)
-                records = await result.data()
-                file_ids = [r["file_id"] for r in records]
+            # Query PostgreSQL for file IDs (not Neo4j — :File nodes don't exist there)
+            from sqlalchemy import text
+            result = await self.db.execute(
+                text("SELECT id FROM neural_nexus.files WHERE folder_id = :fid"),
+                {"fid": folder_id}
+            )
+            file_ids = [str(r[0]) for r in result.fetchall()]
             
             job.message = f"Deleting {len(file_ids)} files..."
             
-            # Delete each file
+            # Delete each file's Neo4j entities via reference counting
             for i, file_id in enumerate(file_ids):
-                file_job = await self.delete_file(file_id, job.user_id, background=False)
-                job.stats["nodes_deleted"] += file_job.stats["nodes_deleted"]
-                job.stats["relationships_deleted"] += file_job.stats["relationships_deleted"]
-                job.stats["nodes_preserved"] += file_job.stats["nodes_preserved"]
-                job.progress = 0.1 + 0.8 * (i + 1) / max(len(file_ids), 1)
+                try:
+                    # Directly clean Neo4j entities for this file
+                    async with self.driver.session() as neo_session:
+                        # Remove file_id from entity file_ids array
+                        # Delete entities that no longer have any file references
+                        await neo_session.run("""
+                            MATCH (e:Entity)
+                            WHERE $file_id IN e.file_ids
+                            SET e.file_ids = [x IN e.file_ids WHERE x <> $file_id]
+                            WITH e
+                            WHERE size(e.file_ids) = 0
+                            DETACH DELETE e
+                        """, file_id=file_id)
+                        
+                        # Delete chunks for this file
+                        await neo_session.run(
+                            "MATCH (c:Chunk {file_id: $file_id}) DELETE c",
+                            file_id=file_id
+                        )
+                    job.stats["nodes_deleted"] += 1  # Approximate
+                except Exception as e:
+                    logger.warning(f"Failed to clean Neo4j for file {file_id}: {e}")
+                
+                job.progress = 0.1 + 0.6 * (i + 1) / max(len(file_ids), 1)
             
-            # Delete folder node
-            folder_query = """
-            MATCH (folder:Folder {id: $folder_id})
-            DETACH DELETE folder
-            """
-            async with self.driver.session() as session:
-                await session.run(folder_query, folder_id=folder_id)
+            # Safety net: delete ANY remaining entities tagged with this folder_id
+            try:
+                async with self.driver.session() as neo_session:
+                    result = await neo_session.run(
+                        "MATCH (e:Entity {folder_id: $fid}) DETACH DELETE e RETURN count(e) as cnt",
+                        fid=folder_id
+                    )
+                    record = await result.single()
+                    orphan_count = record["cnt"] if record else 0
+                    if orphan_count > 0:
+                        logger.info(f"Safety net cleaned {orphan_count} orphaned entities for folder {folder_id}")
+                        job.stats["nodes_deleted"] += orphan_count
+                    
+                    # Also clean any chunks tagged with this folder
+                    await neo_session.run(
+                        "MATCH (c:Chunk {folder_id: $fid}) DELETE c",
+                        fid=folder_id
+                    )
+            except Exception as e:
+                logger.warning(f"Safety net Neo4j cleanup failed for folder {folder_id}: {e}")
             
-            # Delete from PostgreSQL
-            from sqlalchemy import delete
+            job.progress = 0.85
+            
+            # Delete from PostgreSQL (CASCADE will handle files + entity_staging)
+            from sqlalchemy import delete as sql_delete
             from app.db.models import Folder
             
             await self.db.execute(
-                delete(Folder).where(Folder.id == folder_id)
+                sql_delete(Folder).where(Folder.id == folder_id)
             )
             await self.db.commit()
+            
+            # Invalidate all caches
+            if self.cache:
+                await self.cache.invalidate_all()
             
             job.status = DeletionStatus.COMPLETED
             job.message = "Folder deletion complete"
             job.progress = 1.0
             job.completed_at = datetime.utcnow()
             
-            logger.info(f"Folder deletion complete: {folder_id}")
+            logger.info(f"Folder deletion complete: {folder_id}, deleted {job.stats['nodes_deleted']} nodes")
             
         except Exception as e:
             job.status = DeletionStatus.FAILED

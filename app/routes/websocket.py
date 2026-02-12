@@ -97,7 +97,12 @@ async def websocket_endpoint(
         try:
             from app.core.security import decode_token
             payload = decode_token(token)
-            user_id = payload.get("sub")
+            if payload:
+                user_id = payload.get("sub")
+            else:
+                logger.warning("WebSocket token decoding returned None")
+                await websocket.close(code=4003)
+                return
         except Exception as e:
             logger.warning(f"WebSocket token validation failed: {e}")
             await websocket.close(code=4003) # Forbidden

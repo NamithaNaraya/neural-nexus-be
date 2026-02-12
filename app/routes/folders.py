@@ -293,6 +293,14 @@ async def delete_folder(
     except Exception as e:
         logger.warning(f"Failed to clean Neo4j for folder {folder_id}: {e}")
     
+    # Invalidate all caches so UI shows fresh data
+    try:
+        from app.services.cache_service import get_cache_service
+        cache = get_cache_service()
+        await cache.invalidate_all()
+    except Exception as e:
+        logger.warning(f"Cache invalidation failed after folder delete: {e}")
+    
     logger.info(f"Deleted folder {folder_id} for user {user_id}")
     
     return {"message": "Folder deleted successfully"}

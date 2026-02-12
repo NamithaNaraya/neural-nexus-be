@@ -241,11 +241,26 @@ class HybridRAGService:
 
         # 2. Identify core entities from vector search
         entities = [r["name"] for r in state["vector_results"][:5]]
-        entity_hint = f"Relevant entities in play: {', '.join(entities)}"
+        scope = state.get("scope")
+        scope_clause = ""
+        sid = None
+        if scope:
+            sid = scope.get("id")
+            if scope.get("type") == "file":
+                scope_clause = f" (MANDATORY: Check $sid IN node.file_ids OR node.file_id = $sid AND SAME FOR RELS)"
+            else:
+                scope_clause = f" (MANDATORY: Check node.folder_id = $sid)"
+        
+        entity_hint = f"Relevant entities in play: {', '.join(entities)}.{scope_clause}"
 
         # 3. Generate Cypher via LLM
         scout_prompt = f"""
         You are the Neural Nexus Strategic Scout. Your task is to generate a READ-ONLY Cypher query to answer complex multi-hop questions.
+        
+        SCOPE RESTRICTION: You MUST filter all nodes and relationships by the provided $sid. 
+        - If scope is File: Use `($sid IN n.file_ids OR n.file_id = $sid)`.
+        - If scope is Folder: Use `n.folder_id = $sid`.
+        - Apply this filter to EVERY node and relationship in your MATCH.
         
         SCHEMA:
         - Labels: {self.schema_cache['labels']}
@@ -253,12 +268,14 @@ class HybridRAGService:
         
         {entity_hint}
         
-        HISTORICAL STRATEGIC PATTERNS (FEW-SHOT):
-        - Q: "Show the chain for Shatavari from herb to outcomes."
-          A: MATCH (h:Herb {{name:'Shatavari'}}) OPTIONAL MATCH (h)-[:HAS_QUALITY]->(q:Quality) OPTIONAL MATCH path=(q)-[:FACILITATES_EFFECT]->(:Effect)-[:ENABLES_KARMA]->(:Karma)-[:LEADS_TO_OUTCOME]->(:Outcome) RETURN h, q, path
+        ID for scope filter ($sid): {sid}
+        
+        HISTORICAL STRATEGIC PATTERNS (SCOPED FEW-SHOT):
+        - Q: "Show the chain for Shatavari."
+          A: MATCH (h:Herb {{name:'Shatavari'}}) WHERE h.folder_id = $sid MATCH path=(h)-[r*..3]-(related) WHERE ALL(rel IN r WHERE rel.folder_id = $sid) RETURN h, path
           
-        - Q: "Which qualities of Shatavari contribute most to outcomes?"
-          A: MATCH (h:Herb {{name:'Shatavari'}})-[:HAS_QUALITY]->(q:Quality)-[:FACILITATES_EFFECT]->(:Effect)-[:ENABLES_KARMA]->(:Karma)-[:LEADS_TO_OUTCOME]->(o:Outcome) RETURN q.name AS quality, count(*) AS paths ORDER BY paths DESC
+        - Q: "Which qualities contribute most to outcomes?"
+          A: MATCH (q:Quality)-[r:FACILITATES_EFFECT|ENABLES_KARMA|LEADS_TO_OUTCOME*..5]->(o:Outcome) WHERE ALL(rel IN r WHERE rel.folder_id = $sid) RETURN q.name AS quality, count(*) AS paths ORDER BY paths DESC
           
         QUESTION: {state['question']}
         
@@ -279,10 +296,10 @@ class HybridRAGService:
             if not cypher or cypher.strip() == "":
                 return {"strategic_results": []}
                 
-            logger.info(f"[RAG] Executing Strategic Cypher: {cypher}")
+            logger.info(f"[RAG] Executing Strategic Cypher with sid {sid}: {cypher}")
             
             async with self.neo4j.session() as s:
-                result = await s.run(cypher)
+                result = await s.run(cypher, {"sid": sid})
                 records = await result.data()
                 logger.info(f"[RAG] Strategic Scout found {len(records)} structural insights.")
                 return {"strategic_results": records[:10]}
@@ -295,24 +312,32 @@ class HybridRAGService:
         if not state["vector_results"]:
             return {"graph_context": {"nodes": [], "relationships": [], "backbone_types": []}}
             
-        # seed nodes for expansion (include 20+ to ensure deep strategic paths aren't missed)
+        # 0. Define seed nodes for expansion
         node_ids = [r["node_id"] for r in state["vector_results"][:20]]
         
-        # Query 0: Identify dynamic 'backbone' relationships (most frequent in the graph)
-        backbone_query = """
-        CALL db.relationshipTypes() YIELD relationshipType
-        MATCH ()-[r]-() WHERE type(r) = relationshipType
-        RETURN relationshipType, count(r) as freq
-        ORDER BY freq DESC
-        LIMIT 8
-        """
+        # 1. Prepare scope filter for Cypher
+        scope = state.get("scope")
+        scope_filter = ""
+        params = {"node_ids": node_ids}
+        
+        if scope:
+            sid = scope.get("id")
+            if scope.get("type") == "folder":
+                scope_filter = "AND (related.folder_id = $sid OR r.folder_id = $sid)"
+                params["sid"] = sid
+            elif scope.get("type") == "file":
+                scope_filter = "AND ($sid IN related.file_ids OR related.file_id = $sid OR $sid IN r.file_ids OR r.file_id = $sid)"
+                params["sid"] = sid
+        else:
+            params["sid"] = None
 
-        # Query 1: Direct Neighbors
-        neighbors_query = """
+        # Query 1: Direct Neighbors (Scoped)
+        neighbors_query = f"""
         UNWIND $node_ids AS nodeId
         MATCH (n)
         WHERE n.id = nodeId OR elementId(n) = nodeId
         OPTIONAL MATCH (n)-[r]-(related)
+        WHERE related IS NOT NULL {scope_filter}
         RETURN 
             n.name as source_name,
             type(r) as rel_type,
@@ -320,19 +345,23 @@ class HybridRAGService:
         LIMIT 30
         """
         
-        # Query 2: Pathfinding between top entities
-        path_query = """
+        # Query 2: Pathfinding between top entities (Scoped)
+        path_query = f"""
         MATCH (n)
         WHERE (n.id IN $node_ids OR elementId(n) IN $node_ids)
         WITH collect(n) as seedNodes
         UNWIND seedNodes as n1
         UNWIND seedNodes as n2
         WITH n1, n2 WHERE elementId(n1) < elementId(n2)
-        // STRATEGIC PATHFINDING: Increased depth to 10 for very far relationships
         MATCH p = shortestPath((n1)-[*..10]-(n2))
+        WHERE ALL(rel IN relationships(p) WHERE 
+            ($sid IS NULL) OR 
+            (rel.file_id = $sid OR $sid IN rel.file_ids OR rel.folder_id = $sid)
+        )
         RETURN [node in nodes(p) | node.name] as names, [rel in relationships(p) | type(rel)] as types
         LIMIT 15
         """
+        if "sid" not in params: params["sid"] = None # Fallback for path query
         
         try:
             nodes = set()
@@ -340,7 +369,7 @@ class HybridRAGService:
             
             async with self.neo4j.session() as session:
                 # Get Neighbors
-                res1 = await session.run(neighbors_query, {"node_ids": node_ids})
+                res1 = await session.run(neighbors_query, params)
                 records1 = await res1.data()
                 
                 for r in records1:
@@ -353,7 +382,7 @@ class HybridRAGService:
                         rels.append(f"{source} -[{rel}]-> {target}")
                 
                 # Get Paths
-                res2 = await session.run(path_query, {"node_ids": node_ids})
+                res2 = await session.run(path_query, params)
                 records2 = await res2.data()
                 
                 for r in records2:
@@ -398,12 +427,12 @@ class HybridRAGService:
             context += f"\nDomain Backbone (Primary Structural Relationships): {backbone}\n"
                 
         system_prompt = (
-            "You are the Neural Nexus, a high-level Intelligence Expert. Your mission is to provide concise, summarized, and punchy answers that get straight to the point. "
-            "1. CONCISE INTELLIGENCE: Do not be long-winded. Summarize the findings into the essential 'Aha!' moments. Focus on the core connections. "
-            "2. PUNCHY STRUCTURE: Use short bullet points and brief bold headers. Eliminate all conversational 'fluff'. "
-            "3. THE 'WHY' IN ONE SENTENCE: Explain the logic of the connection quickly. (e.g., 'X connects to Y because of Z'). "
-            "4. GRAPH-DRIVEN: Use the 'Strategic Structural Insights' to provide the absolute direct path from start to finish. "
-            "5. HUMAN CLARITY: Ensure the answer is instantly understandable. Warm, professional, but incredibly efficient."
+            "You are the Neural Nexus, a high-level Intelligence Expert. Your mission is to provide concise, summarized, and punchy answers based EXCLUSIVELY and STENOGRAPHICALLY on the provided context. "
+            "1. STRICT GROUNDING: Only use the exact data mentioned in the 'Strategic Structural Insights' and 'Analyzed Entities'. Do NOT add any external knowledge, even if you know it to be true. "
+            "2. NO EXTRA ADDITIONS: If the data says 'A connects to B', report exactly that. Do NOT add context like 'In traditional medicine, A is known for...'. Only report what is specifically in the provided context. "
+            "3. OUT-OF-SCOPE HANDLING: If a question asks for details not found in the provided context, state clearly that the information is not present. "
+            "4. PUNCHY STRUCTURE: Use short bullet points and brief bold headers. Focus on the core 'Aha!' moments. "
+            "5. HUMAN CLARITY: Ensure the answer is instantly understandable and professional."
         )
         user_prompt = f"Context (Strategic Structural Insights & Knowledge):\n{context}\n\nQuestion: {state['question']}"
         

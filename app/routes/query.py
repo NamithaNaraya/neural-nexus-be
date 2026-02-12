@@ -139,7 +139,7 @@ async def run_query(
         )
 
 
-@router.get("/chat/history/{session_id}")
+@router.get("/query/chat/history/{session_id}")
 async def get_chat_history(
     session_id: str,
     limit: int = 10,  # 5 Q&A pairs
@@ -166,7 +166,7 @@ async def get_chat_history(
         }
 
 
-@router.get("/chat/sessions")
+@router.get("/query/chat/sessions")
 async def list_chat_sessions(
     current_user: dict = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
@@ -187,7 +187,7 @@ async def list_chat_sessions(
         return [dict(r) for r in result.mappings().all()]
 
 
-@router.delete("/chat/session/{session_id}")
+@router.delete("/query/chat/session/{session_id}")
 async def delete_chat_session(
     session_id: str,
     current_user: dict = Depends(get_current_user),

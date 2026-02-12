@@ -61,12 +61,14 @@ async def create_indexes() -> None:
         # Ownership scoping
         "CREATE INDEX entity_folder_idx IF NOT EXISTS FOR (n:Entity) ON (n.folder_id)",
         "CREATE INDEX entity_user_idx IF NOT EXISTS FOR (n:Entity) ON (n.user_id)",
-        "CREATE INDEX entity_file_idx IF NOT EXISTS FOR (n:Entity) ON (n.file_id)",
         
-        # Chunk and file lookups
+        # Chunk lookups
         "CREATE INDEX chunk_id_idx IF NOT EXISTS FOR (n:Chunk) ON (n.id)",
-        "CREATE INDEX file_id_idx IF NOT EXISTS FOR (n:File) ON (n.id)",
-        "CREATE INDEX folder_id_idx IF NOT EXISTS FOR (n:Folder) ON (n.id)",
+        "CREATE INDEX chunk_file_idx IF NOT EXISTS FOR (n:Chunk) ON (n.file_id)",
+        
+        # NOTE: :File and :Folder nodes are NOT created in Neo4j.
+        # Entities store folder_id/file_ids as properties.
+        # No indexes needed for :File or :Folder labels.
     ]
     
     async with driver.session() as session:
@@ -150,25 +152,39 @@ async def create_entity(
     embedding: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
     """
-    Create a new entity node in Neo4j.
+    Create or merge an entity node in Neo4j.
     
-    Returns the created entity data.
+    Uses MERGE on (name, type, folder_id) to prevent duplicates.
+    Returns the created/updated entity data.
     """
     driver = get_neo4j_driver()
     
+    import json
+    properties_json = json.dumps(properties) if properties else '{}'
+    
     query = """
-    CREATE (e:Entity {
-        id: $id,
+    MERGE (e:Entity {
         name: $name,
         type: $type,
-        description: $description,
-        properties: $properties,
-        embedding: $embedding,
-        folder_id: $folder_id,
-        user_id: $user_id,
-        file_id: $file_id,
-        created_at: datetime()
+        folder_id: $folder_id
     })
+    ON CREATE SET
+        e.id = $id,
+        e.description = $description,
+        e.properties = $properties_json,
+        e.embedding = $embedding,
+        e.user_id = $user_id,
+        e.file_ids = [$file_id],
+        e.created_at = datetime(),
+        e.source_count = 1
+    ON MATCH SET
+        e.file_ids = CASE 
+            WHEN NOT $file_id IN e.file_ids 
+            THEN e.file_ids + $file_id 
+            ELSE e.file_ids 
+        END,
+        e.source_count = size(e.file_ids),
+        e.updated_at = datetime()
     RETURN e
     """
     
@@ -179,7 +195,7 @@ async def create_entity(
             name=name,
             type=entity_type,
             description=description or "",
-            properties=properties or {},
+            properties_json=properties_json,
             embedding=embedding,
             folder_id=folder_id,
             user_id=user_id,
@@ -382,9 +398,12 @@ async def get_file_graph(file_id: str) -> Dict[str, List]:
     """Get nodes and relationships for a specific file."""
     driver = get_neo4j_driver()
     
+    # Entities use file_ids array (not file_id scalar)
     query = """
-    MATCH (e:Entity {file_id: $file_id})
-    OPTIONAL MATCH (e)-[r]->(target:Entity {file_id: $file_id})
+    MATCH (e:Entity)
+    WHERE $file_id IN e.file_ids
+    OPTIONAL MATCH (e)-[r]->(target:Entity)
+    WHERE $file_id IN target.file_ids
     RETURN collect(DISTINCT e) as entities, 
            collect(DISTINCT {
                source: e.id, 
@@ -482,29 +501,27 @@ async def delete_file_entities(file_id: str) -> int:
     """
     Delete all entities belonging to a file.
     
-    Uses batch deletion for large files.
+    Uses reference counting: removes file_id from file_ids array,
+    then deletes entities with no remaining references.
     Returns count of deleted entities.
     """
     driver = get_neo4j_driver()
     
+    # Use reference counting (file_ids array) — not the scalar file_id
     query = """
-    MATCH (e:Entity {file_id: $file_id})
-    WITH e LIMIT 5000
+    MATCH (e:Entity)
+    WHERE $file_id IN e.file_ids
+    SET e.file_ids = [x IN e.file_ids WHERE x <> $file_id]
+    WITH e
+    WHERE size(e.file_ids) = 0
     DETACH DELETE e
-    RETURN count(*) as deleted
+    RETURN count(e) as deleted
     """
     
-    total_deleted = 0
-    
     async with driver.session() as session:
-        while True:
-            result = await session.run(query, file_id=file_id)
-            record = await result.single()
-            deleted = record["deleted"] if record else 0
-            total_deleted += deleted
-            
-            if deleted < 5000:
-                break
+        result = await session.run(query, file_id=file_id)
+        record = await result.single()
+        total_deleted = record["deleted"] if record else 0
     
     logger.info(f"Deleted {total_deleted} entities for file {file_id}")
     return total_deleted

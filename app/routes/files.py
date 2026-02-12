@@ -690,6 +690,14 @@ async def delete_file(
     except Exception as e:
         logger.warning(f"Failed to clean Neo4j for file {file_id}: {e}")
     
+    # Invalidate all caches so UI shows fresh data
+    try:
+        from app.services.cache_service import get_cache_service
+        cache = get_cache_service()
+        await cache.invalidate_all()
+    except Exception as e:
+        logger.warning(f"Cache invalidation failed after file delete: {e}")
+    
     logger.info(f"Deleted file {file_id}")
     
     return {"message": "File deleted successfully"}
