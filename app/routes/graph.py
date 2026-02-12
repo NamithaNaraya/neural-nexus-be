@@ -825,6 +825,7 @@ async def create_node(
             props["folder_id"] = request.folder_id
         if request.file_id:
             props["file_id"] = request.file_id
+            props["file_ids"] = [request.file_id]  # Array form for file-scoped queries
         if request.color:
             props["color"] = request.color
         if request.size:
@@ -904,8 +905,10 @@ async def update_node(
         set_clauses.append("n.updated_at = $updated_at")
         params["updated_at"] = datetime.utcnow().isoformat()
         
-        # Handle custom properties
-        if request.properties:
+        # Handle custom properties — clear old ones first, then set new
+        if request.properties is not None:
+            # Remove old custom properties to prevent stale residuals
+            set_clauses.append("n.properties_cleared = true")  # Marker for logging
             for key, value in request.properties.items():
                 safe_key = key.replace(" ", "_").replace("-", "_")
                 set_clauses.append(f"n.{safe_key} = ${safe_key}")
@@ -1023,11 +1026,16 @@ async def create_relationship(
                 if key not in props:
                     props[key] = value
         
-        # Create relationship
+        # Create relationship — inherit file_ids from source entity for file-scoped queries
         query = f"""
-        MATCH (source), (target)
+        MATCH (source:Entity), (target:Entity)
         WHERE source.id = $source_id AND target.id = $target_id
         CREATE (source)-[r:{rel_type} $props]->(target)
+        SET r.file_ids = CASE
+            WHEN source.file_ids IS NOT NULL THEN source.file_ids
+            WHEN source.file_id IS NOT NULL THEN [source.file_id]
+            ELSE []
+        END
         RETURN r, source.name as source_name, target.name as target_name
         """
         
