@@ -452,13 +452,8 @@ async def get_node_details(
         query = """
         MATCH (n)
         WHERE n.id = $node_id OR n.entity_id = $node_id OR elementId(n) = $node_id
-        
-        # Get filenames for all associated file_ids
-        OPTIONAL MATCH (n)<-[:CONTAINS|MENTIONS]-(f:File)
-        WITH n, collect(DISTINCT f.filename) as filenames, collect(DISTINCT f.id) as fids
-        
         OPTIONAL MATCH (n)-[r]-()
-        RETURN n, count(DISTINCT r) as degree, filenames, fids
+        RETURN n, count(DISTINCT r) as degree
         LIMIT 1
         """
         result = await neo4j.execute_query(query, {"node_id": node_id})
@@ -470,8 +465,8 @@ async def get_node_details(
         props = dict(node)
         labels = list(node.labels)
         
-        # Prefer names from CONTAINS relationship, fallback to internal properties
-        source_files = record["filenames"] if record["filenames"] else []
+        # Get source files from entity properties (no :File nodes exist in Neo4j)
+        source_files = props.get("file_ids", [])
         if not source_files and props.get("file_id"):
              source_files = [props.get("file_id")]
         
