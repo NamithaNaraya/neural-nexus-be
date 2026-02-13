@@ -12,7 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routes import health, auth, folders, files, upload, graph, query, analytics, sse, websocket, deletion, dashboard
+from app.routes import health, auth, folders, files, upload, graph, query, analytics, sse, websocket, deletion, dashboard, reasoning
 from app.db.connections import (
     init_neo4j, 
     close_neo4j, 
@@ -143,6 +143,7 @@ app.include_router(sse.router, prefix="/api/v1/sse", tags=["SSE"])
 app.include_router(websocket.router, prefix="/api/v1/ws", tags=["WebSocket"])
 app.include_router(deletion.router, prefix="/api/v1", tags=["Deletion"])
 app.include_router(dashboard.router, prefix="/api/v1/dashboard", tags=["Dashboard"])
+app.include_router(reasoning.router, prefix="/api/v1", tags=["Reasoning"])
 
 
 @app.get("/")

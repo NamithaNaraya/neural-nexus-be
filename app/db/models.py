@@ -98,6 +98,11 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
+    encounters: Mapped[List["Encounter"]] = relationship(
+        "Encounter",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
     
     __table_args__ = (
         CheckConstraint("role IN ('admin', 'user')", name="valid_role"),
@@ -379,3 +384,87 @@ class EntityStaging(Base):
             name="valid_staging_status",
         ),
     )
+
+
+class Encounter(Base):
+    """
+    Reasoning Encounter model.
+    
+    Persists a single reasoning/consultation session.
+    Links to input indicators, inferred states, and outcomes.
+    """
+    __tablename__ = "encounters"
+    
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+        index=True,
+    )
+    indicators: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+    )
+    inferred_states: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=True,
+    )
+    recommendations: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=True,
+    )
+    safety_status: Mapped[str] = mapped_column(
+        String(20),
+        default="unknown",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+    )
+    
+    user: Mapped["User"] = relationship("User", back_populates="encounters")
+    outcomes: Mapped[List["Outcome"]] = relationship("Outcome", back_populates="encounter")
+
+
+class Outcome(Base):
+    """
+    Encounter Outcome/Feedback model.
+    
+    Stores patient/user feedback for Step 13.
+    Used for long-term effectiveness tracking.
+    """
+    __tablename__ = "outcomes"
+    
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    encounter_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("encounters.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    feedback: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+    )
+    rating: Mapped[Optional[int]] = mapped_column(
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+    )
+    
+    encounter: Mapped["Encounter"] = relationship("Encounter", back_populates="outcomes")

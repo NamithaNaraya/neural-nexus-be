@@ -126,6 +126,64 @@ class GDSService:
             except Exception as e:
                 logger.warning(f"Failed to drop projection {graph_name}: {e}")
 
+    # === GDS Algorithm Implementations ===
+
+    async def run_pagerank(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10) -> List[Dict[str, Any]]:
+        graph_name = await self.ensure_projection(folder_id, node_ids)
+        query = """
+            CALL gds.pageRank.stream($graph_name)
+            YIELD nodeId, score
+            WITH gds.util.asNode(nodeId) AS node, score
+            RETURN node.id AS id, node.name AS name, node.type AS type, score
+            ORDER BY score DESC
+            LIMIT $top_k
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, graph_name=graph_name, top_k=top_k)
+            return await result.data()
+
+    async def run_betweenness(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10) -> List[Dict[str, Any]]:
+        graph_name = await self.ensure_projection(folder_id, node_ids)
+        query = """
+            CALL gds.betweenness.stream($graph_name)
+            YIELD nodeId, score
+            WITH gds.util.asNode(nodeId) AS node, score
+            RETURN node.id AS id, node.name AS name, node.type AS type, score
+            ORDER BY score DESC
+            LIMIT $top_k
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, graph_name=graph_name, top_k=top_k)
+            return await result.data()
+
+    async def run_closeness(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10) -> List[Dict[str, Any]]:
+        graph_name = await self.ensure_projection(folder_id, node_ids)
+        query = """
+            CALL gds.closeness.stream($graph_name)
+            YIELD nodeId, score
+            WITH gds.util.asNode(nodeId) AS node, score
+            WHERE score > 0
+            RETURN node.id AS id, node.name AS name, node.type AS type, score
+            ORDER BY score DESC
+            LIMIT $top_k
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, graph_name=graph_name, top_k=top_k)
+            return await result.data()
+
+    async def run_louvain(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        graph_name = await self.ensure_projection(folder_id, node_ids)
+        query = """
+            CALL gds.louvain.stream($graph_name)
+            YIELD nodeId, communityId
+            WITH gds.util.asNode(nodeId) AS node, communityId
+            RETURN node.id AS id, node.name AS name, node.type AS type, communityId AS community_id
+            ORDER BY community_id ASC
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, graph_name=graph_name)
+            return await result.data()
+
 # Dependency
 _gds_service = None
 

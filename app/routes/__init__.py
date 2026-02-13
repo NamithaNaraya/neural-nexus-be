@@ -13,6 +13,8 @@ from app.routes import sse
 from app.routes import websocket
 from app.routes import deletion
 
+from app.routes import reasoning
+
 __all__ = [
     "health",
     "auth",
@@ -25,5 +27,6 @@ __all__ = [
     "sse",
     "websocket",
     "deletion",
+    "reasoning",
 ]
 
