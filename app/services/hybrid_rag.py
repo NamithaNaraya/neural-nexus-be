@@ -112,12 +112,12 @@ class HybridRAGService:
     # --- Node Implementation Methods ---
 
     async def _vector_search_node(self, state: RAGState) -> Dict[str, Any]:
-        raw_question = state["question"].lower()
+        logger.info(f"RAG Graph: Starting vector search for '{state['question'][:50]}...'")
         question_embedding = await self.ai.embed(state["question"])
-        
+        logger.info(f"RAG Graph: Embedding generated, querying Neo4j...")
         # 1. Scope handling
         params = {
-            "terms": [w.strip("?,.!") .lower() for w in raw_question.split() if len(w) > 2][:10],
+            "terms": [w.strip("?,.!") .lower() for w in state["question"].split() if len(w) > 2][:10],
             "embedding": question_embedding,
             "top_k": 10
         }
@@ -363,6 +363,16 @@ class HybridRAGService:
         """
         if "sid" not in params: params["sid"] = None # Fallback for path query
         
+        # Query 3: Backbone (Most common relationship types in scope)
+        backbone_query = f"""
+        MATCH ()-[r]->()
+        WHERE ($sid IS NULL) OR (r.folder_id = $sid OR r.file_id = $sid OR $sid IN r.file_ids)
+        WITH type(r) AS relType, count(*) AS relCount
+        ORDER BY relCount DESC
+        LIMIT 5
+        RETURN relType as relationshipType
+        """
+        
         try:
             nodes = set()
             rels = []
@@ -478,7 +488,9 @@ class HybridRAGService:
         }
         
         try:
+            logger.info(f"RAG Graph: Invoking LangGraph for session {session_id}")
             final_state = await self.graph.ainvoke(initial_state)
+            logger.info(f"RAG Graph: LangGraph completed successfully.")
             return {
                 "answer": final_state["answer"],
                 "citations": final_state["citations"],
