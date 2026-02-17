@@ -112,9 +112,11 @@ class HybridRAGService:
     # --- Node Implementation Methods ---
 
     async def _vector_search_node(self, state: RAGState) -> Dict[str, Any]:
+        start_time = datetime.now()
         logger.info(f"RAG Graph: Starting vector search for '{state['question'][:50]}...'")
         question_embedding = await self.ai.embed(state["question"])
-        logger.info(f"RAG Graph: Embedding generated, querying Neo4j...")
+        embed_time = (datetime.now() - start_time).total_seconds()
+        logger.info(f"RAG Graph: Embedding generated in {embed_time:.2f}s, querying Neo4j...")
         # 1. Scope handling
         params = {
             "terms": [w.strip("?,.!") .lower() for w in state["question"].split() if len(w) > 2][:10],
@@ -299,9 +301,11 @@ class HybridRAGService:
             logger.info(f"[RAG] Executing Strategic Cypher with sid {sid}: {cypher}")
             
             async with self.neo4j.session() as s:
+                s_start = datetime.now()
                 result = await s.run(cypher, {"sid": sid})
                 records = await result.data()
-                logger.info(f"[RAG] Strategic Scout found {len(records)} structural insights.")
+                scout_exec_time = (datetime.now() - s_start).total_seconds()
+                logger.info(f"[RAG] Strategic Scout found {len(records)} structural insights in {scout_exec_time:.2f}s.")
                 return {"strategic_results": records[:10]}
                 
         except Exception as e:
@@ -406,7 +410,7 @@ class HybridRAGService:
                     for name in names: nodes.add(name)
 
                 # Get Backbone (Dynamic Relevance)
-                res0 = await session.run(backbone_query)
+                res0 = await session.run(backbone_query, params)
                 backbone_records = await res0.data()
                 backbone_types = [r["relationshipType"] for r in backbone_records]
                 
@@ -437,12 +441,13 @@ class HybridRAGService:
             context += f"\nDomain Backbone (Primary Structural Relationships): {backbone}\n"
                 
         system_prompt = (
-            "You are the Neural Nexus, a high-level Intelligence Expert. Your mission is to provide concise, summarized, and punchy answers based EXCLUSIVELY and STENOGRAPHICALLY on the provided context. "
-            "1. STRICT GROUNDING: Only use the exact data mentioned in the 'Strategic Structural Insights' and 'Analyzed Entities'. Do NOT add any external knowledge, even if you know it to be true. "
-            "2. NO EXTRA ADDITIONS: If the data says 'A connects to B', report exactly that. Do NOT add context like 'In traditional medicine, A is known for...'. Only report what is specifically in the provided context. "
-            "3. OUT-OF-SCOPE HANDLING: If a question asks for details not found in the provided context, state clearly that the information is not present. "
-            "4. PUNCHY STRUCTURE: Use short bullet points and brief bold headers. Focus on the core 'Aha!' moments. "
-            "5. HUMAN CLARITY: Ensure the answer is instantly understandable and professional."
+            "You are the Neural Nexus, a high-level Intelligence Expert. Your mission is to provide helpful, well-structured, and accurate answers based on the provided context.\n\n"
+            "GUIDELINES:\n"
+            "1. **Markdown Formatting**: Use standard Markdown (bold headers, bullet points, numbered lists) to make the information easy to read. Ensure headers are on their own lines.\n"
+            "2. **Strict Grounding**: Primarily use the exact data mentioned in the 'Strategic Structural Insights' and 'Analyzed Entities'. If the data is available, summarize it clearly.\n"
+            "3. **Greeting & Chatter**: If the user says 'hi', 'hello', or asks a general non-technical question, respond politely and briefly as a professional assistant. You don't need to say 'no information found' for a greeting.\n"
+            "4. **Gap Handling**: If the specific technical information requested is missing from the context, state that clearly but remain professional.\n"
+            "5. **Conciseness**: Be punchy and focus on core insights. Avoid unnecessary filler text."
         )
         user_prompt = f"Context (Strategic Structural Insights & Knowledge):\n{context}\n\nQuestion: {state['question']}"
         
