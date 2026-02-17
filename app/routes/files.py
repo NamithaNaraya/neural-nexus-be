@@ -572,6 +572,11 @@ async def reject_file_ingestion(
 
 # === Standard File Endpoints ===
 
+class FileUpdate(BaseModel):
+    """File update request."""
+    filename: Optional[str] = None
+
+
 class FileResponse(BaseModel):
     """Complete file data response."""
     id: str
@@ -701,6 +706,47 @@ async def delete_file(
     logger.info(f"Deleted file {file_id}")
     
     return {"message": "File deleted successfully"}
+
+
+@router.patch("/{file_id}", response_model=FileResponse)
+async def update_file(
+    file_id: str,
+    data: FileUpdate,
+    current_user: dict = Depends(get_current_user),
+) -> FileResponse:
+    """Update file metadata (e.g., rename)."""
+    user_id = current_user["id"]
+    
+    async with get_postgres_session() as session:
+        # Verify file belongs to user
+        result = await session.execute(
+            text("""
+                SELECT f.id, f.filename
+                FROM neural_nexus.files f
+                JOIN neural_nexus.folders fo ON fo.id = f.folder_id
+                WHERE f.id = :file_id AND fo.user_id = :user_id
+            """),
+            {"file_id": file_id, "user_id": user_id}
+        )
+        row = result.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Update fields
+        new_filename = data.filename if data.filename is not None else row.filename
+        
+        await session.execute(
+            text("""
+                UPDATE neural_nexus.files 
+                SET filename = :filename
+                WHERE id = :file_id
+            """),
+            {"file_id": file_id, "filename": new_filename}
+        )
+        await session.commit()
+    
+    return await get_file(file_id, current_user)
 
 
 @router.get("/{file_id}", response_model=FileResponse)
