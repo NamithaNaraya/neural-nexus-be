@@ -232,8 +232,16 @@ class ManagedCypherService:
                         WHEN n.type CONTAINS '_F_' THEN split(n.type, '_F_')[0]
                         ELSE n.type
                     END,
+                    // Improve naming heuristics to avoid UUIDs in the UI
+                    // We prioritize specific properties that typically contain names/labels
                     n.name = CASE
-                        WHEN n.name IS NULL THEN coalesce(n.label, n.title, n.id, 'Unknown')
+                        WHEN n.name IS NULL OR n.name = n.id THEN
+                            coalesce(
+                                n.label, n.title, n.herb, n.quality, n.property,
+                                n.value, n.text, n.display_name,
+                                [lbl IN labels(n) WHERE NOT lbl IN ['Entity', 'Chunk', 'File', 'Folder'] AND NOT lbl STARTS WITH 'F_'][0],
+                                n.id, 'Unknown'
+                            )
                         ELSE n.name
                     END
                 RETURN DISTINCT id(n) as internal_id, n.id as uuid
