@@ -32,28 +32,42 @@ class ManagedCypherService:
         Example: '(n:Herb)' becomes '(n:Herb:F_e59c8189)'
         Ensures MERGE operations are scoped to the folder without manual query edits.
         """
+        folder_suffix = f"_F_{folder_id.replace('-', '_')}"
         folder_label = f"F_{folder_id.replace('-', '_')}"
-        
+
+        def prefix_labels(label_str: str) -> str:
+            if not label_str:
+                return ""
+            # label_str looks like ":L1:L2"
+            lbl_parts = label_str.split(':')
+            prefixed = []
+            for p in lbl_parts:
+                if not p:
+                    continue
+                # Skip system labels and already prefixed labels
+                if p in STANDARD_LABELS or p.startswith('F_') or p.endswith(folder_suffix):
+                    prefixed.append(p)
+                else:
+                    prefixed.append(f"{p}{folder_suffix}")
+            return ":" + ":".join(prefixed)
+
         # Regex to find node patterns: ( [var] [ :Labels] [ {props} ] )
         node_pattern = r"(\(\s*)([a-zA-Z0-9_]*)(\s*:[a-zA-Z0-9_:]*)?(\s*\{.*?\})?(\s*\))"
-        # Split query by semicolon to separate schema (CONSTRAINT/INDEX) from data (MERGE/CREATE)
-        # Process each statement individually to ensure isolation label is only applied to data.
+
         parts = query.split(';')
         rewritten_parts = []
-        
+
         for part in parts:
-            # Track nodes seen in this specific statement to avoid redundant label injection
-            # which causes "variable already declared" syntax errors in Cypher.
             seen_vars = set()
 
             def inject(match):
-                prefix = match.group(1) # '('
-                var = match.group(2)    # 'n' or empty
-                labels = match.group(3) or "" # ':Label' or empty
-                props = match.group(4) or ""  # ' {..}' or empty
-                suffix = match.group(5) # ')'
-                
-                # If it's a named variable we've already seen in this statement, 
+                prefix = match.group(1)  # '('
+                var = match.group(2)     # 'n' or empty
+                labels = match.group(3) or ""  # ':Label' or empty
+                props = match.group(4) or ""   # ' {..}' or empty
+                suffix = match.group(5)  # ')'
+
+                # If it's a named variable we've already seen in this statement,
                 # don't inject the folder label again.
                 if var and var in seen_vars:
                     return f"{prefix}{var}{labels}{props}{suffix}"
@@ -61,40 +75,59 @@ class ManagedCypherService:
                 if var:
                     seen_vars.add(var)
 
-                if var and not labels and not props:
+                # Prefix all user labels in the pattern
+                new_labels = prefix_labels(labels)
+
+                if var and not new_labels and not props:
                     return f"{prefix}{var}:{folder_label}{suffix}"
 
-                if not var and not labels and not props:
+                if not var and not new_labels and not props:
                     return f"{prefix}:{folder_label}{suffix}"
 
-                return f"{prefix}{var}{labels}:{folder_label}{props}{suffix}"
+                # Append the technical isolation label as well
+                return f"{prefix}{var}{new_labels}:{folder_label}{props}{suffix}"
 
-            # Clean up comments for the check (avoid greedy DOTALL on single-line comments)
+            # Clean up comments
             check_part = re.sub(r'//.*', '', part)
             check_part = re.sub(r'/\*.*?\*/', '', check_part, flags=re.DOTALL)
-            
+
             if not check_part.strip():
                 rewritten_parts.append(part)
                 continue
-            
+
             # Check for schema commands (CONSTRAINT or INDEX)
-            check_part = check_part.strip().upper()
-            is_schema = any(check_part.startswith(kw) for kw in [
-                "CREATE CONSTRAINT", "DROP CONSTRAINT", 
+            upper_part = check_part.strip().upper()
+            is_schema = any(upper_part.startswith(kw) for kw in [
+                "CREATE CONSTRAINT", "DROP CONSTRAINT",
                 "CREATE INDEX", "DROP INDEX", "SHOW", "ASSERT"
             ])
-            
+
             if is_schema:
-                rewritten_parts.append(part)
+                schema_lbl_pattern = r":([a-zA-Z0-9_]+)"
+
+                def schema_inject(m):
+                    lbl = m.group(1)
+                    if lbl in STANDARD_LABELS or lbl.startswith('F_'):
+                        return f":{lbl}"
+                    return f":{lbl}{folder_suffix}"
+
+                rewritten_part = re.sub(schema_lbl_pattern, schema_inject, part)
+                rewritten_part = re.sub(
+                    r"(CONSTRAINT|INDEX)\s+([a-zA-Z0-9_]+)\s+FOR",
+                    r"\1 \2" + folder_suffix + " FOR",
+                    rewritten_part,
+                    flags=re.IGNORECASE
+                )
+                rewritten_parts.append(rewritten_part)
             else:
                 rewritten_parts.append(re.sub(node_pattern, inject, part))
-                
+
         return rewritten_parts
 
     async def execute_managed_query(
-        self, 
-        query: str, 
-        file_id: str, 
+        self,
+        query: str,
+        file_id: str,
         folder_id: str,
         user_id: str
     ) -> Dict[str, Any]:
@@ -110,24 +143,18 @@ class ManagedCypherService:
           7. Sync entities & relationships to PostgreSQL entity_staging
           8. Return final counts
         """
-        # Execute the query as a single block to preserve variables (MERGE h, etc.)
-        # We only split if strictly necessary for certain system commands, 
-        # but for user data, one block is better.
-        # 0. Rewrite query for folder isolation
         folder_label = f"F_{folder_id.replace('-', '_')}"
         rewritten_statements = self._rewrite_query_for_folder(query, folder_id)
         logger.info(f"Rewrote Cypher for folder isolation: {folder_label}")
 
         async with self.driver.session() as session:
             # 0.5 Pre-Adoption: Restore isolation labels to orphaned or unassigned nodes
-            # This ensures MERGE can find existing nodes even if they lost their labels previously
-            # or were created partially before a failure.
             try:
                 pre_res = await session.run(f"""
                     MATCH (n)
                     WHERE (n.folder_id = $folder_id OR (n.folder_id IS NULL AND labels(n) <> []))
                     AND NOT n:{folder_label}
-                    SET n:{folder_label}, 
+                    SET n:{folder_label},
                         n.folder_id = $folder_id
                     RETURN count(n) as repaired_count
                 """, {"folder_id": folder_id})
@@ -147,15 +174,13 @@ class ManagedCypherService:
                 raise
 
             # 2. Targeted Adoption: Find nodes that should belong to this file.
-            # We ONLY adopt nodes that have the folder-specific label (guaranteed isolation).
-            # We also ensure :Entity label and system IDs are present.
             adoption_result = await session.run(f"""
                 MATCH (n)
                 WHERE (n:{folder_label} OR n.folder_id = $folder_id)
                 AND (n.file_id IS NULL OR n.file_id = $file_id OR NOT $file_id IN n.file_ids)
                 SET n.file_id = CASE WHEN n.file_id IS NULL THEN $file_id ELSE n.file_id END,
                     n.folder_id = CASE WHEN n.folder_id IS NULL THEN $folder_id ELSE n.folder_id END,
-                    n.file_ids = CASE 
+                    n.file_ids = CASE
                         WHEN n.file_ids IS NULL THEN [$file_id]
                         WHEN NOT $file_id IN n.file_ids THEN n.file_ids + $file_id
                         ELSE n.file_ids
@@ -168,58 +193,61 @@ class ManagedCypherService:
             logger.info(f"Adopted {adoption_record['adopted_count']} nodes for file {file_id}")
 
             # 2.5 Adopt Relationships: Tag relationships between adopted entities
-            # We use DISTINCT to avoid issues with multiple paths
             await session.run("""
                 MATCH (a:Entity)-[r]->(b:Entity)
-                WHERE ($file_id IN a.file_ids) 
+                WHERE ($file_id IN a.file_ids)
                   AND ($file_id IN b.file_ids)
                   AND (r.file_ids IS NULL OR NOT $file_id IN r.file_ids)
-                SET r.file_ids = CASE 
+                SET r.file_ids = CASE
                     WHEN r.file_ids IS NULL THEN [$file_id]
-                    ELSE r.file_ids + $file_id 
+                    ELSE r.file_ids + $file_id
                 END
             """, {"file_id": file_id})
 
-            # 3. Robust ID and Name Generation
+            # 3. UUID Generation — use randomUUID() (built-in Neo4j 4.4+), fallback to Python
             try:
                 await session.run("""
                     MATCH (n:Entity)
                     WHERE ($file_id IN n.file_ids OR n.file_id = $file_id) AND n.id IS NULL
-                    SET n.id = apoc.create.uuid()
+                    SET n.id = randomUUID()
                 """, {"file_id": file_id})
             except Exception as e:
-                logger.warning(f"APOC UUID generation failed, will fallback to Python: {e}")
+                logger.warning(f"randomUUID() generation failed, will fallback to Python: {e}")
 
             # 4. File-to-Entity association is handled via the file_ids array on entities
-            # (No :File nodes exist in Neo4j — ownership is tracked via e.file_ids property)
             logger.info(f"Entities for file {file_id} are tracked via file_ids array")
 
             # 5. Normalize names and types from original labels, catch missing IDs
+            # NOTE: Use // for Cypher comments inside query strings, never #
             result = await session.run("""
                 MATCH (n:Entity)
                 WHERE $file_id IN n.file_ids OR n.file_id = $file_id
-                SET n.type = CASE 
-                        WHEN n.type IS NULL THEN [l IN labels(n) WHERE NOT l IN ['Entity', 'Chunk', 'File', 'Folder'] AND NOT l STARTS WITH 'F_'][0]
+                SET n.type = CASE
+                        WHEN n.type IS NULL THEN
+                            [l IN labels(n) WHERE NOT l IN ['Entity', 'Chunk', 'File', 'Folder'] AND NOT l STARTS WITH 'F_'][0]
                         ELSE n.type
                     END,
-                    n.name = CASE 
+                    // Strip folder suffix from type if present (e.g. 'Herb_F_3c15...' -> 'Herb')
+                    n.type = CASE
+                        WHEN n.type CONTAINS '_F_' THEN split(n.type, '_F_')[0]
+                        ELSE n.type
+                    END,
+                    n.name = CASE
                         WHEN n.name IS NULL THEN coalesce(n.label, n.title, n.id, 'Unknown')
                         ELSE n.name
                     END
                 RETURN DISTINCT id(n) as internal_id, n.id as uuid
             """, {"file_id": file_id})
-            
-            import uuid
+
             async for record in result:
                 if not record["uuid"]:
                     new_uuid = str(uuid.uuid4())
-                    await session.run("MATCH (n) WHERE id(n) = $int_id SET n.id = $uuid", 
-                                    {"int_id": record["internal_id"], "uuid": new_uuid})
+                    await session.run(
+                        "MATCH (n) WHERE id(n) = $int_id SET n.id = $uuid",
+                        {"int_id": record["internal_id"], "uuid": new_uuid}
+                    )
 
-            # Step 5: Normalize labels (Move additional labels to the type property if not already set)
-            # We no longer aggressively remove user labels or isolation labels.
-            # This ensures that subsequent MERGE operations using the same labels 
-            # (which is common in Cypher ingestion) remain idempotent and correct.
+            # Step 5b: Retain all labels for idempotent Cypher compatibility.
             # The folder_label (:F_uuid) MUST persist for folder-based query scoping.
             logger.info("Retaining all labels for idempotent Cypher compatibility.")
 
@@ -229,7 +257,7 @@ class ManagedCypherService:
                 WHERE ($file_id IN n.file_ids OR n.file_id = $file_id) AND n.embedding IS NULL
                 RETURN DISTINCT n.id as id, n.name as name, n.type as type, coalesce(n.description, '') as description
             """, {"file_id": file_id})
-            
+
             new_nodes = []
             async for record in result:
                 if record["id"] and record["name"]:
@@ -239,7 +267,7 @@ class ManagedCypherService:
                         "type": record["type"] or "Entity",
                         "description": record["description"]
                     })
-            
+
             if new_nodes:
                 try:
                     embedded_nodes = await self.embedding_agent.embed_entities(new_nodes)
@@ -254,16 +282,14 @@ class ManagedCypherService:
 
             # 7. Sync to PostgreSQL entity_staging
             try:
-                # Collect all entities for this file
-                # Use DISTINCT to avoid inflated counts from messy graphs
                 entities_result = await session.run("""
                     MATCH (n:Entity)
                     WHERE $file_id IN n.file_ids OR n.file_id = $file_id
-                    RETURN DISTINCT n.id as id, n.name as name, n.type as type, 
+                    RETURN DISTINCT n.id as id, n.name as name, n.type as type,
                            coalesce(n.description, '') as description,
                            coalesce(n.confidence, 1.0) as confidence
                 """, {"file_id": file_id})
-                
+
                 entities_for_staging = []
                 async for record in entities_result:
                     entities_for_staging.append({
@@ -273,9 +299,7 @@ class ManagedCypherService:
                         "description": record["description"],
                         "confidence": record["confidence"],
                     })
-                
-                # Collect all relationships for this file
-                # Use DISTINCT to avoid relationship duplication in the list
+
                 rels_result = await session.run("""
                     MATCH (a:Entity)-[r]->(b:Entity)
                     WHERE ($file_id IN a.file_ids OR a.file_id = $file_id)
@@ -284,7 +308,7 @@ class ManagedCypherService:
                     RETURN DISTINCT a.id as source, b.id as target, type(r) as rel_type,
                            coalesce(r.description, '') as description
                 """, {"file_id": file_id})
-                
+
                 relationships_for_staging = []
                 async for record in rels_result:
                     relationships_for_staging.append({
@@ -293,7 +317,7 @@ class ManagedCypherService:
                         "type": record["rel_type"],
                         "description": record["description"],
                     })
-                
+
                 await self.storage.store_staging(file_id, entities_for_staging, relationships_for_staging)
                 logger.info(f"Staged {len(entities_for_staging)} entities and {len(relationships_for_staging)} relationships for file {file_id}")
             except Exception as e:
@@ -323,9 +347,8 @@ class ManagedCypherService:
                 from app.services.cache_service import get_cache_service
                 cache = get_cache_service()
                 await cache.invalidate_graph(f"file_{file_id}")
-                await cache.invalidate_graph(f"folder_{folder_id}_None_0_1000") # Common folder cache key
-                # Also invalidate general folder cache
-                await cache.invalidate_all() 
+                await cache.invalidate_graph(f"folder_{folder_id}_None_0_1000")
+                await cache.invalidate_all()
                 logger.info(f"Invalidated graph cache for file {file_id}")
             except Exception as e:
                 logger.warning(f"Cache invalidation failed: {e}")
