@@ -170,6 +170,9 @@ class DeletionService:
         )
         self.active_jobs[job.job_id] = job
         
+        # Delete from PostgreSQL immediately so it disappears from UI
+        await self._delete_file_from_sql(file_id)
+        
         if background:
             asyncio.create_task(self._execute_file_deletion(job))
         else:
@@ -210,8 +213,7 @@ class DeletionService:
             job.message = f"Deleted {deleted_count} entities"
             job.progress = 0.8
             
-            # Delete from PostgreSQL
-            await self._delete_file_from_sql(file_id)
+            # Postgres deletion already done in main method
             
             job.status = DeletionStatus.COMPLETED
             job.message = "Deletion complete"
@@ -341,6 +343,7 @@ class DeletionService:
         Uses cascading deletion for contained files.
         """
         import uuid
+        from sqlalchemy import text
         
         job = DeletionJob(
             job_id=str(uuid.uuid4()),
@@ -350,31 +353,43 @@ class DeletionService:
         )
         self.active_jobs[job.job_id] = job
         
+        # 1. Fetch file IDs before deleting the folder (cascade will remove them)
+        result = await self.db.execute(
+            text("SELECT id FROM neural_nexus.files WHERE folder_id = :fid"),
+            {"fid": folder_id}
+        )
+        file_ids = [str(r[0]) for r in result.fetchall()]
+        
+        # 2. Delete from PostgreSQL immediately so it disappears from UI
+        #    (CASCADE will handle files + entity_staging)
+        from sqlalchemy import delete as sql_delete
+        from app.db.models import Folder
+        
+        await self.db.execute(
+            sql_delete(Folder).where(Folder.id == folder_id)
+        )
+        await self.db.commit()
+        
+        # Invalidate folder list caches right away
+        if self.cache:
+            await self.cache.invalidate_all()
+        
+        # 3. Handle expensive graph cleanup
         if background:
-            asyncio.create_task(self._execute_folder_deletion(job))
+            asyncio.create_task(self._execute_folder_deletion(job, file_ids))
         else:
-            await self._execute_folder_deletion(job)
+            await self._execute_folder_deletion(job, file_ids)
         
         return job
     
-    async def _execute_folder_deletion(self, job: DeletionJob):
+    async def _execute_folder_deletion(self, job: DeletionJob, file_ids: List[str]):
         """Execute folder deletion with cascading file deletions."""
         try:
             job.status = DeletionStatus.IN_PROGRESS
-            job.message = "Finding folder contents..."
             job.progress = 0.1
             
             folder_id = job.target_id
-            
-            # Query PostgreSQL for file IDs (not Neo4j — :File nodes don't exist there)
-            from sqlalchemy import text
-            result = await self.db.execute(
-                text("SELECT id FROM neural_nexus.files WHERE folder_id = :fid"),
-                {"fid": folder_id}
-            )
-            file_ids = [str(r[0]) for r in result.fetchall()]
-            
-            job.message = f"Deleting {len(file_ids)} files..."
+            job.message = f"Cleaning up {len(file_ids)} files in graph..."
             
             # Delete each file's Neo4j entities via reference counting
             for i, file_id in enumerate(file_ids):
@@ -424,20 +439,11 @@ class DeletionService:
             except Exception as e:
                 logger.warning(f"Safety net Neo4j cleanup failed for folder {folder_id}: {e}")
             
-            job.progress = 0.85
+            job.progress = 0.9
             
-            # Delete from PostgreSQL (CASCADE will handle files + entity_staging)
-            from sqlalchemy import delete as sql_delete
-            from app.db.models import Folder
-            
-            await self.db.execute(
-                sql_delete(Folder).where(Folder.id == folder_id)
-            )
-            await self.db.commit()
-            
-            # Invalidate all caches
-            if self.cache:
-                await self.cache.invalidate_all()
+            # Invalidate graph caches
+            if self.gds:
+                await self.gds.invalidate_all()
             
             job.status = DeletionStatus.COMPLETED
             job.message = "Folder deletion complete"
