@@ -36,28 +36,39 @@ class ManagedCypherService:
         
         # Regex to find node patterns: ( [var] [ :Labels] [ {props} ] )
         node_pattern = r"(\(\s*)([a-zA-Z0-9_]*)(\s*:[a-zA-Z0-9_:]*)?(\s*\{.*?\})?(\s*\))"
-
-        def inject(match):
-            prefix = match.group(1) # '('
-            var = match.group(2)    # 'n' or empty
-            labels = match.group(3) or "" # ':Label' or empty
-            props = match.group(4) or ""  # ' {..}' or empty
-            suffix = match.group(5) # ')'
-            
-            if var and not labels and not props:
-                return f"{prefix}{var}{suffix}"
-
-            if not var and not labels and not props:
-                return f"{prefix}:{folder_label}{suffix}"
-
-            return f"{prefix}{var}{labels}:{folder_label}{props}{suffix}"
-
         # Split query by semicolon to separate schema (CONSTRAINT/INDEX) from data (MERGE/CREATE)
         # Process each statement individually to ensure isolation label is only applied to data.
         parts = query.split(';')
         rewritten_parts = []
         
         for part in parts:
+            # Track nodes seen in this specific statement to avoid redundant label injection
+            # which causes "variable already declared" syntax errors in Cypher.
+            seen_vars = set()
+
+            def inject(match):
+                prefix = match.group(1) # '('
+                var = match.group(2)    # 'n' or empty
+                labels = match.group(3) or "" # ':Label' or empty
+                props = match.group(4) or ""  # ' {..}' or empty
+                suffix = match.group(5) # ')'
+                
+                # If it's a named variable we've already seen in this statement, 
+                # don't inject the folder label again.
+                if var and var in seen_vars:
+                    return f"{prefix}{var}{labels}{props}{suffix}"
+
+                if var:
+                    seen_vars.add(var)
+
+                if var and not labels and not props:
+                    return f"{prefix}{var}:{folder_label}{suffix}"
+
+                if not var and not labels and not props:
+                    return f"{prefix}:{folder_label}{suffix}"
+
+                return f"{prefix}{var}{labels}:{folder_label}{props}{suffix}"
+
             # Clean up comments for the check (avoid greedy DOTALL on single-line comments)
             check_part = re.sub(r'//.*', '', part)
             check_part = re.sub(r'/\*.*?\*/', '', check_part, flags=re.DOTALL)
@@ -108,6 +119,24 @@ class ManagedCypherService:
         logger.info(f"Rewrote Cypher for folder isolation: {folder_label}")
 
         async with self.driver.session() as session:
+            # 0.5 Pre-Adoption: Restore isolation labels to orphaned or unassigned nodes
+            # This ensures MERGE can find existing nodes even if they lost their labels previously
+            # or were created partially before a failure.
+            try:
+                pre_res = await session.run(f"""
+                    MATCH (n)
+                    WHERE (n.folder_id = $folder_id OR (n.folder_id IS NULL AND labels(n) <> []))
+                    AND NOT n:{folder_label}
+                    SET n:{folder_label}, 
+                        n.folder_id = $folder_id
+                    RETURN count(n) as repaired_count
+                """, {"folder_id": folder_id})
+                pre_rec = await pre_res.single()
+                if pre_rec and pre_rec["repaired_count"] > 0:
+                    logger.info(f"Pre-adopted {pre_rec['repaired_count']} orphaned nodes in folder {folder_id}")
+            except Exception as e:
+                logger.warning(f"Pre-adoption repair failed: {e}")
+
             # 1. Execute the user's query statements
             try:
                 logger.info(f"Executing managed Cypher query for file {file_id}")
@@ -121,8 +150,9 @@ class ManagedCypherService:
             # We ONLY adopt nodes that have the folder-specific label (guaranteed isolation).
             # We also ensure :Entity label and system IDs are present.
             adoption_result = await session.run(f"""
-                MATCH (n:{folder_label})
-                WHERE (n.file_id IS NULL OR n.file_id = $file_id OR NOT $file_id IN n.file_ids)
+                MATCH (n)
+                WHERE (n:{folder_label} OR n.folder_id = $folder_id)
+                AND (n.file_id IS NULL OR n.file_id = $file_id OR NOT $file_id IN n.file_ids)
                 SET n.file_id = CASE WHEN n.file_id IS NULL THEN $file_id ELSE n.file_id END,
                     n.folder_id = CASE WHEN n.folder_id IS NULL THEN $folder_id ELSE n.folder_id END,
                     n.file_ids = CASE 
@@ -130,7 +160,8 @@ class ManagedCypherService:
                         WHEN NOT $file_id IN n.file_ids THEN n.file_ids + $file_id
                         ELSE n.file_ids
                     END,
-                    n:Entity
+                    n:Entity,
+                    n:{folder_label}
                 RETURN count(n) as adopted_count
             """, {"file_id": file_id, "folder_id": folder_id})
             adoption_record = await adoption_result.single()
@@ -168,7 +199,7 @@ class ManagedCypherService:
                 MATCH (n:Entity)
                 WHERE $file_id IN n.file_ids OR n.file_id = $file_id
                 SET n.type = CASE 
-                        WHEN n.type IS NULL THEN [l IN labels(n) WHERE l <> 'Entity'][0]
+                        WHEN n.type IS NULL THEN [l IN labels(n) WHERE NOT l IN ['Entity', 'Chunk', 'File', 'Folder'] AND NOT l STARTS WITH 'F_'][0]
                         ELSE n.type
                     END,
                     n.name = CASE 
@@ -185,38 +216,12 @@ class ManagedCypherService:
                     await session.run("MATCH (n) WHERE id(n) = $int_id SET n.id = $uuid", 
                                     {"int_id": record["internal_id"], "uuid": new_uuid})
 
-            # 5. Remove non-standard labels (Herb, Karma, Quality, etc.)
-            try:
-                await session.run(f"""
-                    MATCH (n:Entity:{folder_label})
-                    WHERE $file_id IN n.file_ids OR n.file_id = $file_id
-                    WITH n, [l IN labels(n) WHERE NOT l IN ['Entity', 'Chunk', 'File', 'Folder', $folder_label]] AS extra
-                    WHERE size(extra) > 0
-                    CALL apoc.create.removeLabels(n, extra) YIELD node
-                    RETURN count(node)
-                """, {"file_id": file_id, "folder_label": folder_label})
-
-                # Explicitly remove the isolation label after normalization
-                await session.run(f"MATCH (n:{folder_label}) REMOVE n:{folder_label}")
-                logger.debug(f"Labels normalized for file {file_id}")
-            except Exception as e:
-                # Fallback implementation...
-                extras_result = await session.run("""
-                    MATCH (n:Entity)
-                    WHERE $file_id IN n.file_ids OR n.file_id = $file_id
-                    UNWIND labels(n) AS lbl
-                    WITH DISTINCT lbl
-                    WHERE NOT lbl IN ['Entity', 'Chunk', 'File', 'Folder']
-                    RETURN collect(lbl) AS extras
-                """, {"file_id": file_id})
-                extras_record = await extras_result.single()
-                if extras_record and extras_record["extras"]:
-                    for label in extras_record["extras"]:
-                        safe_label = label.replace('`', '``')
-                        await session.run(
-                            f"MATCH (n:`{safe_label}`:Entity) WHERE $file_id IN n.file_ids REMOVE n:`{safe_label}`",
-                            {"file_id": file_id}
-                        )
+            # Step 5: Normalize labels (Move additional labels to the type property if not already set)
+            # We no longer aggressively remove user labels or isolation labels.
+            # This ensures that subsequent MERGE operations using the same labels 
+            # (which is common in Cypher ingestion) remain idempotent and correct.
+            # The folder_label (:F_uuid) MUST persist for folder-based query scoping.
+            logger.info("Retaining all labels for idempotent Cypher compatibility.")
 
             # 6. Generate missing embeddings
             result = await session.run("""
