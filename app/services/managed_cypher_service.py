@@ -5,6 +5,8 @@ Ensures architectural compliance (e.g., :Entity label, file_id sync).
 Syncs created data to PostgreSQL entity_staging for consistency with AI pipeline.
 """
 import logging
+import re
+import uuid
 from typing import List, Dict, Any, Optional
 from app.db.connections import get_neo4j_driver
 from app.agents.storage_agent import StorageAgent
@@ -21,6 +23,62 @@ class ManagedCypherService:
         self.driver = get_neo4j_driver()
         self.storage = StorageAgent()
         self.embedding_agent = EmbeddingAgent()
+
+    from typing import List
+
+    def _rewrite_query_for_folder(self, query: str, folder_id: str) -> List[str]:
+        """
+        Injects a folder-specific label into all node patterns in a Cypher query for isolation.
+        Example: '(n:Herb)' becomes '(n:Herb:F_e59c8189)'
+        Ensures MERGE operations are scoped to the folder without manual query edits.
+        """
+        folder_label = f"F_{folder_id.replace('-', '_')}"
+        
+        # Regex to find node patterns: ( [var] [ :Labels] [ {props} ] )
+        node_pattern = r"(\(\s*)([a-zA-Z0-9_]*)(\s*:[a-zA-Z0-9_:]*)?(\s*\{.*?\})?(\s*\))"
+
+        def inject(match):
+            prefix = match.group(1) # '('
+            var = match.group(2)    # 'n' or empty
+            labels = match.group(3) or "" # ':Label' or empty
+            props = match.group(4) or ""  # ' {..}' or empty
+            suffix = match.group(5) # ')'
+            
+            if var and not labels and not props:
+                return f"{prefix}{var}{suffix}"
+
+            if not var and not labels and not props:
+                return f"{prefix}:{folder_label}{suffix}"
+
+            return f"{prefix}{var}{labels}:{folder_label}{props}{suffix}"
+
+        # Split query by semicolon to separate schema (CONSTRAINT/INDEX) from data (MERGE/CREATE)
+        # Process each statement individually to ensure isolation label is only applied to data.
+        parts = query.split(';')
+        rewritten_parts = []
+        
+        for part in parts:
+            # Clean up comments for the check (avoid greedy DOTALL on single-line comments)
+            check_part = re.sub(r'//.*', '', part)
+            check_part = re.sub(r'/\*.*?\*/', '', check_part, flags=re.DOTALL)
+            
+            if not check_part.strip():
+                rewritten_parts.append(part)
+                continue
+            
+            # Check for schema commands (CONSTRAINT or INDEX)
+            check_part = check_part.strip().upper()
+            is_schema = any(check_part.startswith(kw) for kw in [
+                "CREATE CONSTRAINT", "DROP CONSTRAINT", 
+                "CREATE INDEX", "DROP INDEX", "SHOW", "ASSERT"
+            ])
+            
+            if is_schema:
+                rewritten_parts.append(part)
+            else:
+                rewritten_parts.append(re.sub(node_pattern, inject, part))
+                
+        return rewritten_parts
 
     async def execute_managed_query(
         self, 
@@ -44,36 +102,27 @@ class ManagedCypherService:
         # Execute the query as a single block to preserve variables (MERGE h, etc.)
         # We only split if strictly necessary for certain system commands, 
         # but for user data, one block is better.
+        # 0. Rewrite query for folder isolation
+        folder_label = f"F_{folder_id.replace('-', '_')}"
+        rewritten_statements = self._rewrite_query_for_folder(query, folder_id)
+        logger.info(f"Rewrote Cypher for folder isolation: {folder_label}")
+
         async with self.driver.session() as session:
-            # 1. Execute the user's query block
+            # 1. Execute the user's query statements
             try:
-                # We still support multiple statements if they are NOT interdependent,
-                # but for the variable sharing case (like variables h, qR1 across MERGEs),
-                # running as one block is required.
                 logger.info(f"Executing managed Cypher query for file {file_id}")
-                await session.run(query, {"file_id": file_id, "folder_id": folder_id, "user_id": user_id})
+                for stmt in rewritten_statements:
+                    await session.run(stmt, {"file_id": file_id, "folder_id": folder_id, "user_id": user_id})
             except Exception as e:
                 logger.error(f"User Cypher execution failed: {e}")
-                # Optional: fallback to statement splitting if it's a multi-statement system setup
-                if ";" in query:
-                    logger.info("Retrying with statement splitting...")
-                    statements = [s.strip() for s in query.split(';') if s.strip()]
-                    for stmt in statements:
-                        await session.run(stmt, {"file_id": file_id, "folder_id": folder_id, "user_id": user_id})
-                else:
-                    raise
+                raise
 
             # 2. Targeted Adoption: Find nodes that should belong to this file.
-            # We only adopt if:
-            # - They have a non-standard label (Herb, Quality, etc.) which means they are fresh from the Cypher block
-            # - OR they are :Entity nodes but lack a system ID (newly created via Cypher :Entity)
-            adoption_result = await session.run("""
-                MATCH (n)
-                WHERE (
-                    any(l IN labels(n) WHERE NOT l IN ['Entity', 'Chunk', 'File', 'Folder'])
-                    OR (n:Entity AND n.id IS NULL)
-                )
-                  AND (n.file_id IS NULL OR n.file_id = $file_id OR NOT $file_id IN n.file_ids)
+            # We ONLY adopt nodes that have the folder-specific label (guaranteed isolation).
+            # We also ensure :Entity label and system IDs are present.
+            adoption_result = await session.run(f"""
+                MATCH (n:{folder_label})
+                WHERE (n.file_id IS NULL OR n.file_id = $file_id OR NOT $file_id IN n.file_ids)
                 SET n.file_id = CASE WHEN n.file_id IS NULL THEN $file_id ELSE n.file_id END,
                     n.folder_id = CASE WHEN n.folder_id IS NULL THEN $folder_id ELSE n.folder_id END,
                     n.file_ids = CASE 
@@ -138,14 +187,17 @@ class ManagedCypherService:
 
             # 5. Remove non-standard labels (Herb, Karma, Quality, etc.)
             try:
-                await session.run("""
-                    MATCH (n:Entity)
+                await session.run(f"""
+                    MATCH (n:Entity:{folder_label})
                     WHERE $file_id IN n.file_ids OR n.file_id = $file_id
-                    WITH n, [l IN labels(n) WHERE NOT l IN ['Entity', 'Chunk', 'File', 'Folder']] AS extra
+                    WITH n, [l IN labels(n) WHERE NOT l IN ['Entity', 'Chunk', 'File', 'Folder', $folder_label]] AS extra
                     WHERE size(extra) > 0
                     CALL apoc.create.removeLabels(n, extra) YIELD node
                     RETURN count(node)
-                """, {"file_id": file_id})
+                """, {"file_id": file_id, "folder_label": folder_label})
+
+                # Explicitly remove the isolation label after normalization
+                await session.run(f"MATCH (n:{folder_label}) REMOVE n:{folder_label}")
                 logger.debug(f"Labels normalized for file {file_id}")
             except Exception as e:
                 # Fallback implementation...

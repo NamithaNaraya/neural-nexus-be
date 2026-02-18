@@ -97,6 +97,15 @@ class CreateRelationshipRequest(BaseModel):
     strength: float = 1.0
 
 
+class MergeNodesRequest(BaseModel):
+    """Request to merge multiple entities into one."""
+    primary_id: str
+    secondary_ids: List[str]
+    new_name: Optional[str] = None
+    new_type: Optional[str] = None
+    new_description: Optional[str] = None
+
+
 # === Utilities ===
 def serialize_neo4j_values(data: Any) -> Any:
     """Recursively convert Neo4j types to JSON-serializable Python types."""
@@ -167,7 +176,7 @@ async def get_all_graph(
     try:
         # Query nodes with degree
         nodes_query = """
-        MATCH (n:Entity)
+        MATCH (n)
         OPTIONAL MATCH (n)-[r]-()
         WITH n, count(DISTINCT r) as degree
         RETURN n, degree
@@ -219,7 +228,8 @@ async def get_all_graph(
         RETURN COALESCE(a.id, a.entity_id, elementId(a)) as source,
                COALESCE(b.id, b.entity_id, elementId(b)) as target,
                COALESCE(r.type, type(r)) as rel_type,
-               r.weight as weight
+               r.weight as weight,
+               properties(r) as properties
         LIMIT $limit
         """
         links_result = await neo4j.execute_query(links_query, {"limit": limit * 2})
@@ -234,6 +244,7 @@ async def get_all_graph(
                     target=target_id,
                     type=record["rel_type"],
                     strength=record["weight"] or 1.0,
+                    properties=serialize_neo4j_values(record["properties"] or {}),
                 ))
         
         response = GraphResponse(nodes=nodes, links=links, total_nodes=len(nodes), total_links=len(links))
@@ -256,6 +267,8 @@ async def get_folder_graph(
 ) -> GraphResponse:
     """Get graph data for all files in a folder."""
     cache_key = f"folder_{folder_id}_{node_type}_{min_connections}_{limit}"
+    
+    # Check cache
     cached_data = await cache.get_cached_graph(cache_key)
     if cached_data:
         return GraphResponse(**cached_data)
@@ -268,7 +281,7 @@ async def get_folder_graph(
         
         # Query nodes
         nodes_query = f"""
-        MATCH (n:Entity)
+        MATCH (n)
         WHERE n.folder_id = $folder_id OR n.folderId = $folder_id
         {type_filter}
         OPTIONAL MATCH (n)-[r]-()
@@ -331,7 +344,7 @@ async def get_folder_graph(
                COALESCE(b.id, b.entity_id, elementId(b)) as target,
                COALESCE(r.type, type(r)) as rel_type,
                r.weight as weight,
-               r.description as description
+               properties(r) as properties
         LIMIT $limit
         """
         
@@ -350,6 +363,7 @@ async def get_folder_graph(
                     target=target_id,
                     type=record["rel_type"],
                     strength=record["weight"] or 1.0,
+                    properties=serialize_neo4j_values(record["properties"] or {}),
                 ))
         
         response = GraphResponse(nodes=nodes, links=links, total_nodes=len(nodes), total_links=len(links))
@@ -376,7 +390,7 @@ async def get_file_graph(
     try:
         # Query nodes
         nodes_query = """
-        MATCH (n:Entity)
+        MATCH (n)
         WHERE $file_id IN n.file_ids OR n.file_id = $file_id OR n.fileId = $file_id
         OPTIONAL MATCH (n)-[r]-()
         WITH n, count(DISTINCT r) as degree
@@ -415,7 +429,8 @@ async def get_file_graph(
         RETURN COALESCE(a.id, a.entity_id, elementId(a)) as source,
                COALESCE(b.id, b.entity_id, elementId(b)) as target,
                COALESCE(r.type, type(r)) as rel_type,
-               r.weight as weight
+               r.weight as weight,
+               properties(r) as properties
         """
         links_result = await neo4j.execute_query(links_query, {"file_id": file_id})
         
@@ -429,6 +444,7 @@ async def get_file_graph(
                     target=target_id,
                     type=record["rel_type"],
                     strength=record["weight"] or 1.0,
+                    properties=serialize_neo4j_values(record["properties"] or {}),
                 ))
                 
         response = GraphResponse(nodes=nodes, links=links, total_nodes=len(nodes), total_links=len(links))
@@ -541,7 +557,8 @@ async def expand_node(
                 links.append(LinkResponse(
                     source=props.get("id", str(rel.start_node.id)),
                     target=props.get("id", str(rel.end_node.id)),
-                    type=rel.type
+                    type=rel.type,
+                    properties=serialize_neo4j_values(dict(rel))
                 ))
         
         # Dedup links
@@ -1172,3 +1189,124 @@ async def get_relationship_types(
     except Exception as e:
         logger.error(f"Failed to get relationship types: {e}")
         return {"types": ["RELATED_TO", "BELONGS_TO", "PART_OF"]}
+@router.post("/nodes/merge")
+async def merge_nodes(
+    request: MergeNodesRequest,
+    current_user: dict = Depends(get_current_user),
+    neo4j = Depends(get_neo4j),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
+) -> Dict[str, Any]:
+    """
+    Merge multiple duplicate nodes into one primary node.
+    
+    1. Re-routes all relationships from secondaries to primary.
+    2. Aggregates file_ids metadata.
+    3. Updates primary with new name/type/description if provided.
+    4. Deletes secondary nodes.
+    """
+    try:
+        # Verify primary exists
+        check_primary = "MATCH (p:Entity) WHERE p.id = $primary_id RETURN p"
+        res = await neo4j.execute_query(check_primary, {"primary_id": request.primary_id})
+        if not res.records:
+            raise HTTPException(status_code=404, detail=f"Primary node {request.primary_id} not found")
+
+        # 1. Collect all file_ids from all nodes being merged
+        collect_files_query = """
+        MATCH (n:Entity)
+        WHERE n.id IN $node_ids
+        RETURN collect(DISTINCT n.file_id) as f1, collect(DISTINCT n.fileId) as f2, collect(DISTINCT n.file_ids) as f3
+        """
+        all_ids = [request.primary_id] + request.secondary_ids
+        files_res = await neo4j.execute_query(collect_files_query, {"node_ids": all_ids})
+        
+        combined_file_ids = set()
+        if files_res.records:
+            rec = files_res.records[0]
+            # Flatten everything
+            for item in (rec["f1"] or []): combined_file_ids.add(item)
+            for item in (rec["f2"] or []): combined_file_ids.add(item)
+            for sublist in (rec["f3"] or []):
+                if isinstance(sublist, list):
+                    for item in sublist: combined_file_ids.add(item)
+                elif sublist:
+                    combined_file_ids.add(sublist)
+        
+        combined_file_ids = [f for f in combined_file_ids if f]
+
+        # 2. Update Primary Node Metadata
+        update_primary_query = """
+        MATCH (p:Entity)
+        WHERE p.id = $primary_id
+        SET p.file_ids = $file_ids,
+            p.merged_at = datetime().isoformat(),
+            p.merge_count = coalesce(p.merge_count, 0) + $secondary_count
+        """
+        params = {
+            "primary_id": request.primary_id,
+            "file_ids": combined_file_ids,
+            "secondary_count": len(request.secondary_ids)
+        }
+        
+        if request.new_name:
+            update_primary_query += ", p.name = $new_name"
+            params["new_name"] = request.new_name
+        if request.new_type:
+            update_primary_query += ", p.type = $new_type"
+            params["new_type"] = request.new_type
+        if request.new_description:
+            update_primary_query += ", p.description = $new_description"
+            params["new_description"] = request.new_description
+            
+        await neo4j.execute_query(update_primary_query, params)
+
+        # 3. Re-route Relationships & Delete Secondaries
+        # Note: elementId usage for robustness with APOC or native cypher
+        merge_rel_query = """
+        UNWIND $secondary_ids as sec_id
+        MATCH (sec:Entity {id: sec_id})
+        MATCH (prim:Entity {id: $primary_id})
+        
+        // Outgoing
+        WITH sec, prim
+        MATCH (sec)-[r]->(target)
+        WHERE target <> prim
+        MERGE (prim)-[new_r:RELATED_TO]->(target) // Default to RELATED_TO or try to preserve type if possible
+        SET new_r += properties(r),
+            new_r.original_type = type(r),
+            new_r.is_merged = true
+        
+        // Incoming
+        WITH sec, prim
+        MATCH (source)-[r]->(sec)
+        WHERE source <> prim
+        MERGE (source)-[new_r:RELATED_TO]->(prim)
+        SET new_r += properties(r),
+            new_r.original_type = type(r),
+            new_r.is_merged = true
+            
+        WITH sec
+        DETACH DELETE sec
+        """
+        # Improved relationship preservation (try to keep type) - requires string concat in cypher or APOC
+        # For simplicity and safety we use a pattern that works in standard Cypher
+        
+        await neo4j.execute_query(merge_rel_query, {
+            "primary_id": request.primary_id,
+            "secondary_ids": request.secondary_ids
+        })
+
+        # Invalidate cache
+        await cache.invalidate_all()
+        await gds.invalidate_all()
+
+        return {
+            "success": True, 
+            "message": f"Successfully merged {len(request.secondary_ids)} nodes into {request.primary_id}",
+            "primary_id": request.primary_id,
+            "aggregated_files": len(combined_file_ids)
+        }
+    except Exception as e:
+        logger.error(f"Merge failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
