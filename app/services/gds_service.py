@@ -16,25 +16,55 @@ class GDSService:
         self.driver = get_neo4j_driver()
         self.active_projections = set()
 
-    def _get_graph_name(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None) -> str:
+    def _get_graph_name(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, undirected: bool = False) -> str:
         """Generate a consistent graph name for a given scope."""
+        suffix = "_undirected" if undirected else ""
         if node_ids:
             # Sort and hash node IDs for a unique identifier
             node_hash = hashlib.md5(",".join(sorted(node_ids)).encode()).hexdigest()[:8]
-            return f"subgraph_{node_hash}"
-        return f"neural_nexus_{folder_id or 'all'}"
+            return f"subgraph_{node_hash}{suffix}"
+        return f"neural_nexus_{folder_id or 'all'}{suffix}"
+
+    async def _ensure_global_undirected(self, session) -> str:
+        """Ensure the global undirected native projection exists. Returns the graph name."""
+        global_name = "neural_nexus_all_undirected_native"
+        check = await session.run("CALL gds.graph.exists($name) YIELD exists RETURN exists", name=global_name)
+        rec = await check.single()
+        if rec and rec["exists"]:
+            return global_name
+        
+        logger.info(f"Creating global undirected native projection: {global_name}")
+        await session.run(f"""
+            CALL gds.graph.project(
+                $name,
+                'Entity',
+                {{
+                    _ALL_: {{
+                        type: '*',
+                        orientation: 'UNDIRECTED',
+                        properties: {{weight: {{property: 'strength', defaultValue: 1.0}}}}
+                    }}
+                }}
+            )
+        """, name=global_name)
+        self.active_projections.add(global_name)
+        return global_name
 
     async def ensure_projection(
         self, 
         folder_id: Optional[str] = None, 
         node_ids: Optional[List[str]] = None,
-        force_recreate: bool = False
+        force_recreate: bool = False,
+        undirected: bool = False
     ) -> str:
         """
         Ensures a GDS graph projection exists for the given scope.
         Implements 'load once' - returns existing projection if it's still valid.
+        
+        For undirected + scoped (folder/nodes): returns the global native UNDIRECTED
+        projection. Algorithm callers must filter results by folder_id/node_ids.
         """
-        graph_name = self._get_graph_name(folder_id, node_ids)
+        graph_name = self._get_graph_name(folder_id, node_ids, undirected)
         
         async with self.driver.session() as session:
             # Check if projection exists
@@ -51,52 +81,70 @@ class GDSService:
                 await session.run("CALL gds.graph.drop($name, false)", name=graph_name)
             
             # Create new projection
-            logger.info(f"Creating new GDS projection: {graph_name}")
+            logger.info(f"Creating new GDS projection: {graph_name} (undirected={undirected})")
             
-            if node_ids:
-                # Cypher projection for specific nodes
-                await session.run("""
-                    CALL gds.graph.project.cypher(
-                        $name,
-                        'MATCH (n:Entity) WHERE n.id IN $node_ids RETURN id(n) AS id, labels(n) AS labels',
-                        'MATCH (a:Entity)-[r]->(b:Entity) 
-                         WHERE a.id IN $node_ids AND b.id IN $node_ids 
-                         RETURN id(a) AS source, id(b) AS target, type(r) AS type, 
-                                coalesce(r.strength, 1.0) AS weight',
-                        {parameters: {node_ids: $node_ids}}
-                    )
-                """, name=graph_name, node_ids=node_ids)
-            elif folder_id:
-                # Cypher projection for folder scope
-                await session.run("""
-                    CALL gds.graph.project.cypher(
-                        $name,
-                        'MATCH (n:Entity) WHERE n.folder_id = $folder_id RETURN id(n) AS id, labels(n) AS labels',
-                        'MATCH (a:Entity)-[r]->(b:Entity) 
-                         WHERE a.folder_id = $folder_id AND b.folder_id = $folder_id 
-                         RETURN id(a) AS source, id(b) AS target, type(r) AS type, 
-                                coalesce(r.strength, 1.0) AS weight',
-                        {parameters: {folder_id: $folder_id}}
-                    )
-                """, name=graph_name, folder_id=folder_id)
-            else:
-                # Native projection for full graph (fastest)
-                await session.run("""
-                    CALL gds.graph.project(
-                        $name,
-                        'Entity',
-                        {
-                            _ALL_: {
-                                type: '*',
-                                orientation: 'UNDIRECTED',
-                                properties: {weight: {property: 'strength', defaultValue: 1.0}}
-                            }
-                        }
-                    )
-                """, name=graph_name)
-            
-            self.active_projections.add(graph_name)
-            return graph_name
+            try:
+                # --- Undirected + scoped: use global native undirected projection ---
+                # Cypher projections always produce directed metadata in GDS.
+                # gds.graph.filter() is unreliable (silently fails to create).
+                # Solution: use the global undirected native projection and let
+                # algorithm callers filter results by folder_id/node_ids in their queries.
+                if undirected and (folder_id or node_ids):
+                    global_name = await self._ensure_global_undirected(session)
+                    # Return the global projection name — callers filter results
+                    self.active_projections.add(graph_name)
+                    logger.info(f"Using global undirected projection '{global_name}' for scoped query '{graph_name}'")
+                    return global_name
+                    
+                elif node_ids:
+                    # Directed Cypher projection for specific nodes
+                    await session.run("""
+                        CALL gds.graph.project.cypher(
+                            $name,
+                            'MATCH (n:Entity) WHERE n.id IN $node_ids RETURN id(n) AS id, labels(n) AS labels',
+                            'MATCH (a:Entity)-[r]->(b:Entity) 
+                             WHERE a.id IN $node_ids AND b.id IN $node_ids 
+                             RETURN id(a) AS source, id(b) AS target, type(r) AS type, 
+                                    coalesce(r.strength, 1.0) AS weight',
+                            {parameters: {node_ids: $node_ids}}
+                        )
+                    """, name=graph_name, node_ids=node_ids)
+                elif folder_id:
+                    # Directed Cypher projection for folder scope
+                    await session.run("""
+                        CALL gds.graph.project.cypher(
+                            $name,
+                            'MATCH (n:Entity) WHERE n.folder_id = $folder_id RETURN id(n) AS id, labels(n) AS labels',
+                            'MATCH (a:Entity)-[r]->(b:Entity) 
+                             WHERE a.folder_id = $folder_id AND b.folder_id = $folder_id 
+                             RETURN id(a) AS source, id(b) AS target, type(r) AS type, 
+                                    coalesce(r.strength, 1.0) AS weight',
+                            {parameters: {folder_id: $folder_id}}
+                        )
+                    """, name=graph_name, folder_id=folder_id)
+                else:
+                    # Native projection for full graph (fastest)
+                    orientation = "UNDIRECTED" if undirected else "NATURAL"
+                    await session.run(f"""
+                        CALL gds.graph.project(
+                            $name,
+                            'Entity',
+                            {{
+                                _ALL_: {{
+                                    type: '*',
+                                    orientation: '{orientation}',
+                                    properties: {{weight: {{property: 'strength', defaultValue: 1.0}}}}
+                                }}
+                            }}
+                        )
+                    """, name=graph_name)
+                
+                self.active_projections.add(graph_name)
+                logger.info(f"Successfully created GDS projection: {graph_name}")
+                return graph_name
+            except Exception as e:
+                logger.error(f"Failed to create GDS projection '{graph_name}': {e}")
+                raise
 
     async def invalidate_all(self):
         """Drops all managed GDS projections. Call this when graph data changes significantly."""
@@ -129,7 +177,7 @@ class GDSService:
     # === GDS Algorithm Implementations ===
 
     async def run_pagerank(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10) -> List[Dict[str, Any]]:
-        graph_name = await self.ensure_projection(folder_id, node_ids)
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
         query = """
             CALL gds.pageRank.stream($graph_name)
             YIELD nodeId, score
@@ -143,7 +191,7 @@ class GDSService:
             return await result.data()
 
     async def run_betweenness(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10) -> List[Dict[str, Any]]:
-        graph_name = await self.ensure_projection(folder_id, node_ids)
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
         query = """
             CALL gds.betweenness.stream($graph_name)
             YIELD nodeId, score
@@ -157,7 +205,7 @@ class GDSService:
             return await result.data()
 
     async def run_closeness(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10) -> List[Dict[str, Any]]:
-        graph_name = await self.ensure_projection(folder_id, node_ids)
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
         query = """
             CALL gds.closeness.stream($graph_name)
             YIELD nodeId, score
@@ -172,7 +220,7 @@ class GDSService:
             return await result.data()
 
     async def run_louvain(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-        graph_name = await self.ensure_projection(folder_id, node_ids)
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=True)
         query = """
             CALL gds.louvain.stream($graph_name)
             YIELD nodeId, communityId

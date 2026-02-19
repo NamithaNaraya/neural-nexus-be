@@ -90,13 +90,24 @@ async def get_nodes_by_type(
     try:
         skip = (page - 1) * page_size
         
-        # Base filter - check both property and labels
-        where_clause = "WHERE (n.type = $node_type OR $node_type IN labels(n))"
-        params = {"node_type": node_type}
-        
-        if folder_id:
-            where_clause += " AND n.folder_id = $folder_id"
-            params["folder_id"] = folder_id
+        # Use a more robust check that mirrors get_all_node_types and handles suffixes
+        # We first identify the 'raw' type, then clean it, then compare
+        where_clause = """
+        WHERE n.folder_id = $folder_id
+        AND (
+          (CASE WHEN n.type IS NOT NULL THEN (CASE WHEN n.type CONTAINS '_F_' THEN split(n.type, '_F_')[0] ELSE n.type END) ELSE "" END) = $node_type
+          OR
+          any(l IN labels(n) WHERE NOT l IN $system_labels AND NOT l STARTS WITH 'F_' AND (CASE WHEN l CONTAINS '_F_' THEN split(l, '_F_')[0] ELSE l END) = $node_type)
+        )
+        """
+        if not folder_id:
+            where_clause = where_clause.replace("n.folder_id = $folder_id AND", "")
+
+        params = {
+            "node_type": node_type,
+            "folder_id": folder_id,
+            "system_labels": settings.GRAPH_SYSTEM_LABELS
+        }
         
         if q:
             where_clause += " AND n.name =~ $regex"

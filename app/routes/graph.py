@@ -1253,7 +1253,7 @@ async def merge_nodes(
         MATCH (p:Entity)
         WHERE p.id = $primary_id
         SET p.file_ids = $file_ids,
-            p.merged_at = datetime().isoformat(),
+            p.merged_at = toString(datetime()),
             p.merge_count = coalesce(p.merge_count, 0) + $secondary_count
         """
         params = {

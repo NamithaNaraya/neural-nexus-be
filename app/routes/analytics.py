@@ -41,12 +41,21 @@ async def list_available_algorithms() -> Dict[str, Any]:
     return {
         "implemented": [
             {"name": "pagerank", "category": "centrality", "description": "Find influential nodes (GDS)", "engine": "gds"},
+            {"name": "articlerank", "category": "centrality", "description": "Improved influence for diverse graphs (GDS)", "engine": "gds"},
             {"name": "betweenness", "category": "centrality", "description": "Find bridge nodes (GDS)", "engine": "gds"},
             {"name": "closeness", "category": "centrality", "description": "Find central nodes by distance (GDS)", "engine": "gds"},
+            {"name": "hits", "category": "centrality", "description": "Hub and authority scores (GDS)", "engine": "gds"},
             {"name": "louvain", "category": "community", "description": "Community detection (GDS)", "engine": "gds"},
             {"name": "leiden", "category": "community", "description": "Improved community detection (GDS)", "engine": "gds"},
+            {"name": "wcc", "category": "community", "description": "Identify connected islands (GDS)", "engine": "gds"},
+            {"name": "k_core", "category": "decomposition", "description": "Core structure analysis (GDS)", "engine": "gds"},
+            {"name": "triangle_count", "category": "community", "description": "Count structural triangles (GDS)", "engine": "gds"},
             {"name": "node_similarity", "category": "similarity", "description": "Jaccard similarity (GDS)", "engine": "gds"},
             {"name": "link_prediction", "category": "prediction", "description": "Predict missing links (GDS)", "engine": "gds"},
+            {"name": "shortest_path", "category": "pathfinding", "description": "Dijkstra shortest path (GDS)", "engine": "gds"},
+            {"name": "bfs_dfs", "category": "pathfinding", "description": "Breadth/Depth first search (GDS)", "engine": "gds"},
+            {"name": "random_walk", "category": "pathfinding", "description": "Simulate random paths (GDS)", "engine": "gds"},
+            {"name": "topological_sort", "category": "topology", "description": "Sequence nodes in a DAG (GDS)", "engine": "gds"},
         ],
         "exports": [
             {"name": "json", "description": "Export graph as JSON (APOC)", "engine": "apoc"},
@@ -230,6 +239,96 @@ async def run_closeness(
         raise HTTPException(status_code=500, detail=f"Closeness failed: {str(e)}")
 
 
+@router.get("/centrality/articlerank")
+async def run_articlerank(
+    folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
+    damping_factor: float = Query(default=0.85, ge=0.0, le=1.0),
+    max_iterations: int = Query(default=20, le=100),
+    top_k: int = Query(default=10, le=100),
+    current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
+) -> Dict[str, Any]:
+    """Run ArticleRank (influence variant for diverse degree distributions)."""
+    driver = get_neo4j_driver()
+    graph_name = await gds.ensure_projection(folder_id, node_ids)
+    
+    try:
+        async with driver.session() as session:
+            result = await session.run("""
+                CALL gds.articleRank.stream($graph_name, {
+                    dampingFactor: $damping,
+                    maxIterations: $max_iter
+                })
+                YIELD nodeId, score
+                WITH gds.util.asNode(nodeId) AS node, score
+                RETURN node.id AS id, node.name AS name, node.type AS type, score
+                ORDER BY score DESC
+                LIMIT $top_k
+            """, graph_name=graph_name, damping=damping_factor, max_iter=max_iterations, top_k=top_k)
+            
+            records = await result.data()
+            insight = f"ArticleRank identified '{records[0]['name']}' as the primary authority." if records else "No results."
+            
+            return {
+                "algorithm": "articlerank",
+                "engine": "gds.articleRank.stream",
+                "folder_id": folder_id,
+                "parameters": {"damping_factor": damping_factor, "max_iterations": max_iterations},
+                "results": records,
+                "insight": insight,
+            }
+    except Exception as e:
+        logger.error(f"GDS ArticleRank error: {e}")
+        raise HTTPException(status_code=500, detail=f"ArticleRank failed: {str(e)}")
+
+
+@router.get("/centrality/hits")
+async def run_hits_gds(
+    folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
+    max_iterations: int = Query(default=20, le=100),
+    top_k: int = Query(default=10, le=100),
+    current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
+) -> Dict[str, Any]:
+    """Run HITS (Hubs and Authorities) algorithm using Neo4j GDS."""
+    driver = get_neo4j_driver()
+    graph_name = await gds.ensure_projection(folder_id, node_ids)
+    
+    try:
+        async with driver.session() as session:
+            result = await session.run("""
+                CALL gds.hits.stream($graph_name, {})
+                YIELD nodeId, values
+                WITH gds.util.asNode(nodeId) AS node, values.hub AS hubScore, values.auth AS authScore
+                RETURN node.id AS id, node.name AS name, node.type AS type, 
+                       hubScore AS hub_score, authScore AS auth_score
+                ORDER BY authScore DESC
+                LIMIT $top_k
+            """, graph_name=graph_name, max_iter=max_iterations, top_k=top_k)
+            
+            records = await result.data()
+            
+            if records:
+                top = records[0]
+                insight = f"'{top['name']}' is the strongest authority in this set. Hub scores indicate '{records[0]['name']}' also serves as a key information aggregator."
+            else:
+                insight = "No clear hubs or authorities found."
+            
+            return {
+                "algorithm": "hits",
+                "engine": "gds.hits.stream",
+                "folder_id": folder_id,
+                "parameters": {"max_iterations": max_iterations, "top_k": top_k},
+                "results": records,
+                "insight": insight,
+            }
+    except Exception as e:
+        logger.error(f"GDS HITS error: {e}")
+        raise HTTPException(status_code=500, detail=f"HITS failed: {str(e)}")
+
+
 # === GDS Community Detection ===
 @router.get("/community/louvain")
 async def run_louvain(
@@ -241,21 +340,32 @@ async def run_louvain(
 ) -> Dict[str, Any]:
     """Run Louvain community detection using Neo4j GDS."""
     driver = get_neo4j_driver()
-    graph_name = await gds.ensure_projection(folder_id, node_ids)
+    graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
+    
+    # Build scope filter for results (global projection runs on all nodes)
+    scope_filter = ""
+    params = {"graph_name": graph_name, "intermediate": include_intermediate}
+    if folder_id:
+        scope_filter = "WHERE node.folder_id = $folder_id"
+        params["folder_id"] = folder_id
+    elif node_ids:
+        scope_filter = "WHERE node.id IN $node_ids"
+        params["node_ids"] = node_ids
     
     try:
         async with driver.session() as session:
-            result = await session.run("""
-                CALL gds.louvain.stream($graph_name, {
+            result = await session.run(f"""
+                CALL gds.louvain.stream($graph_name, {{
                     includeIntermediateCommunities: $intermediate
-                })
+                }})
                 YIELD nodeId, communityId, intermediateCommunityIds
                 WITH gds.util.asNode(nodeId) AS node, communityId, intermediateCommunityIds
+                {scope_filter}
                 RETURN node.id AS id, node.name AS name, node.type AS type, 
                        communityId AS community_id,
                        intermediateCommunityIds AS hierarchy
                 ORDER BY communityId, node.name
-            """, graph_name=graph_name, intermediate=include_intermediate)
+            """, **params)
             
             records = await result.data()
             
@@ -297,21 +407,31 @@ async def run_leiden(
 ) -> Dict[str, Any]:
     """Run Leiden community detection (improved Louvain) using Neo4j GDS."""
     driver = get_neo4j_driver()
-    graph_name = await gds.ensure_projection(folder_id, node_ids)
+    graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
+    
+    scope_filter = ""
+    params = {"graph_name": graph_name, "gamma": gamma}
+    if folder_id:
+        scope_filter = "WHERE node.folder_id = $folder_id"
+        params["folder_id"] = folder_id
+    elif node_ids:
+        scope_filter = "WHERE node.id IN $node_ids"
+        params["node_ids"] = node_ids
     
     try:
         async with driver.session() as session:
-            result = await session.run("""
-                CALL gds.leiden.stream($graph_name, {
+            result = await session.run(f"""
+                CALL gds.leiden.stream($graph_name, {{
                     gamma: $gamma,
                     relationshipWeightProperty: 'weight'
-                })
+                }})
                 YIELD nodeId, communityId
                 WITH gds.util.asNode(nodeId) AS node, communityId
+                {scope_filter}
                 RETURN node.id AS id, node.name AS name, node.type AS type, 
                        communityId AS community_id
                 ORDER BY communityId, node.name
-            """, graph_name=graph_name, gamma=gamma)
+            """, **params)
             
             records = await result.data()
             
@@ -340,6 +460,185 @@ async def run_leiden(
         raise HTTPException(status_code=500, detail=f"Leiden failed: {str(e)}")
 
 
+@router.get("/community/wcc")
+async def run_wcc_gds(
+    folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
+) -> Dict[str, Any]:
+    """Run Weakly Connected Components (WCC) to identify disconnected islands."""
+    driver = get_neo4j_driver()
+    graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
+    
+    scope_filter = ""
+    params = {"graph_name": graph_name}
+    if folder_id:
+        scope_filter = "WHERE node.folder_id = $folder_id"
+        params["folder_id"] = folder_id
+    elif node_ids:
+        scope_filter = "WHERE node.id IN $node_ids"
+        params["node_ids"] = node_ids
+    
+    try:
+        async with driver.session() as session:
+            result = await session.run(f"""
+                CALL gds.wcc.stream($graph_name)
+                YIELD nodeId, componentId
+                WITH gds.util.asNode(nodeId) AS node, componentId
+                {scope_filter}
+                RETURN node.id AS id, node.name AS name, node.type AS type, 
+                       componentId AS community_id
+                ORDER BY componentId
+            """, **params)
+            
+            records = await result.data()
+            
+            communities = {}
+            for r in records:
+                cid = r["community_id"]
+                if cid not in communities:
+                    communities[cid] = []
+                communities[cid].append({"id": r["id"], "name": r["name"], "type": r["type"]})
+            
+            # Sort communities by size (descending) to find the main cluster
+            sorted_comps = sorted(communities.items(), key=lambda x: len(x[1]), reverse=True)
+            
+            if len(sorted_comps) <= 1:
+                insight = "All nodes are connected in a single component. There are no isolated islands in this current view."
+            else:
+                giant_id, giant_nodes = sorted_comps[0]
+                islands = sorted_comps[1:]
+                island_node_count = sum(len(c[1]) for c in islands)
+                
+                # Get names from the smaller components
+                sample_isolated = []
+                for _, nodes in islands[:3]:
+                    sample_isolated.append(nodes[0]['name'])
+                
+                names_str = ", ".join(sample_isolated)
+                if len(islands) > 3:
+                    names_str += ", and others"
+                
+                insight = (f"Found {len(sorted_comps)} disconnected islands. The main cluster has {len(giant_nodes)} nodes. "
+                          f"There are {len(islands)} isolated islands (total {island_node_count} nodes), including: {names_str}.")
+            
+            return {
+                "algorithm": "wcc",
+                "engine": "gds.wcc.stream",
+                "folder_id": folder_id,
+                "community_count": len(communities),
+                "communities": communities,
+                "results": records[:50],
+                "insight": insight,
+            }
+    except Exception as e:
+        logger.error(f"GDS WCC error: {e}")
+        raise HTTPException(status_code=500, detail=f"WCC failed: {str(e)}")
+
+
+@router.get("/community/kcore")
+async def run_kcore_gds(
+    folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
+    k: int = Query(default=3, ge=1),
+    current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
+) -> Dict[str, Any]:
+    """Run K-Core decomposition to find the stable core of the graph."""
+    driver = get_neo4j_driver()
+    graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
+    
+    scope_filter = "WHERE coreValue >= $k"
+    params = {"graph_name": graph_name, "k": k}
+    if folder_id:
+        scope_filter = "WHERE coreValue >= $k AND node.folder_id = $folder_id"
+        params["folder_id"] = folder_id
+    elif node_ids:
+        scope_filter = "WHERE coreValue >= $k AND node.id IN $node_ids"
+        params["node_ids"] = node_ids
+    
+    try:
+        async with driver.session() as session:
+            result = await session.run(f"""
+                CALL gds.kcore.stream($graph_name, {{
+                    k: $k
+                }})
+                YIELD nodeId, coreValue
+                WITH gds.util.asNode(nodeId) AS node, coreValue
+                {scope_filter}
+                RETURN node.id AS id, node.name AS name, node.type AS type, 
+                       coreValue AS score
+                ORDER BY coreValue DESC
+            """, **params)
+            
+            records = await result.data()
+            
+            insight = f"{len(records)} nodes belong to the {k}-core (the most stable, highly-connected center of the graph)." if records else f"No nodes found in the {k}-core."
+            
+            return {
+                "algorithm": "kcore",
+                "engine": "gds.kcore.stream",
+                "folder_id": folder_id,
+                "parameters": {"k": k},
+                "results": records,
+                "insight": insight,
+            }
+    except Exception as e:
+        logger.error(f"GDS K-Core error: {e}")
+        raise HTTPException(status_code=500, detail=f"K-Core failed: {str(e)}")
+
+
+@router.get("/community/triangles")
+async def run_triangle_count_gds(
+    folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
+) -> Dict[str, Any]:
+    """Run Triangle Counting to measure local group density."""
+    driver = get_neo4j_driver()
+    graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
+    
+    scope_filter = ""
+    params = {"graph_name": graph_name}
+    if folder_id:
+        scope_filter = "WHERE node.folder_id = $folder_id"
+        params["folder_id"] = folder_id
+    elif node_ids:
+        scope_filter = "WHERE node.id IN $node_ids"
+        params["node_ids"] = node_ids
+    
+    try:
+        async with driver.session() as session:
+            result = await session.run(f"""
+                CALL gds.triangleCount.stream($graph_name)
+                YIELD nodeId, triangleCount
+                WITH gds.util.asNode(nodeId) AS node, triangleCount
+                {scope_filter}
+                RETURN node.id AS id, node.name AS name, node.type AS type, 
+                       triangleCount AS score
+                ORDER BY triangleCount DESC
+                LIMIT 50
+            """, **params)
+            
+            records = await result.data()
+            total_triangles = sum(r["score"] for r in records)
+            
+            insight = f"Found {total_triangles} structural triangles. Entities with high triangle counts are part of very tight-knit, collaborative groups."
+            
+            return {
+                "algorithm": "triangle_count",
+                "engine": "gds.triangleCount.stream",
+                "folder_id": folder_id,
+                "results": records,
+                "insight": insight,
+            }
+    except Exception as e:
+        logger.error(f"GDS Triangle Count error: {e}")
+        raise HTTPException(status_code=500, detail=f"Triangle count failed: {str(e)}")
+
+
 # === GDS Similarity ===
 @router.get("/similarity/nodes")
 async def run_node_similarity(
@@ -350,25 +649,35 @@ async def run_node_similarity(
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
-    """Find similar node pairs using GDS Node Similarity (Jaccard).."""
+    """Find similar node pairs using GDS Node Similarity (Jaccard)."""
     driver = get_neo4j_driver()
-    graph_name = await gds.ensure_projection(folder_id, node_ids)
+    graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
+    
+    scope_filter = ""
+    params = {"graph_name": graph_name, "top_k": top_k, "cutoff": similarity_cutoff}
+    if folder_id:
+        scope_filter = "WHERE n1.folder_id = $folder_id AND n2.folder_id = $folder_id"
+        params["folder_id"] = folder_id
+    elif node_ids:
+        scope_filter = "WHERE n1.id IN $node_ids AND n2.id IN $node_ids"
+        params["node_ids"] = node_ids
     
     try:
         async with driver.session() as session:
-            result = await session.run("""
-                CALL gds.nodeSimilarity.stream($graph_name, {
+            result = await session.run(f"""
+                CALL gds.nodeSimilarity.stream($graph_name, {{
                     topK: $top_k,
                     similarityCutoff: $cutoff
-                })
+                }})
                 YIELD node1, node2, similarity
                 WITH gds.util.asNode(node1) AS n1, gds.util.asNode(node2) AS n2, similarity
+                {scope_filter}
                 RETURN n1.id AS source_id, n1.name AS source_name, n1.type AS source_type,
                        n2.id AS target_id, n2.name AS target_name, n2.type AS target_type,
                        similarity AS score
                 ORDER BY score DESC
                 LIMIT $top_k
-            """, graph_name=graph_name, top_k=top_k, cutoff=similarity_cutoff)
+            """, **params)
             
             records = await result.data()
             
@@ -470,6 +779,7 @@ async def find_shortest_path(
                 "source_id": source_id,
                 "target_id": target_id,
                 "path": path,
+                "results": path,  # Consistent with other algorithms for table display
                 "total_cost": cost,
                 "path_length": length,
                 "insight": insight,
@@ -481,29 +791,156 @@ async def find_shortest_path(
         raise HTTPException(status_code=500, detail=f"Shortest path failed: {str(e)}")
 
 
+@router.get("/path/traversal")
+async def run_traversal(
+    source_id: str,
+    method: str = Query(default="bfs", enum=["bfs", "dfs"]),
+    folder_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
+) -> Dict[str, Any]:
+    """Run BFS or DFS traversal from a source node."""
+    driver = get_neo4j_driver()
+    graph_name = await gds.ensure_projection(folder_id)
+    
+    try:
+        async with driver.session() as session:
+            # Get internal node ID
+            id_res = await session.run("MATCH (n:Entity {id: $id}) RETURN id(n) AS neo_id", id=source_id)
+            rec = await id_res.single()
+            if not rec: raise HTTPException(status_code=404, detail="Start node not found")
+            
+            proc = "bfs" if method == "bfs" else "dfs"
+            result = await session.run(f"""
+                CALL gds.{proc}.stream($graph_name, {{
+                    sourceNode: $source
+                }})
+                YIELD nodeId, path
+                UNWIND nodeIds(path) AS nid
+                WITH gds.util.asNode(nid) AS n
+                RETURN n.id AS id, n.name AS name, n.type AS type
+            """, graph_name=graph_name, source=rec["neo_id"])
+            
+            records = await result.data()
+            return {
+                "algorithm": method,
+                "engine": f"gds.{proc}.stream",
+                "source_id": source_id,
+                "results": records,
+                "insight": f"{method.upper()} traversal explored {len(records)} nodes starting from '{source_id}'."
+            }
+    except Exception as e:
+        logger.error(f"GDS Traversal error: {e}")
+        raise HTTPException(status_code=500, detail=f"Traversal failed: {str(e)}")
+
+
+@router.get("/path/random-walk")
+async def run_random_walk(
+    source_id: str,
+    walk_length: int = Query(default=10, le=50),
+    walk_count: int = Query(default=1),
+    folder_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
+) -> Dict[str, Any]:
+    """Simulate random walks from a source node."""
+    driver = get_neo4j_driver()
+    graph_name = await gds.ensure_projection(folder_id)
+    
+    try:
+        async with driver.session() as session:
+            id_res = await session.run("MATCH (n:Entity {id: $id}) RETURN id(n) AS neo_id", id=source_id)
+            rec = await id_res.single()
+            if not rec: raise HTTPException(status_code=404, detail="Start node not found")
+            
+            result = await session.run("""
+                CALL gds.randomWalk.stream($graph_name, {
+                    sourceNodes: [$source],
+                    walkLength: $length,
+                    walkCount: $count
+                })
+                YIELD nodeIds
+                UNWIND nodeIds AS nid
+                WITH gds.util.asNode(nid) AS n
+                RETURN n.id AS id, n.name AS name, n.type AS type
+            """, graph_name=graph_name, source=rec["neo_id"], length=walk_length, count=walk_count)
+            
+            records = await result.data()
+            return {
+                "algorithm": "random_walk",
+                "engine": "gds.randomWalk.stream",
+                "results": records,
+                "insight": f"Completed {walk_count} random walks of length {walk_length}."
+            }
+    except Exception as e:
+        logger.error(f"GDS Random Walk error: {e}")
+        raise HTTPException(status_code=500, detail=f"Random walk failed: {str(e)}")
+
+
+@router.get("/topology/topological-sort")
+async def run_topological_sort(
+    folder_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
+) -> Dict[str, Any]:
+    """Sequence nodes in a Directed Acyclic Graph (DAG)."""
+    driver = get_neo4j_driver()
+    graph_name = await gds.ensure_projection(folder_id)
+    
+    try:
+        async with driver.session() as session:
+            result = await session.run("""
+                CALL gds.dag.topologicalSort.stream($graph_name)
+                YIELD nodeId
+                WITH gds.util.asNode(nodeId) AS n
+                RETURN n.id AS id, n.name AS name, n.type AS type
+            """, graph_name=graph_name)
+            
+            records = await result.data()
+            return {
+                "algorithm": "topological_sort",
+                "engine": "gds.dag.topologicalSort.stream",
+                "results": records,
+                "insight": f"Topological sort successful for {len(records)} nodes. This defines a valid logical sequence."
+            }
+    except Exception as e:
+        logger.error(f"GDS TopoSort error: {e}")
+        raise HTTPException(status_code=500, detail="Topological sort failed. Ensure your graph is a DAG (Directed Acyclic Graph).")
+
+
 # === GDS Link Prediction ===
 @router.get("/link-prediction")
 async def run_link_prediction_gds(
     folder_id: Optional[str] = None,
-    method: str = Query(default="common_neighbors", enum=["common_neighbors", "adamic_adar", "preferential_attachment"]),
+    method: str = Query(default="common_neighbors", enum=[
+        "common_neighbors", 
+        "adamic_adar", 
+        "preferential_attachment",
+        "resource_allocation",
+        "total_neighbors",
+        "same_community"
+    ]),
     top_k: int = Query(default=20, le=100),
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """Predict missing links using GDS Link Prediction algorithms."""
+    """Predict missing links using Cypher-based link prediction algorithms."""
     driver = get_neo4j_driver()
     
     try:
         async with driver.session() as session:
-            # Corrected query generation to avoid dual WHERE clauses
-            where_clause = "WHERE a <> b AND NOT (a)--(b)"
+            # Build the folder filter for node matching
+            folder_filter = ""
             if folder_id:
-                where_clause += " AND a.folder_id = $folder_id AND b.folder_id = $folder_id"
+                folder_filter = " {folder_id: $folder_id}"
             
             if method == "common_neighbors":
+                # Count of shared neighbors between two non-connected nodes
                 query = f"""
-                    MATCH (a:Entity), (b:Entity)
-                    {where_clause}
-                    WITH a, b, gds.linkPrediction.commonNeighbors(a, b) AS score
+                    MATCH (a:Entity{folder_filter}), (b:Entity{folder_filter})
+                    WHERE a <> b AND NOT (a)--(b) AND id(a) < id(b)
+                    WITH a, b
+                    OPTIONAL MATCH (a)--(neighbor)--(b)
+                    WITH a, b, count(DISTINCT neighbor) AS score
                     WHERE score > 0
                     RETURN a.id AS source_id, a.name AS source_name,
                            b.id AS target_id, b.name AS target_name,
@@ -512,10 +949,28 @@ async def run_link_prediction_gds(
                     LIMIT $top_k
                 """
             elif method == "adamic_adar":
+                # Sum of 1/log(degree) for each shared neighbor
                 query = f"""
-                    MATCH (a:Entity), (b:Entity)
-                    {where_clause}
-                    WITH a, b, gds.linkPrediction.adamicAdar(a, b) AS score
+                    MATCH (a:Entity{folder_filter}), (b:Entity{folder_filter})
+                    WHERE a <> b AND NOT (a)--(b) AND id(a) < id(b)
+                    WITH a, b
+                    MATCH (a)--(neighbor)--(b)
+                    WITH a, b, neighbor, size((neighbor)--()) AS degree
+                    WHERE degree > 1
+                    WITH a, b, sum(1.0 / log(toFloat(degree))) AS score
+                    WHERE score > 0
+                    RETURN a.id AS source_id, a.name AS source_name,
+                           b.id AS target_id, b.name AS target_name,
+                           round(score * 1000) / 1000.0 AS score
+                    ORDER BY score DESC
+                    LIMIT $top_k
+                """
+            elif method == "preferential_attachment":
+                # Product of degrees of the two nodes
+                query = f"""
+                    MATCH (a:Entity{folder_filter}), (b:Entity{folder_filter})
+                    WHERE a <> b AND NOT (a)--(b) AND id(a) < id(b)
+                    WITH a, b, size((a)--()) * size((b)--()) AS score
                     WHERE score > 0
                     RETURN a.id AS source_id, a.name AS source_name,
                            b.id AS target_id, b.name AS target_name,
@@ -523,11 +978,48 @@ async def run_link_prediction_gds(
                     ORDER BY score DESC
                     LIMIT $top_k
                 """
-            else:  # preferential_attachment
+            elif method == "resource_allocation":
+                # Sum of 1/degree for each shared neighbor
                 query = f"""
-                    MATCH (a:Entity), (b:Entity)
-                    {where_clause}
-                    WITH a, b, gds.linkPrediction.preferentialAttachment(a, b) AS score
+                    MATCH (a:Entity{folder_filter}), (b:Entity{folder_filter})
+                    WHERE a <> b AND NOT (a)--(b) AND id(a) < id(b)
+                    WITH a, b
+                    MATCH (a)--(neighbor)--(b)
+                    WITH a, b, neighbor, toFloat(size((neighbor)--())) AS degree
+                    WHERE degree > 0
+                    WITH a, b, sum(1.0 / degree) AS score
+                    WHERE score > 0
+                    RETURN a.id AS source_id, a.name AS source_name,
+                           b.id AS target_id, b.name AS target_name,
+                           round(score * 1000) / 1000.0 AS score
+                    ORDER BY score DESC
+                    LIMIT $top_k
+                """
+            elif method == "total_neighbors":
+                # Total unique neighbors of either node (union)
+                query = f"""
+                    MATCH (a:Entity{folder_filter}), (b:Entity{folder_filter})
+                    WHERE a <> b AND NOT (a)--(b) AND id(a) < id(b)
+                    WITH a, b
+                    OPTIONAL MATCH (a)--(na)
+                    WITH a, b, collect(DISTINCT na) AS aNeighbors
+                    OPTIONAL MATCH (b)--(nb)
+                    WITH a, b, aNeighbors, collect(DISTINCT nb) AS bNeighbors
+                    WITH a, b, size(apoc.coll.union(aNeighbors, bNeighbors)) AS score
+                    WHERE score > 0
+                    RETURN a.id AS source_id, a.name AS source_name,
+                           b.id AS target_id, b.name AS target_name,
+                           score
+                    ORDER BY score DESC
+                    LIMIT $top_k
+                """
+            else:  # same_community — check for shared type
+                query = f"""
+                    MATCH (a:Entity{folder_filter}), (b:Entity{folder_filter})
+                    WHERE a <> b AND NOT (a)--(b) AND id(a) < id(b)
+                      AND a.type IS NOT NULL AND a.type = b.type
+                    WITH a, b, 
+                         CASE WHEN a.type = b.type THEN 1.0 ELSE 0.0 END AS score
                     WHERE score > 0
                     RETURN a.id AS source_id, a.name AS source_name,
                            b.id AS target_id, b.name AS target_name,
@@ -551,7 +1043,7 @@ async def run_link_prediction_gds(
             
             return {
                 "algorithm": "link_prediction",
-                "engine": f"gds.linkPrediction.{method}",
+                "engine": f"cypher.linkPrediction.{method}",
                 "folder_id": folder_id,
                 "parameters": {"method": method, "top_k": top_k},
                 "results": records,

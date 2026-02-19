@@ -63,6 +63,15 @@ async def lifespan(app: FastAPI):
         await create_fulltext_indexes()
         await create_vector_index()
         logger.info("✅ Neo4j indexes created/verified")
+        
+        # Clear any stale GDS projections from previous runs
+        try:
+            from app.services.gds_service import get_gds_service
+            gds = get_gds_service()
+            await gds.invalidate_all()
+            logger.info("✅ GDS projections cleared")
+        except Exception as e:
+            logger.warning(f"⚠️ Could not clear GDS projections: {e}")
     except Exception as e:
         logger.error(f"❌ Neo4j connection failed: {e}")
     
