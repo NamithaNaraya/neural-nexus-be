@@ -46,16 +46,7 @@ async def list_available_algorithms() -> Dict[str, Any]:
             {"name": "louvain", "category": "community", "description": "Community detection (GDS)", "engine": "gds"},
             {"name": "leiden", "category": "community", "description": "Improved community detection (GDS)", "engine": "gds"},
             {"name": "node_similarity", "category": "similarity", "description": "Jaccard similarity (GDS)", "engine": "gds"},
-            {"name": "shortest_path", "category": "pathfinding", "description": "Dijkstra shortest path (GDS)", "engine": "gds"},
-            {"name": "graph_health", "category": "analysis", "description": "Comprehensive graph audit"},
-            {"name": "completeness", "category": "analysis", "description": "Knowledge completeness score"},
-            {"name": "degree_distribution", "category": "analysis", "description": "Node connectivity analysis"},
             {"name": "link_prediction", "category": "prediction", "description": "Predict missing links (GDS)", "engine": "gds"},
-            {"name": "missing_relationships", "category": "prediction", "description": "Find definite gaps"},
-            {"name": "incomplete_entities", "category": "analysis", "description": "Find incomplete nodes"},
-            {"name": "structural_holes", "category": "analysis", "description": "Bridging opportunities"},
-            {"name": "hits", "category": "centrality", "description": "Hub and authority scores"},
-            {"name": "k_core", "category": "decomposition", "description": "Core structure analysis"},
         ],
         "exports": [
             {"name": "json", "description": "Export graph as JSON (APOC)", "engine": "apoc"},
@@ -64,6 +55,9 @@ async def list_available_algorithms() -> Dict[str, Any]:
         "coming_soon": [
             {"name": "ml_training", "category": "ml", "description": "Train ML models on graph"},
             {"name": "node_classification", "category": "ml", "description": "Auto-categorize nodes"},
+            {"name": "graph_health", "category": "analysis", "description": "Comprehensive graph audit"},
+            {"name": "completeness", "category": "analysis", "description": "Knowledge completeness score"},
+            {"name": "degree_distribution", "category": "analysis", "description": "Node connectivity analysis"},
         ]
     }
 
@@ -309,7 +303,8 @@ async def run_leiden(
         async with driver.session() as session:
             result = await session.run("""
                 CALL gds.leiden.stream($graph_name, {
-                    gamma: $gamma
+                    gamma: $gamma,
+                    relationshipWeightProperty: 'weight'
                 })
                 YIELD nodeId, communityId
                 WITH gds.util.asNode(nodeId) AS node, communityId
@@ -499,14 +494,15 @@ async def run_link_prediction_gds(
     
     try:
         async with driver.session() as session:
-            # Get node pairs that aren't connected
-            folder_filter = "WHERE a.folder_id = $folder_id AND b.folder_id = $folder_id" if folder_id else ""
+            # Corrected query generation to avoid dual WHERE clauses
+            where_clause = "WHERE a <> b AND NOT (a)--(b)"
+            if folder_id:
+                where_clause += " AND a.folder_id = $folder_id AND b.folder_id = $folder_id"
             
             if method == "common_neighbors":
                 query = f"""
                     MATCH (a:Entity), (b:Entity)
-                    {folder_filter}
-                    WHERE a <> b AND NOT (a)--(b)
+                    {where_clause}
                     WITH a, b, gds.linkPrediction.commonNeighbors(a, b) AS score
                     WHERE score > 0
                     RETURN a.id AS source_id, a.name AS source_name,
@@ -518,8 +514,7 @@ async def run_link_prediction_gds(
             elif method == "adamic_adar":
                 query = f"""
                     MATCH (a:Entity), (b:Entity)
-                    {folder_filter}
-                    WHERE a <> b AND NOT (a)--(b)
+                    {where_clause}
                     WITH a, b, gds.linkPrediction.adamicAdar(a, b) AS score
                     WHERE score > 0
                     RETURN a.id AS source_id, a.name AS source_name,
@@ -531,8 +526,7 @@ async def run_link_prediction_gds(
             else:  # preferential_attachment
                 query = f"""
                     MATCH (a:Entity), (b:Entity)
-                    {folder_filter}
-                    WHERE a <> b AND NOT (a)--(b)
+                    {where_clause}
                     WITH a, b, gds.linkPrediction.preferentialAttachment(a, b) AS score
                     WHERE score > 0
                     RETURN a.id AS source_id, a.name AS source_name,
