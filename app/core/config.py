@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     ENABLE_PERFORMANCE_MODE: bool = True
     DEFAULT_LOD_LEVEL: str = "balanced"
     
+    # === Graph Schema Settings ===
+    # Priority for label selection when a node has multiple labels
+    GRAPH_LABEL_PRIORITY: List[str] = ["Herb", "Property", "Quality", "Entity"]
+    # Labels that are internal/system and should be ignored for domain discovery
+    GRAPH_SYSTEM_LABELS: List[str] = ["Entity", "Chunk", "File", "Folder", "Unknown"]
+    
     # === JWT Settings ===
     JWT_SECRET_KEY: str = "jwt-secret-key-change-in-production"
     JWT_ALGORITHM: str = "HS256"

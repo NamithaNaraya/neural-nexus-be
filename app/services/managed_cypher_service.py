@@ -218,8 +218,9 @@ class ManagedCypherService:
             logger.info(f"Entities for file {file_id} are tracked via file_ids array")
 
             # 5. Normalize names and types from original labels, catch missing IDs
-            # NOTE: Use // for Cypher comments inside query strings, never #
-            result = await session.run("""
+            # NOTE: Commented out to allow RAW node storage as nodes, not attributes
+            """
+            result = await session.run(\"\"\"
                 MATCH (n:Entity)
                 WHERE $file_id IN n.file_ids OR n.file_id = $file_id
                 SET n.type = CASE
@@ -233,7 +234,6 @@ class ManagedCypherService:
                         ELSE n.type
                     END,
                     // Improve naming heuristics to avoid UUIDs in the UI
-                    // We prioritize specific properties that typically contain names/labels
                     n.name = CASE
                         WHEN n.name IS NULL OR n.name = n.id THEN
                             coalesce(
@@ -244,6 +244,13 @@ class ManagedCypherService:
                             )
                         ELSE n.name
                     END
+                RETURN DISTINCT id(n) as internal_id, n.id as uuid
+            \"\"\", {"file_id": file_id})
+            """
+            # Placeholder to ensure UUIDs are still generated if missing
+            result = await session.run("""
+                MATCH (n)
+                WHERE ($file_id IN n.file_ids OR n.file_id = $file_id) AND n.id IS NULL
                 RETURN DISTINCT id(n) as internal_id, n.id as uuid
             """, {"file_id": file_id})
 

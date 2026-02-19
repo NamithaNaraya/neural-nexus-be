@@ -10,6 +10,8 @@ import logging
 
 from app.core.security import get_current_user
 from app.db.connections import get_neo4j
+from app.core.config import settings
+from app.utils.graph_utils import get_node_name, get_node_type, clean_label
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -39,12 +41,34 @@ async def get_all_node_types(
         query = f"""
         MATCH (n:Entity)
         {where_clause}
-        RETURN n.type as type, count(n) as count
+        WITH n, 
+             CASE WHEN n.type IS NOT NULL THEN n.type 
+             ELSE [l IN labels(n) WHERE NOT l IN $system_labels AND NOT l STARTS WITH 'F_'][0] 
+             END as node_type
+        WHERE node_type IS NOT NULL
+        RETURN node_type as type, count(n) as count
         ORDER BY count DESC
         """
-        result = await neo4j.execute_query(query, params)
-        types = [dict(record) for record in result.records if record["type"]]
-        return {"types": types, "total_types": len(types)}
+        result = await neo4j.execute_query(query, {**params, "system_labels": settings.GRAPH_SYSTEM_LABELS})
+        types = []
+        for record in result.records:
+            t = record["type"]
+            if t:
+                types.append({
+                    "type": clean_label(t),
+                    "count": record["count"]
+                })
+        
+        # Merge counts if cleaning led to same names (e.g. Herb_F1 and Herb_F2 both become Herb)
+        merged_types = {}
+        for item in types:
+            name = item["type"]
+            merged_types[name] = merged_types.get(name, 0) + item["count"]
+            
+        final_types = [{"type": k, "count": v} for k, v in merged_types.items()]
+        final_types.sort(key=lambda x: x["count"], reverse=True)
+        
+        return {"types": final_types, "total_types": len(final_types)}
     except Exception as e:
         logger.error(f"Failed to fetch node types: {e}")
         return {"types": [], "total_types": 0}
@@ -66,8 +90,8 @@ async def get_nodes_by_type(
     try:
         skip = (page - 1) * page_size
         
-        # Base filter
-        where_clause = "WHERE n.type = $node_type"
+        # Base filter - check both property and labels
+        where_clause = "WHERE (n.type = $node_type OR $node_type IN labels(n))"
         params = {"node_type": node_type}
         
         if folder_id:
@@ -92,10 +116,18 @@ async def get_nodes_by_type(
         WITH n, neighbor.type as nt, count(neighbor) as c
         WITH n, collect({{type: nt, count: c}}) as raw_conn_list
         WITH n, [x IN raw_conn_list WHERE x.type IS NOT NULL] as conn_list
-        RETURN n, conn_list
+        RETURN n, conn_list, 
+               CASE WHEN n.type IS NOT NULL THEN n.type 
+               ELSE [l IN labels(n) WHERE NOT l IN $system_labels AND NOT l STARTS WITH 'F_'][0] 
+               END as effective_type
         """
         
-        result = await neo4j.execute_query(nodes_query, {**params, "skip": skip, "limit": page_size})
+        result = await neo4j.execute_query(nodes_query, {
+            **params, 
+            "skip": skip, 
+            "limit": page_size,
+            "system_labels": settings.GRAPH_SYSTEM_LABELS
+        })
         
         nodes = []
         for record in result.records:
@@ -105,10 +137,11 @@ async def get_nodes_by_type(
             # Map Neo4j properties
             node_id = node_data.get("id") or str(record["n"].element_id)
             
+            labels = list(record["n"].labels)
             nodes.append({
                 "id": node_id,
-                "name": node_data.get("name", "Unknown"),
-                "type": node_data.get("type", node_type),
+                "name": get_node_name(labels, node_data, node_id),
+                "type": get_node_type(labels, node_data),
                 "folder_id": node_data.get("folder_id"),
                 "properties": {k: v for k, v in node_data.items() if k not in ["id", "name", "type", "folder_id"]},
                 "connections": connections

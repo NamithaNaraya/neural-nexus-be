@@ -13,9 +13,14 @@ from app.core.security import get_current_user
 from app.services.cache_service import get_cache_service, CacheService
 from app.services.gds_service import get_gds_service, GDSService
 from app.db.connections import get_neo4j
+from app.core.config import settings
+from app.utils.graph_utils import get_node_type, get_node_name, clean_label
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+
 
 
 # === Pydantic Models ===
@@ -212,8 +217,8 @@ async def get_all_graph(
 
                 nodes.append(NodeResponse(
                     id=node_id,
-                    name=props.get("name", props.get("label", "Unknown")),
-                    type=props.get("type", labels[0] if labels else "Unknown"),
+                    name=get_node_name(labels, props, node_id),
+                    type=get_node_type(labels, props),
                     description=props.get("description"),
                     properties=node_properties,
                     degree=record["degree"],
@@ -268,10 +273,11 @@ async def get_folder_graph(
     """Get graph data for all files in a folder."""
     cache_key = f"folder_{folder_id}_{node_type}_{min_connections}_{limit}"
     
+    # TEMPORARY: Skip cache to ensure fresh data with link properties
     # Check cache
-    cached_data = await cache.get_cached_graph(cache_key)
-    if cached_data:
-        return GraphResponse(**cached_data)
+    # cached_data = await cache.get_cached_graph(cache_key)
+    # if cached_data:
+    #     return GraphResponse(**cached_data)
 
     try:
         # Build type filter
@@ -325,8 +331,8 @@ async def get_folder_graph(
 
                 nodes.append(NodeResponse(
                     id=node_id,
-                    name=props.get("name", props.get("label", "Unknown")),
-                    type=props.get("type", labels[0] if labels else "Unknown"),
+                    name=get_node_name(labels, props, node_id),
+                    type=get_node_type(labels, props),
                     description=props.get("description"),
                     properties=node_properties,
                     degree=record["degree"],
@@ -357,15 +363,22 @@ async def get_folder_graph(
         for record in links_result.records:
             source_id = str(record["source"])
             target_id = str(record["target"])
+            raw_props = record["properties"]
+            rel_type = record["rel_type"]
             if source_id in node_ids and target_id in node_ids:
+                serialized_props = serialize_neo4j_values(raw_props or {})
+                # DIAGNOSTIC: Log link properties for HAS_QUALITY relationships  
+                if rel_type == "HAS_QUALITY":
+                    logger.info(f"[LINK DIAG FOLDER] {rel_type}: {source_id[:8]}...->{target_id[:8]}... raw={raw_props} final={serialized_props}")
                 links.append(LinkResponse(
                     source=source_id,
                     target=target_id,
-                    type=record["rel_type"],
+                    type=rel_type,
                     strength=record["weight"] or 1.0,
-                    properties=serialize_neo4j_values(record["properties"] or {}),
+                    properties=serialized_props,
                 ))
         
+        # Always store fresh data (bust stale cache)
         response = GraphResponse(nodes=nodes, links=links, total_nodes=len(nodes), total_links=len(links))
         await cache.set_cached_graph(cache_key, response.model_dump())
         return response
@@ -410,8 +423,8 @@ async def get_file_graph(
                 raw_properties = {k: v for k, v in props.items() if k not in ["id", "name", "type", "description", "folder_id", "file_id"]}
                 nodes.append(NodeResponse(
                     id=node_id,
-                    name=props.get("name", props.get("label", "Unknown")),
-                    type=props.get("type", labels[0] if labels else "Unknown"),
+                    name=get_node_name(labels, props, node_id),
+                    type=get_node_type(labels, props),
                     description=props.get("description"),
                     properties=serialize_neo4j_values(raw_properties),
                     degree=record["degree"],
@@ -490,8 +503,8 @@ async def get_node_details(
         
         return NodeDetailsResponse(
             id=node_id,
-            name=props.get("name", "Unknown"),
-            type=labels[0] if labels else "Unknown",
+            name=get_node_name(labels, props, node_id),
+            type=get_node_type(labels, props),
             description=props.get("description", "No description available"),
             properties=serialize_neo4j_values(raw_properties),
             source_files=source_files,
@@ -547,8 +560,8 @@ async def expand_node(
                 raw_properties = {k: v for k, v in props.items() if k not in ["id", "name", "type"]}
                 nodes.append(NodeResponse(
                     id=n_id,
-                    name=props.get("name", "Unknown"),
-                    type=list(neighbor.labels)[0] if neighbor.labels else "Unknown",
+                    name=get_node_name(list(neighbor.labels), props, n_id),
+                    type=get_node_type(list(neighbor.labels), props),
                     degree=record["degree"],
                     properties=serialize_neo4j_values(raw_properties)
                 ))
