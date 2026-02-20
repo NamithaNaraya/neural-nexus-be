@@ -561,9 +561,7 @@ async def run_kcore_gds(
     try:
         async with driver.session() as session:
             result = await session.run(f"""
-                CALL gds.kcore.stream($graph_name, {{
-                    k: $k
-                }})
+                CALL gds.kcore.stream($graph_name)
                 YIELD nodeId, coreValue
                 WITH gds.util.asNode(nodeId) AS node, coreValue
                 {scope_filter}
@@ -815,9 +813,8 @@ async def run_traversal(
                 CALL gds.{proc}.stream($graph_name, {{
                     sourceNode: $source
                 }})
-                YIELD nodeId, path
-                UNWIND nodeIds(path) AS nid
-                WITH gds.util.asNode(nid) AS n
+                YIELD nodeId
+                WITH gds.util.asNode(nodeId) AS n
                 RETURN n.id AS id, n.name AS name, n.type AS type
             """, graph_name=graph_name, source=rec["neo_id"])
             
@@ -857,7 +854,7 @@ async def run_random_walk(
                 CALL gds.randomWalk.stream($graph_name, {
                     sourceNodes: [$source],
                     walkLength: $length,
-                    walkCount: $count
+                    walks: $count
                 })
                 YIELD nodeIds
                 UNWIND nodeIds AS nid
@@ -955,7 +952,7 @@ async def run_link_prediction_gds(
                     WHERE a <> b AND NOT (a)--(b) AND id(a) < id(b)
                     WITH a, b
                     MATCH (a)--(neighbor)--(b)
-                    WITH a, b, neighbor, size((neighbor)--()) AS degree
+                    WITH a, b, neighbor, COUNT {{ (neighbor)--() }} AS degree
                     WHERE degree > 1
                     WITH a, b, sum(1.0 / log(toFloat(degree))) AS score
                     WHERE score > 0
@@ -970,7 +967,7 @@ async def run_link_prediction_gds(
                 query = f"""
                     MATCH (a:Entity{folder_filter}), (b:Entity{folder_filter})
                     WHERE a <> b AND NOT (a)--(b) AND id(a) < id(b)
-                    WITH a, b, size((a)--()) * size((b)--()) AS score
+                    WITH a, b, COUNT {{ (a)--() }} * COUNT {{ (b)--() }} AS score
                     WHERE score > 0
                     RETURN a.id AS source_id, a.name AS source_name,
                            b.id AS target_id, b.name AS target_name,
@@ -985,7 +982,7 @@ async def run_link_prediction_gds(
                     WHERE a <> b AND NOT (a)--(b) AND id(a) < id(b)
                     WITH a, b
                     MATCH (a)--(neighbor)--(b)
-                    WITH a, b, neighbor, toFloat(size((neighbor)--())) AS degree
+                    WITH a, b, neighbor, toFloat(COUNT {{ (neighbor)--() }}) AS degree
                     WHERE degree > 0
                     WITH a, b, sum(1.0 / degree) AS score
                     WHERE score > 0
