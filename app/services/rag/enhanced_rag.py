@@ -676,22 +676,23 @@ RULES:
 
         full_context = "\n".join(context_parts)
 
-        # Feature 1: STRICT GROUNDING system prompt
+        # Feature 1: STRICT GROUNDING — ZERO tolerance for generalizing
         system_prompt = (
-            "You are the Neural Nexus Intelligence Engine. Your ABSOLUTE RULES:\n\n"
-            "1. **STRICT GROUNDING**: You MUST answer ONLY from the DATABASE EVIDENCE provided below. "
-            "If the information exists in the evidence, you MUST present it clearly. "
-            "Do NOT say 'I don't have information' if the data IS in the context.\n\n"
-            "2. **CONVERSATIONAL STYLE**: Be warm, professional, and ask follow-up questions when appropriate. "
-            "For example: 'Would you like to know more about [related topic]?'\n\n"
-            "3. **MARKDOWN FORMATTING**: Use headers, bullet points, and bold text for clarity.\n\n"
-            "4. **ML INSIGHTS**: If AI Predictions are provided, mention them as supplementary insights "
-            "(e.g., 'Our ML model also suggests...').\n\n"
-            "5. **SIMILAR NODES**: If structurally similar nodes are mentioned, include them as related discoveries.\n\n"
+            "You are the Neural Nexus Intelligence Engine. ABSOLUTE RULES:\n\n"
+            "1. **DATABASE ONLY**: You answer STRICTLY from the DATABASE EVIDENCE below. "
+            "Do NOT add any general knowledge, textbook facts, or information from outside the evidence. "
+            "If the evidence contains the answer, present it clearly and completely.\n\n"
+            "2. **NO GENERALIZING**: If the database evidence does NOT contain the answer, "
+            "you MUST say: 'The database does not contain specific information about [topic]. "
+            "However, I found these related entries: [list relevant items from evidence].' "
+            "NEVER fill gaps with general knowledge. NEVER make up information.\n\n"
+            "3. **CONVERSATIONAL**: Be warm and professional. End with a relevant follow-up question "
+            "about something the database DOES have. Example: 'Would you like to explore [topic from evidence]?'\n\n"
+            "4. **MARKDOWN**: Use headers, bullets, bold for clarity.\n\n"
+            "5. **ML INSIGHTS**: If AI Predictions section exists, mention as: 'Our ML model also suggests...'\n\n"
             "6. **GREETINGS**: For hi/hello, respond warmly and briefly.\n\n"
-            "7. **MISSING DATA**: If the specific answer truly isn't in the evidence, say so clearly "
-            "but suggest what related information IS available.\n\n"
-            "8. **FOLLOW-UP**: End responses with a relevant follow-up question to keep the conversation going."
+            "7. **HONESTY OVER HELPFULNESS**: It is BETTER to say 'this data is not in the database' "
+            "than to guess or generalize. The user trusts you to reflect their data accurately."
         )
 
         user_prompt = f"Evidence & Knowledge:\n{full_context}\n\nQuestion: {state['question']}"
@@ -707,6 +708,22 @@ RULES:
             mentioned = sum(1 for name in entity_names if name in answer_lower)
             grounding_score = min(mentioned / max(len(entity_names), 1), 1.0)
             grounding_score = round(grounding_score, 2)
+
+            # ── ANTI-HALLUCINATION GATE ──
+            # If grounding is very low (<25%), the LLM is mostly generalizing.
+            # Replace with an honest "not in database" answer.
+            if grounding_score < 0.25 and entity_names:
+                available_items = ", ".join(
+                    f"**{r['name']}**" for r in state["vector_results"][:8]
+                )
+                answer = (
+                    f"The database does not contain enough specific information to fully answer "
+                    f"your question about *\"{state['question']}\"*.\n\n"
+                    f"However, here are the closest entries I found:\n"
+                    f"- {available_items}\n\n"
+                    f"Would you like me to explore any of these in detail?"
+                )
+                grounding_score = 1.0  # This honest answer IS grounded (it's truthful)
 
             citations = [
                 {
