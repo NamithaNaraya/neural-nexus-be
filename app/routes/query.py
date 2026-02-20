@@ -40,6 +40,11 @@ class QueryResponse(BaseModel):
     citations: List[Citation]
     session_id: str
     related_nodes: List[str]
+    # Enhanced RAG fields
+    grounding_score: float = 0.0          # Feature 10: 0-1 confidence
+    needs_clarification: bool = False      # Feature 2: ask-back flag
+    ml_insights_count: int = 0             # Feature 3+6: similar nodes found
+    predictions_count: int = 0             # Feature 4+5: ML predictions injected
 
 
 @router.post("/query", response_model=QueryResponse)
@@ -58,7 +63,7 @@ async def run_query(
     """
     from app.db.connections import get_neo4j_driver
     from app.services.ai_service import AIService
-    from app.services.hybrid_rag import get_rag_service
+    from app.services.rag import get_enhanced_rag_service
     
     # Create session if not provided
     session_id = request.session_id or str(uuid.uuid4())
@@ -67,7 +72,7 @@ async def run_query(
         # Get services
         neo4j = get_neo4j_driver()
         ai_service = AIService()
-        rag_service = get_rag_service(neo4j, ai_service)
+        rag_service = get_enhanced_rag_service(neo4j, ai_service)
         
         # 1. Fetch persistent history from PostgreSQL
         history = []
@@ -127,6 +132,10 @@ async def run_query(
             ],
             session_id=session_id,
             related_nodes=result.get("related_nodes", []),
+            grounding_score=result.get("grounding_score", 0.0),
+            needs_clarification=result.get("needs_clarification", False),
+            ml_insights_count=result.get("ml_insights_count", 0),
+            predictions_count=result.get("predictions_count", 0),
         )
         
     except Exception as e:
