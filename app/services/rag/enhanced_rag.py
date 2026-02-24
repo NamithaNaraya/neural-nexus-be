@@ -81,6 +81,9 @@ class EnhancedRAGService:
         self.neo4j = neo4j_driver
         self.ai = ai_service
         self.schema_cache = None
+        self._gds_projection_exists = None   # cached: True/False/None
+        self._model_catalog_cache = None      # cached model list
+        self._model_catalog_ts = 0            # cache timestamp
         self.graph = self._build_graph()
 
     # ─── Pipeline ────────────────────────────────────────
@@ -93,10 +96,7 @@ class EnhancedRAGService:
         wf.add_node("clarification_check",   self._clarification_node)
         wf.add_node("clarification_response",self._clarification_response_node)
         wf.add_node("vector_search",         self._vector_search_node)
-        wf.add_node("ml_enrichment",         self._ml_enrichment_node)
-        wf.add_node("strategic_scout",       self._strategic_scout_node)
         wf.add_node("graph_expansion",       self._graph_expansion_node)
-        wf.add_node("prediction_injection",  self._prediction_injection_node)
         wf.add_node("generate_answer",       self._answer_generation_node)
 
         wf.set_entry_point("load_context")
@@ -111,11 +111,10 @@ class EnhancedRAGService:
         )
         wf.add_edge("clarification_response", END)
 
-        wf.add_edge("vector_search", "ml_enrichment")
-        wf.add_edge("ml_enrichment", "strategic_scout")
-        wf.add_edge("strategic_scout", "graph_expansion")
-        wf.add_edge("graph_expansion", "prediction_injection")
-        wf.add_edge("prediction_injection", "generate_answer")
+        # Optimized pipeline: vector_search → graph_expansion → generate_answer
+        # (removed strategic_scout LLM call, merged ml/prediction into graph_expansion)
+        wf.add_edge("vector_search", "graph_expansion")
+        wf.add_edge("graph_expansion", "generate_answer")
         wf.add_edge("generate_answer", END)
 
         return wf.compile()
@@ -396,130 +395,28 @@ class EnhancedRAGService:
         logger.info(f"[RAG] Retrieval: {len(all_results)} results (vector+lexical+relationship+reranked)")
         return {"vector_results": all_results[:25]}
 
-    async def _ml_enrichment_node(self, state: EnhancedRAGState) -> Dict[str, Any]:
-        """
-        Feature 3: ML-powered retrieval via GDS Node Similarity.
-        Feature 6: Similarity-enriched expansion.
-        Finds structurally similar nodes that text search might miss.
-        """
-        if not state.get("vector_results"):
-            return {"ml_similar_nodes": []}
-
-        ml_nodes = []
-        seed_ids = [r["node_id"] for r in state["vector_results"][:5]]
-
-        try:
-            # Check if any GDS projection exists
-            async with self.neo4j.session() as session:
-                check = await session.run(
-                    "CALL gds.graph.exists('neural_nexus_all_undirected_native') YIELD exists RETURN exists"
-                )
-                rec = await check.single()
-                if not (rec and rec["exists"]):
-                    logger.info("[RAG] No GDS projection — skipping ML enrichment")
-                    return {"ml_similar_nodes": []}
-
-                # Find nodes similar to our seed results
-                result = await session.run("""
-                    CALL gds.nodeSimilarity.stream('neural_nexus_all_undirected_native', {
-                        topK: 5, similarityCutoff: 0.3
-                    })
-                    YIELD node1, node2, similarity
-                    WITH gds.util.asNode(node1) AS n1, gds.util.asNode(node2) AS n2, similarity
-                    WHERE n1.id IN $seeds OR n2.id IN $seeds
-                    WITH CASE WHEN n1.id IN $seeds THEN n2 ELSE n1 END AS similar,
-                         similarity
-                    WHERE similar.id IS NOT NULL AND NOT similar.id IN $seeds
-                    RETURN DISTINCT similar.id AS node_id, similar.name AS name,
-                           similar.type AS type,
-                           COALESCE(similar.description, '') AS description,
-                           similarity
-                    ORDER BY similarity DESC
-                    LIMIT 10
-                """, seeds=seed_ids)
-                ml_nodes = await result.data()
-                logger.info(f"[RAG] Feature 3+6: Found {len(ml_nodes)} structurally similar nodes")
-
-        except Exception as e:
-            logger.warning(f"[RAG] ML enrichment skipped: {e}")
-
-        return {"ml_similar_nodes": ml_nodes}
-
     # ═══════════════════════════════════════════════════════
-    #  PHASE 3: Reasoning
+    #  PHASE 3: Reasoning (Graph Expansion + ML + Predictions — single fast step)
     # ═══════════════════════════════════════════════════════
-
-    async def _strategic_scout_node(self, state: EnhancedRAGState) -> Dict[str, Any]:
-        """Strategic Cypher generation — same as before but with ML context."""
-        if not self.schema_cache:
-            try:
-                async with self.neo4j.session() as s:
-                    r1 = await s.run("CALL db.labels()")
-                    labels = [list(r.values())[0] for r in await r1.data()]
-                    r2 = await s.run("CALL db.relationshipTypes()")
-                    rels = [list(r.values())[0] for r in await r2.data()]
-                    self.schema_cache = {"labels": labels, "relationships": rels}
-            except Exception:
-                self.schema_cache = {"labels": [], "relationships": []}
-
-        entities = [r["name"] for r in state["vector_results"][:5]]
-        scope = state.get("scope") or state.get("auto_scope")
-        sid = scope.get("id") if scope else None
-        scope_clause = ""
-        if scope:
-            scope_clause = (
-                f" (MANDATORY: Filter by node.folder_id = $sid)"
-                if scope.get("type") == "folder"
-                else f" (MANDATORY: Filter by $sid IN node.file_ids)"
-            )
-
-        scout_prompt = f"""
-You are the Neural Nexus Strategic Scout. Generate a READ-ONLY Cypher query.
-
-SCHEMA:
-- Labels: {self.schema_cache['labels']}
-- Relationships: {self.schema_cache['relationships']}
-
-Relevant entities: {', '.join(entities)}.{scope_clause}
-Scope $sid: {sid}
-
-QUESTION: {state['question']}
-
-RULES:
-1. Output ONLY: {{"reasoning": "...", "cypher": "..."}}
-2. Use only labels/relationships from SCHEMA.
-3. LIMIT 50. Use $sid for scope filtering.
-4. If simple/factual, return empty cypher.
-"""
-
-        try:
-            prediction = await self.ai.chat_json([
-                {"role": "system", "content": "You generate high-precision Cypher for graph analytics."},
-                {"role": "user", "content": scout_prompt},
-            ])
-            cypher = prediction.get("cypher", "").strip()
-            if not cypher:
-                return {"strategic_results": []}
-
-            async with self.neo4j.session() as s:
-                result = await s.run(cypher, sid=sid)
-                records = await result.data()
-                logger.info(f"[RAG] Strategic Scout: {len(records)} insights")
-                return {"strategic_results": records[:10]}
-        except Exception as e:
-            logger.error(f"[RAG] Strategic Scout failed: {e}")
-            return {"strategic_results": []}
 
     async def _graph_expansion_node(self, state: EnhancedRAGState) -> Dict[str, Any]:
-        """Deep graph expansion: full entity profiles + paths + aliases."""
-        if not state.get("vector_results"):
-            return {"graph_context": {"nodes": [], "relationships": [], "backbone_types": [], "entity_profiles": []}}
+        """
+        Combined: Deep graph expansion + ML enrichment + prediction injection.
+        All in one step to avoid sequential overhead.
+        """
+        import asyncio
+        import time as _time
 
-        # Combine vector results + ML similar nodes for expansion
+        if not state.get("vector_results"):
+            return {
+                "graph_context": {"nodes": [], "relationships": [], "backbone_types": [], "entity_profiles": []},
+                "ml_similar_nodes": [],
+                "prediction_context": [],
+            }
+
         node_ids = [r["node_id"] for r in state["vector_results"][:15]]
-        for ml_node in state.get("ml_similar_nodes", [])[:5]:
-            if ml_node.get("node_id") and ml_node["node_id"] not in node_ids:
-                node_ids.append(ml_node["node_id"])
+        seed_ids = [r["node_id"] for r in state["vector_results"][:5]]
+        seed_names = [r["name"] for r in state["vector_results"][:10]]
 
         scope = state.get("scope") or state.get("auto_scope")
         scope_filter = ""
@@ -534,187 +431,198 @@ RULES:
                 scope_filter = "AND ($sid IN related.file_ids OR related.file_id = $sid)"
                 scope_filter_2hop = "AND ($sid IN hop2.file_ids OR hop2.file_id = $sid)"
 
-        try:
+        # ─── Run entity profiles, ML enrichment, and prediction check CONCURRENTLY ───
+        t0 = _time.time()
+
+        async def _get_entity_profiles():
+            """Deep 2-hop entity profiles."""
             nodes = set()
             rels = []
             entity_profiles = []
+            try:
+                async with self.neo4j.session() as session:
+                    profile_res = await session.run(f"""
+                        UNWIND $node_ids AS nodeId
+                        MATCH (n) WHERE n.id = nodeId OR elementId(n) = nodeId
+                        OPTIONAL MATCH (n)-[r1]-(hop1)
+                        WHERE hop1 IS NOT NULL {scope_filter.replace('related', 'hop1').replace(' r.', ' r1.')}
+                        OPTIONAL MATCH (hop1)-[r2]-(hop2)
+                        WHERE hop2 IS NOT NULL AND hop2 <> n {scope_filter_2hop}
+                        WITH n,
+                             collect(DISTINCT {{
+                               name: hop1.name,
+                               type: COALESCE(hop1.type, labels(hop1)[0]),
+                               rel: type(r1),
+                               desc: COALESCE(hop1.description, '')
+                             }}) AS direct_connections,
+                             collect(DISTINCT {{
+                               from_name: hop1.name,
+                               from_rel: type(r1),
+                               name: hop2.name,
+                               type: COALESCE(hop2.type, labels(hop2)[0]),
+                               rel: type(r2),
+                               desc: COALESCE(hop2.description, '')
+                             }}) AS two_hop_connections
+                        RETURN n.name AS entity_name,
+                               COALESCE(n.type, labels(n)[0]) AS entity_type,
+                               COALESCE(n.description, '') AS entity_desc,
+                               direct_connections[..25] AS direct,
+                               two_hop_connections[..20] AS two_hop
+                    """, params)
 
-            async with self.neo4j.session() as session:
-                # ── Deep Entity Profiles: 2-hop traversal ──
-                # For each seed node, get ALL its direct connections AND
-                # the connections of those connections (2 hops deep).
-                # This captures full chains like:
-                #   Herb -> HAS_PROPERTY -> Property -> EXPRESSED_AS -> Quality
-                #   Entity -> ALSO_KNOWN_AS -> Alias
-                #   Herb -> TREATS -> Condition
-                profile_res = await session.run(f"""
-                    UNWIND $node_ids AS nodeId
-                    MATCH (n) WHERE n.id = nodeId OR elementId(n) = nodeId
-                    OPTIONAL MATCH (n)-[r1]-(hop1)
-                    WHERE hop1 IS NOT NULL {scope_filter.replace('related', 'hop1').replace(' r.', ' r1.')}
-                    OPTIONAL MATCH (hop1)-[r2]-(hop2)
-                    WHERE hop2 IS NOT NULL AND hop2 <> n {scope_filter_2hop}
-                    WITH n,
-                         collect(DISTINCT {{
-                           name: hop1.name,
-                           type: COALESCE(hop1.type, labels(hop1)[0]),
-                           rel: type(r1),
-                           desc: COALESCE(hop1.description, '')
-                         }}) AS direct_connections,
-                         collect(DISTINCT {{
-                           from_name: hop1.name,
-                           from_rel: type(r1),
-                           name: hop2.name,
-                           type: COALESCE(hop2.type, labels(hop2)[0]),
-                           rel: type(r2),
-                           desc: COALESCE(hop2.description, '')
-                         }}) AS two_hop_connections
-                    RETURN n.name AS entity_name,
-                           COALESCE(n.type, labels(n)[0]) AS entity_type,
-                           COALESCE(n.description, '') AS entity_desc,
-                           direct_connections[..30] AS direct,
-                           two_hop_connections[..30] AS two_hop
-                """, params)
+                    for rec in await profile_res.data():
+                        entity_name = rec.get("entity_name")
+                        if not entity_name:
+                            continue
+                        nodes.add(entity_name)
 
-                for rec in await profile_res.data():
-                    entity_name = rec.get("entity_name")
-                    if not entity_name:
-                        continue
-                    nodes.add(entity_name)
+                        profile_lines = [f"## {entity_name} [{rec.get('entity_type', 'Entity')}]"]
+                        if rec.get("entity_desc"):
+                            profile_lines.append(f"   Description: {rec['entity_desc']}")
 
-                    # Build a structured profile
-                    profile_lines = [f"## {entity_name} [{rec.get('entity_type', 'Entity')}]"]
-                    if rec.get("entity_desc"):
-                        profile_lines.append(f"   Description: {rec['entity_desc']}")
+                        direct_by_rel = {}
+                        for conn in rec.get("direct", []):
+                            if conn.get("name"):
+                                rel_type = conn.get("rel", "RELATED_TO")
+                                if rel_type not in direct_by_rel:
+                                    direct_by_rel[rel_type] = []
+                                entry = conn["name"]
+                                if conn.get("desc"):
+                                    entry += f" ({conn['desc'][:80]})"
+                                direct_by_rel[rel_type].append(entry)
+                                nodes.add(conn["name"])
+                                rels.append(f"{entity_name} -[{rel_type}]-> {conn['name']}")
 
-                    # Group direct connections by relationship type
-                    direct_by_rel = {}
-                    for conn in rec.get("direct", []):
-                        if conn.get("name"):
-                            rel_type = conn.get("rel", "RELATED_TO")
-                            if rel_type not in direct_by_rel:
-                                direct_by_rel[rel_type] = []
-                            entry = conn["name"]
-                            if conn.get("desc"):
-                                entry += f" ({conn['desc'][:100]})"
-                            direct_by_rel[rel_type].append(entry)
-                            nodes.add(conn["name"])
-                            rels.append(f"{entity_name} -[{rel_type}]-> {conn['name']}")
+                        for rel_type, items in direct_by_rel.items():
+                            profile_lines.append(f"   {rel_type}: {', '.join(items)}")
 
-                    for rel_type, items in direct_by_rel.items():
-                        profile_lines.append(f"   {rel_type}: {', '.join(items)}")
+                        two_hop_chains = []
+                        for conn2 in rec.get("two_hop", []):
+                            if conn2.get("name") and conn2.get("from_name"):
+                                chain = f"{conn2['from_name']} -[{conn2.get('rel', '?')}]-> {conn2['name']}"
+                                if chain not in two_hop_chains:
+                                    two_hop_chains.append(chain)
+                                    nodes.add(conn2["name"])
 
-                    # 2-hop connections (e.g., Property -> EXPRESSED_AS -> Quality)
-                    two_hop_chains = []
-                    for conn2 in rec.get("two_hop", []):
-                        if conn2.get("name") and conn2.get("from_name"):
-                            chain = f"{conn2['from_name']} -[{conn2.get('rel', '?')}]-> {conn2['name']}"
-                            if chain not in two_hop_chains:
-                                two_hop_chains.append(chain)
-                                nodes.add(conn2["name"])
-                                rels.append(f"{entity_name} -> {conn2['from_name']} -[{conn2.get('rel', '?')}]-> {conn2['name']}")
+                        if two_hop_chains:
+                            profile_lines.append(f"   Extended connections: {'; '.join(two_hop_chains[:12])}")
 
-                    if two_hop_chains:
-                        profile_lines.append(f"   Extended connections: {'; '.join(two_hop_chains[:15])}")
+                        entity_profiles.append("\n".join(profile_lines))
 
-                    entity_profiles.append("\n".join(profile_lines))
+                    # Backbone types (fast query)
+                    res3 = await session.run("""
+                        MATCH ()-[r]->()
+                        WHERE ($sid IS NULL) OR r.folder_id = $sid
+                        WITH type(r) AS t, count(*) AS c ORDER BY c DESC LIMIT 5
+                        RETURN t AS relationshipType
+                    """, params)
+                    backbone = [r["relationshipType"] for r in await res3.data()]
 
-                # Shortest paths between seed entities
-                res2 = await session.run(f"""
-                    MATCH (n) WHERE n.id IN $node_ids OR elementId(n) IN $node_ids
-                    WITH collect(n) AS seeds
-                    UNWIND seeds AS a UNWIND seeds AS b
-                    WITH a, b WHERE elementId(a) < elementId(b)
-                    MATCH p = shortestPath((a)-[*..6]-(b))
-                    RETURN [node IN nodes(p) | node.name] AS names,
-                           [rel IN relationships(p) | type(rel)] AS types
-                    LIMIT 10
-                """, params)
-                for rec in await res2.data():
-                    path_parts = []
-                    for i, t in enumerate(rec["types"]):
-                        path_parts.append(f"{rec['names'][i]} -[{t}]->")
-                    path_parts.append(rec["names"][-1])
-                    rels.append(f"PATH: {' '.join(path_parts)}")
-                    for n in rec["names"]:
-                        nodes.add(n)
+            except Exception as e:
+                logger.error(f"[RAG] Entity profiles failed: {e}")
+                backbone = []
 
-                # Backbone types
-                res3 = await session.run("""
-                    MATCH ()-[r]->()
-                    WHERE ($sid IS NULL) OR r.folder_id = $sid
-                    WITH type(r) AS t, count(*) AS c ORDER BY c DESC LIMIT 5
-                    RETURN t AS relationshipType
-                """, params)
-                backbone = [r["relationshipType"] for r in await res3.data()]
+            return nodes, rels, entity_profiles, backbone
 
-            logger.info(f"[RAG] Graph expansion: {len(entity_profiles)} entity profiles, {len(rels)} relationships")
-            return {"graph_context": {
-                "nodes": list(nodes),
-                "relationships": rels,
-                "backbone_types": backbone,
-                "entity_profiles": entity_profiles,
-            }}
-        except Exception as e:
-            logger.error(f"[RAG] Graph expansion failed: {e}")
-            return {"graph_context": {"nodes": [], "relationships": [], "backbone_types": [], "entity_profiles": []}}
+        async def _get_ml_similar():
+            """ML enrichment with cached GDS check."""
+            ml_nodes = []
+            try:
+                # Use cached check — only query GDS once per service lifetime
+                if self._gds_projection_exists is None:
+                    async with self.neo4j.session() as session:
+                        check = await session.run(
+                            "CALL gds.graph.exists('neural_nexus_all_undirected_native') YIELD exists RETURN exists"
+                        )
+                        rec = await check.single()
+                        self._gds_projection_exists = bool(rec and rec["exists"])
 
-    async def _prediction_injection_node(self, state: EnhancedRAGState) -> Dict[str, Any]:
-        """
-        Feature 4: Inject Link Prediction results into context.
-        Feature 5: Auto-label nodes via Node Classification.
-        """
-        predictions = []
-        seed_names = [r["name"] for r in state.get("vector_results", [])[:10]]
+                if not self._gds_projection_exists:
+                    return []
 
-        try:
-            async with self.neo4j.session() as session:
-                # Feature 4: Check for trained LP models and predicted links
-                try:
-                    models = await session.run(
-                        "CALL gds.model.list() YIELD modelName, modelType "
-                        "RETURN modelName, modelType"
-                    )
-                    model_data = await models.data()
+                async with self.neo4j.session() as session:
+                    result = await session.run("""
+                        CALL gds.nodeSimilarity.stream('neural_nexus_all_undirected_native', {
+                            topK: 3, similarityCutoff: 0.3
+                        })
+                        YIELD node1, node2, similarity
+                        WITH gds.util.asNode(node1) AS n1, gds.util.asNode(node2) AS n2, similarity
+                        WHERE n1.id IN $seeds OR n2.id IN $seeds
+                        WITH CASE WHEN n1.id IN $seeds THEN n2 ELSE n1 END AS similar,
+                             similarity
+                        WHERE similar.id IS NOT NULL AND NOT similar.id IN $seeds
+                        RETURN DISTINCT similar.id AS node_id, similar.name AS name,
+                               similar.type AS type,
+                               COALESCE(similar.description, '') AS description,
+                               similarity
+                        ORDER BY similarity DESC
+                        LIMIT 5
+                    """, seeds=seed_ids)
+                    ml_nodes = await result.data()
+            except Exception as e:
+                logger.warning(f"[RAG] ML enrichment skipped: {e}")
+            return ml_nodes
 
-                    lp_models = [m for m in model_data if "Link" in str(m.get("modelType", ""))]
-                    nc_models = [m for m in model_data if "Classification" in str(m.get("modelType", ""))]
+        async def _get_predictions():
+            """Prediction context with cached model catalog."""
+            predictions = []
+            try:
+                # Cache model catalog for 60 seconds
+                now = _time.time()
+                if self._model_catalog_cache is None or (now - self._model_catalog_ts) > 60:
+                    async with self.neo4j.session() as session:
+                        models = await session.run(
+                            "CALL gds.model.list() YIELD modelName, modelType "
+                            "RETURN modelName, modelType"
+                        )
+                        self._model_catalog_cache = await models.data()
+                        self._model_catalog_ts = now
 
-                    # If LP model exists, find predictions relevant to current entities
-                    if lp_models:
-                        # Check if predictions were previously applied (PREDICTED_LINK in graph)
+                model_data = self._model_catalog_cache or []
+                lp_models = [m for m in model_data if "Link" in str(m.get("modelType", ""))]
+
+                if lp_models:
+                    async with self.neo4j.session() as session:
                         pred_res = await session.run("""
                             MATCH (a:Entity)-[r:PREDICTED_LINK]-(b:Entity)
                             WHERE a.name IN $names OR b.name IN $names
                             RETURN a.name AS source, b.name AS target,
                                    COALESCE(r.probability, 0.5) AS probability
-                            LIMIT 10
+                            LIMIT 5
                         """, names=seed_names)
-                        pred_data = await pred_res.data()
-                        for p in pred_data:
+                        for p in await pred_res.data():
                             predictions.append({
                                 "type": "link_prediction",
                                 "detail": f"AI predicts: {p['source']} ↔ {p['target']} ({p['probability']*100:.0f}% confidence)",
                             })
+            except Exception as e:
+                logger.debug(f"[RAG] Predictions skipped: {e}")
+            return predictions
 
-                    # Feature 5: If NC model exists, predict types for nodes without clear type
-                    if nc_models:
-                        # Check for nodes in results that might have uncertain types
-                        for r in state.get("vector_results", [])[:5]:
-                            if not r.get("type") or r["type"] == "Entity":
-                                predictions.append({
-                                    "type": "classification_suggestion",
-                                    "detail": f"Node '{r['name']}' may need type classification (NC model available)",
-                                })
+        # ─── Run ALL THREE concurrently ───
+        (nodes, rels, entity_profiles, backbone), ml_nodes, predictions = await asyncio.gather(
+            _get_entity_profiles(),
+            _get_ml_similar(),
+            _get_predictions(),
+        )
 
-                except Exception as e:
-                    logger.debug(f"[RAG] Model catalog check: {e}")
+        elapsed = _time.time() - t0
+        logger.info(
+            f"[RAG] Graph expansion: {len(entity_profiles)} profiles, "
+            f"{len(ml_nodes)} ML nodes, {len(predictions)} predictions in {elapsed:.1f}s"
+        )
 
-        except Exception as e:
-            logger.warning(f"[RAG] Prediction injection skipped: {e}")
+        return {
+            "graph_context": {
+                "nodes": list(nodes),
+                "relationships": rels,
+                "backbone_types": backbone,
+                "entity_profiles": entity_profiles,
+            },
+            "ml_similar_nodes": ml_nodes,
+            "prediction_context": predictions,
+        }
 
-        logger.info(f"[RAG] Feature 4+5: {len(predictions)} prediction insights injected")
-        return {"prediction_context": predictions}
 
     # ═══════════════════════════════════════════════════════
     #  PHASE 4: Answer Generation

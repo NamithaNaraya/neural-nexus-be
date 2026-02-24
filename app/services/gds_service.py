@@ -97,7 +97,7 @@ class GDSService:
                     return global_name
                     
                 elif node_ids:
-                    # Directed Cypher projection for specific nodes
+                    # Directed Cypher projection for specific nodes (highest priority)
                     await session.run("""
                         CALL gds.graph.project.cypher(
                             $name,

@@ -342,15 +342,15 @@ async def run_louvain(
     driver = get_neo4j_driver()
     graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
     
-    # Build scope filter for results (global projection runs on all nodes)
+    # Build scope filter — node_ids takes priority (more specific scope)
     scope_filter = ""
     params = {"graph_name": graph_name, "intermediate": include_intermediate}
-    if folder_id:
-        scope_filter = "WHERE node.folder_id = $folder_id"
-        params["folder_id"] = folder_id
-    elif node_ids:
+    if node_ids:
         scope_filter = "WHERE node.id IN $node_ids"
         params["node_ids"] = node_ids
+    elif folder_id:
+        scope_filter = "WHERE node.folder_id = $folder_id"
+        params["folder_id"] = folder_id
     
     try:
         async with driver.session() as session:
@@ -411,12 +411,12 @@ async def run_leiden(
     
     scope_filter = ""
     params = {"graph_name": graph_name, "gamma": gamma}
-    if folder_id:
-        scope_filter = "WHERE node.folder_id = $folder_id"
-        params["folder_id"] = folder_id
-    elif node_ids:
+    if node_ids:
         scope_filter = "WHERE node.id IN $node_ids"
         params["node_ids"] = node_ids
+    elif folder_id:
+        scope_filter = "WHERE node.folder_id = $folder_id"
+        params["folder_id"] = folder_id
     
     try:
         async with driver.session() as session:
@@ -473,12 +473,12 @@ async def run_wcc_gds(
     
     scope_filter = ""
     params = {"graph_name": graph_name}
-    if folder_id:
-        scope_filter = "WHERE node.folder_id = $folder_id"
-        params["folder_id"] = folder_id
-    elif node_ids:
+    if node_ids:
         scope_filter = "WHERE node.id IN $node_ids"
         params["node_ids"] = node_ids
+    elif folder_id:
+        scope_filter = "WHERE node.folder_id = $folder_id"
+        params["folder_id"] = folder_id
     
     try:
         async with driver.session() as session:
@@ -551,12 +551,12 @@ async def run_kcore_gds(
     
     scope_filter = "WHERE coreValue >= $k"
     params = {"graph_name": graph_name, "k": k}
-    if folder_id:
-        scope_filter = "WHERE coreValue >= $k AND node.folder_id = $folder_id"
-        params["folder_id"] = folder_id
-    elif node_ids:
+    if node_ids:
         scope_filter = "WHERE coreValue >= $k AND node.id IN $node_ids"
         params["node_ids"] = node_ids
+    elif folder_id:
+        scope_filter = "WHERE coreValue >= $k AND node.folder_id = $folder_id"
+        params["folder_id"] = folder_id
     
     try:
         async with driver.session() as session:
@@ -600,12 +600,12 @@ async def run_triangle_count_gds(
     
     scope_filter = ""
     params = {"graph_name": graph_name}
-    if folder_id:
-        scope_filter = "WHERE node.folder_id = $folder_id"
-        params["folder_id"] = folder_id
-    elif node_ids:
+    if node_ids:
         scope_filter = "WHERE node.id IN $node_ids"
         params["node_ids"] = node_ids
+    elif folder_id:
+        scope_filter = "WHERE node.folder_id = $folder_id"
+        params["folder_id"] = folder_id
     
     try:
         async with driver.session() as session:
@@ -653,12 +653,12 @@ async def run_node_similarity(
     
     scope_filter = ""
     params = {"graph_name": graph_name, "top_k": top_k, "cutoff": similarity_cutoff}
-    if folder_id:
-        scope_filter = "WHERE n1.folder_id = $folder_id AND n2.folder_id = $folder_id"
-        params["folder_id"] = folder_id
-    elif node_ids:
+    if node_ids:
         scope_filter = "WHERE n1.id IN $node_ids AND n2.id IN $node_ids"
         params["node_ids"] = node_ids
+    elif folder_id:
+        scope_filter = "WHERE n1.folder_id = $folder_id AND n2.folder_id = $folder_id"
+        params["folder_id"] = folder_id
     
     try:
         async with driver.session() as session:
@@ -877,26 +877,39 @@ async def run_random_walk(
 @router.get("/topology/topological-sort")
 async def run_topological_sort(
     folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Sequence nodes in a Directed Acyclic Graph (DAG)."""
     driver = get_neo4j_driver()
-    graph_name = await gds.ensure_projection(folder_id)
+    # Note: Topological sort requires directed relationships, so we use undirected=False (default)
+    graph_name = await gds.ensure_projection(folder_id, node_ids)
     
+    scope_filter = ""
+    params = {"graph_name": graph_name}
+    if node_ids:
+        scope_filter = "WHERE n.id IN $node_ids"
+        params["node_ids"] = node_ids
+    elif folder_id:
+        scope_filter = "WHERE n.folder_id = $folder_id"
+        params["folder_id"] = folder_id
+        
     try:
         async with driver.session() as session:
-            result = await session.run("""
+            result = await session.run(f"""
                 CALL gds.dag.topologicalSort.stream($graph_name)
                 YIELD nodeId
                 WITH gds.util.asNode(nodeId) AS n
+                {scope_filter}
                 RETURN n.id AS id, n.name AS name, n.type AS type
-            """, graph_name=graph_name)
+            """, **params)
             
             records = await result.data()
             return {
                 "algorithm": "topological_sort",
                 "engine": "gds.dag.topologicalSort.stream",
+                "folder_id": folder_id,
                 "results": records,
                 "insight": f"Topological sort successful for {len(records)} nodes. This defines a valid logical sequence."
             }
@@ -1034,9 +1047,9 @@ async def run_link_prediction_gds(
             
             if records:
                 top = records[0]
-                insight = f"Strongest predicted link: '{top['source_name']}' ↔ '{top['target_name']}' (score: {top['score']:.2f}). Found {len(records)} potential connections."
+                insight = f"Strongest new link prediction: '{top['source_name']}' ↔ '{top['target_name']}' (score: {top['score']:.2f}). Identified {len(records)} potential new connections."
             else:
-                insight = "No link predictions above threshold."
+                insight = "No new link predictions above threshold."
             
             return {
                 "algorithm": "link_prediction",
