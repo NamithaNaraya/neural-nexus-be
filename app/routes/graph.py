@@ -42,6 +42,7 @@ class NodeResponse(BaseModel):
 
 class LinkResponse(BaseModel):
     """Graph link/relationship representation."""
+    id: Optional[str] = None
     source: str
     target: str
     type: str
@@ -100,6 +101,21 @@ class CreateRelationshipRequest(BaseModel):
     type: str
     properties: Dict[str, Any] = {}
     strength: float = 1.0
+
+
+class UpdateRelationshipRequest(BaseModel):
+    """Request to update an existing relationship."""
+    type: Optional[str] = None
+    properties: Optional[Dict[str, Any]] = None
+    strength: Optional[float] = None
+
+
+class RenameRelationshipTypeRequest(BaseModel):
+    """Request to globally rename a relationship type."""
+    old_type: str
+    new_type: str
+    folder_id: Optional[str] = None
+    file_id: Optional[str] = None
 
 
 class MergeNodesRequest(BaseModel):
@@ -230,7 +246,8 @@ async def get_all_graph(
         # Query relationships
         links_query = """
         MATCH (a)-[r]->(b)
-        RETURN COALESCE(a.id, a.entity_id, elementId(a)) as source,
+        RETURN elementId(r) as id,
+               COALESCE(a.id, a.entity_id, elementId(a)) as source,
                COALESCE(b.id, b.entity_id, elementId(b)) as target,
                COALESCE(r.type, type(r)) as rel_type,
                r.weight as weight,
@@ -245,6 +262,7 @@ async def get_all_graph(
             target_id = str(record["target"])
             if source_id in node_ids and target_id in node_ids:
                 links.append(LinkResponse(
+                    id=str(record["id"]),
                     source=source_id,
                     target=target_id,
                     type=record["rel_type"],
@@ -346,7 +364,8 @@ async def get_folder_graph(
         MATCH (a)-[r]->(b)
         WHERE (a.folder_id = $folder_id OR a.folderId = $folder_id)
           AND (b.folder_id = $folder_id OR b.folderId = $folder_id)
-        RETURN COALESCE(a.id, a.entity_id, elementId(a)) as source,
+        RETURN elementId(r) as id,
+               COALESCE(a.id, a.entity_id, elementId(a)) as source,
                COALESCE(b.id, b.entity_id, elementId(b)) as target,
                COALESCE(r.type, type(r)) as rel_type,
                r.weight as weight,
@@ -371,6 +390,7 @@ async def get_folder_graph(
                 if rel_type == "HAS_QUALITY":
                     logger.info(f"[LINK DIAG FOLDER] {rel_type}: {source_id[:8]}...->{target_id[:8]}... raw={raw_props} final={serialized_props}")
                 links.append(LinkResponse(
+                    id=str(record["id"]),
                     source=source_id,
                     target=target_id,
                     type=rel_type,
@@ -439,7 +459,8 @@ async def get_file_graph(
         WHERE ($file_id IN a.file_ids OR a.file_id = $file_id OR a.fileId = $file_id)
           AND ($file_id IN b.file_ids OR b.file_id = $file_id OR b.fileId = $file_id)
           AND ($file_id IN r.file_ids OR r.file_id = $file_id)
-        RETURN COALESCE(a.id, a.entity_id, elementId(a)) as source,
+        RETURN elementId(r) as id,
+               COALESCE(a.id, a.entity_id, elementId(a)) as source,
                COALESCE(b.id, b.entity_id, elementId(b)) as target,
                COALESCE(r.type, type(r)) as rel_type,
                r.weight as weight,
@@ -453,6 +474,7 @@ async def get_file_graph(
             target_id = str(record["target"])
             if source_id in node_ids and target_id in node_ids:
                 links.append(LinkResponse(
+                    id=str(record["id"]),
                     source=source_id,
                     target=target_id,
                     type=record["rel_type"],
@@ -1145,6 +1167,82 @@ async def delete_relationship(
         raise
     except Exception as e:
         logger.error(f"Failed to delete relationship: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/relationships/{relationship_id}")
+async def update_relationship(
+    relationship_id: str,
+    request: UpdateRelationshipRequest,
+    current_user: dict = Depends(get_current_user),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
+) -> Dict[str, Any]:
+    """
+    Update an existing relationship (type or properties).
+    """
+    from app.services.graph_service import get_graph_service
+    
+    try:
+        graph_service = get_graph_service()
+        success = await graph_service.update_relationship(
+            relationship_id=relationship_id,
+            new_type=request.type,
+            properties=request.properties,
+            strength=request.strength
+        )
+        
+        if not success:
+            raise HTTPException(status_code=404, detail="Relationship not found")
+        
+        # Invalidate cache
+        await cache.invalidate_all()
+        await gds.invalidate_all()
+        
+        return {
+            "success": True,
+            "relationship_id": relationship_id,
+            "message": "Relationship updated successfully"
+        }
+    except Exception as e:
+        logger.error(f"Failed to update relationship: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/relationships/type/rename")
+async def rename_relationship_type(
+    request: RenameRelationshipTypeRequest,
+    current_user: dict = Depends(get_current_user),
+    cache: CacheService = Depends(get_cache_service),
+    gds: GDSService = Depends(get_gds_service),
+) -> Dict[str, Any]:
+    """
+    Globally rename a relationship type (optionally scoped to a folder).
+    """
+    from app.services.graph_service import get_graph_service
+    
+    try:
+        graph_service = get_graph_service()
+        count = await graph_service.rename_relationship_type(
+            old_type=request.old_type,
+            new_type=request.new_type,
+            folder_id=request.folder_id,
+            file_id=request.file_id
+        )
+        
+        # Invalidate cache if any changes made
+        if count > 0:
+            await cache.invalidate_all()
+            await gds.invalidate_all()
+        
+        return {
+            "success": True,
+            "old_type": request.old_type,
+            "new_type": request.new_type,
+            "affected_count": count
+        }
+    except Exception as e:
+        logger.error(f"Failed to rename relationship type: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

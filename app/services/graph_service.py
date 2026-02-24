@@ -300,13 +300,100 @@ class GraphService:
             result = await session.run("""
                 MATCH (a:Entity {folder_id: $folder_id})-[r]->(b:Entity {folder_id: $folder_id})
                 WHERE type(r) <> toUpper(type(r))
-                WITH a, r, b, type(r) AS old_type, toUpper(type(r)) AS new_type
+                WITH r, toUpper(type(r)) AS new_type
                 CALL apoc.refactor.setType(r, new_type) YIELD output
                 RETURN count(*) AS normalized_count
             """, folder_id=folder_id)
             
             record = await result.single()
             return {"normalized_count": record["normalized_count"] if record else 0}
+
+    async def rename_relationship_type(self, old_type: str, new_type: str, folder_id: Optional[str] = None, file_id: Optional[str] = None) -> int:
+        """
+        Rename all relationships of a certain type, optionally scoped to a folder or file.
+        Uses apoc.refactor.setType for efficiency.
+        """
+        # Sanitize new_type
+        new_type = new_type.upper().replace(" ", "_").replace("-", "_")
+        
+        # Build dynamic query parts
+        where_clauses = []
+        params = {"new_type": new_type, "folder_id": folder_id, "file_id": file_id}
+        
+        if folder_id:
+            where_clauses.append("a.folder_id = $folder_id")
+        if file_id:
+            # Check if relationship has this file_id in its metadata
+            where_clauses.append("$file_id IN r.file_ids")
+            
+        scope_filter = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+        
+        async with self.driver.session() as session:
+            result = await session.run(f"""
+                MATCH (a)-[r:{old_type}]->(b)
+                {scope_filter}
+                WITH r, $new_type AS nt
+                CALL apoc.refactor.setType(r, nt) YIELD output
+                RETURN count(*) AS count
+            """, params)
+            
+            record = await result.single()
+            return record["count"] if record else 0
+
+    async def update_relationship(
+        self, 
+        relationship_id: str, 
+        new_type: Optional[str] = None, 
+        properties: Optional[Dict[str, Any]] = None,
+        strength: Optional[float] = None
+    ) -> bool:
+        """
+        Update a specific relationship by its ID.
+        Handles type changes via apoc.refactor.setType and property updates via SET.
+        """
+        async with self.driver.session() as session:
+            # 1. Update type if provided
+            if new_type:
+                new_type = new_type.upper().replace(" ", "_").replace("-", "_")
+                await session.run("""
+                    MATCH ()-[r]->()
+                    WHERE r.id = $rel_id
+                    CALL apoc.refactor.setType(r, $new_type) YIELD output
+                    RETURN count(output)
+                """, rel_id=relationship_id, new_type=new_type)
+
+            # 2. Update properties if provided
+            set_clauses = []
+            params = {"rel_id": relationship_id}
+            
+            if strength is not None:
+                set_clauses.append("r.strength = $strength")
+                params["strength"] = strength
+                
+            if properties:
+                for key, value in properties.items():
+                    safe_key = key.replace(" ", "_").replace("-", "_")
+                    set_clauses.append(f"r.{safe_key} = ${safe_key}")
+                    params[safe_key] = value
+            
+            if set_clauses:
+                query = f"""
+                MATCH ()-[r]->()
+                WHERE r.id = $rel_id
+                SET {', '.join(set_clauses)}
+                RETURN count(r)
+                """
+                await session.run(query, params)
+                
+            # 3. Add update timestamp
+            from datetime import datetime
+            await session.run("""
+                MATCH ()-[r]->()
+                WHERE r.id = $rel_id
+                SET r.updated_at = $now
+            """, rel_id=relationship_id, now=datetime.utcnow().isoformat())
+                
+            return True
 
     # === GDS Graph Statistics ===
     async def get_graph_stats(self, folder_id: Optional[str] = None) -> Dict[str, Any]:
