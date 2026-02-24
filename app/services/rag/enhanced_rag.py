@@ -275,7 +275,7 @@ class EnhancedRAGService:
 
     async def _vector_search_node(self, state: EnhancedRAGState) -> Dict[str, Any]:
         """
-        Hybrid search: Vector (semantic) + Lexical (keyword).
+        Hybrid search: Vector (semantic) + Lexical (keyword) + Relationship-aware.
         Feature 8: Rerank by relevance × centrality.
         """
         question_embedding = await self.ai.embed(state["question"])
@@ -319,7 +319,7 @@ class EnhancedRAGService:
         except Exception as e:
             logger.warning(f"[RAG] Vector search failed: {e}")
 
-        # B. Lexical search
+        # B. Lexical search (direct name/description match)
         try:
             async with self.neo4j.session() as session:
                 res = await session.run(f"""
@@ -341,6 +341,33 @@ class EnhancedRAGService:
                         seen.add(r["node_id"])
         except Exception as e:
             logger.warning(f"[RAG] Lexical search failed: {e}")
+
+        # C. Relationship-aware search: find nodes connected TO matched terms
+        # This catches cases where user says "medications" but the node is
+        # "Menopause Relief" connected via HAS_PROPERTY/TREATS/etc.
+        try:
+            async with self.neo4j.session() as session:
+                scope_filter_c = scope_filter.replace("node.", "connected.")
+                res = await session.run(f"""
+                    MATCH (node)-[r]-(connected)
+                    WHERE node.name IS NOT NULL AND connected.name IS NOT NULL
+                    AND ANY(term IN $terms WHERE toLower(connected.name) CONTAINS term
+                            OR toLower(COALESCE(connected.description,'')) CONTAINS term)
+                    {scope_filter_c}
+                    WITH DISTINCT node, max(0.80) AS score
+                    RETURN COALESCE(node.id, elementId(node)) AS node_id,
+                           node.name AS name,
+                           COALESCE(node.description, '') AS description,
+                           COALESCE(node.type, labels(node)[0]) AS type,
+                           score
+                    LIMIT 15
+                """, params)
+                for r in await res.data():
+                    if r["node_id"] not in seen:
+                        all_results.append(r)
+                        seen.add(r["node_id"])
+        except Exception as e:
+            logger.warning(f"[RAG] Relationship-aware search failed: {e}")
 
         # Feature 8: Rerank by relevance × graph centrality
         if all_results:
@@ -366,8 +393,8 @@ class EnhancedRAGService:
                 logger.warning(f"[RAG] Citation reranking failed: {e}")
                 all_results.sort(key=lambda x: x["score"], reverse=True)
 
-        logger.info(f"[RAG] Retrieval: {len(all_results)} results (vector+lexical+reranked)")
-        return {"vector_results": all_results[:20]}
+        logger.info(f"[RAG] Retrieval: {len(all_results)} results (vector+lexical+relationship+reranked)")
+        return {"vector_results": all_results[:25]}
 
     async def _ml_enrichment_node(self, state: EnhancedRAGState) -> Dict[str, Any]:
         """
@@ -484,9 +511,9 @@ RULES:
             return {"strategic_results": []}
 
     async def _graph_expansion_node(self, state: EnhancedRAGState) -> Dict[str, Any]:
-        """Expand via neighbors + paths + Feature 6: include ML similar nodes."""
+        """Deep graph expansion: full entity profiles + paths + aliases."""
         if not state.get("vector_results"):
-            return {"graph_context": {"nodes": [], "relationships": [], "backbone_types": []}}
+            return {"graph_context": {"nodes": [], "relationships": [], "backbone_types": [], "entity_profiles": []}}
 
         # Combine vector results + ML similar nodes for expansion
         node_ids = [r["node_id"] for r in state["vector_results"][:15]]
@@ -496,33 +523,101 @@ RULES:
 
         scope = state.get("scope") or state.get("auto_scope")
         scope_filter = ""
+        scope_filter_2hop = ""
         params: Dict[str, Any] = {"node_ids": node_ids, "sid": None}
         if scope:
             params["sid"] = scope.get("id")
             if scope.get("type") == "folder":
                 scope_filter = "AND (related.folder_id = $sid OR r.folder_id = $sid)"
+                scope_filter_2hop = "AND (hop2.folder_id = $sid OR r2.folder_id = $sid)"
             elif scope.get("type") == "file":
                 scope_filter = "AND ($sid IN related.file_ids OR related.file_id = $sid)"
+                scope_filter_2hop = "AND ($sid IN hop2.file_ids OR hop2.file_id = $sid)"
 
         try:
             nodes = set()
             rels = []
+            entity_profiles = []
 
             async with self.neo4j.session() as session:
-                # Neighbors
-                res1 = await session.run(f"""
+                # ── Deep Entity Profiles: 2-hop traversal ──
+                # For each seed node, get ALL its direct connections AND
+                # the connections of those connections (2 hops deep).
+                # This captures full chains like:
+                #   Herb -> HAS_PROPERTY -> Property -> EXPRESSED_AS -> Quality
+                #   Entity -> ALSO_KNOWN_AS -> Alias
+                #   Herb -> TREATS -> Condition
+                profile_res = await session.run(f"""
                     UNWIND $node_ids AS nodeId
                     MATCH (n) WHERE n.id = nodeId OR elementId(n) = nodeId
-                    OPTIONAL MATCH (n)-[r]-(related)
-                    WHERE related IS NOT NULL {scope_filter}
-                    RETURN n.name AS source_name, type(r) AS rel_type, related.name AS related_name
-                    LIMIT 30
+                    OPTIONAL MATCH (n)-[r1]-(hop1)
+                    WHERE hop1 IS NOT NULL {scope_filter.replace('related', 'hop1').replace(' r.', ' r1.')}
+                    OPTIONAL MATCH (hop1)-[r2]-(hop2)
+                    WHERE hop2 IS NOT NULL AND hop2 <> n {scope_filter_2hop}
+                    WITH n,
+                         collect(DISTINCT {{
+                           name: hop1.name,
+                           type: COALESCE(hop1.type, labels(hop1)[0]),
+                           rel: type(r1),
+                           desc: COALESCE(hop1.description, '')
+                         }}) AS direct_connections,
+                         collect(DISTINCT {{
+                           from_name: hop1.name,
+                           from_rel: type(r1),
+                           name: hop2.name,
+                           type: COALESCE(hop2.type, labels(hop2)[0]),
+                           rel: type(r2),
+                           desc: COALESCE(hop2.description, '')
+                         }}) AS two_hop_connections
+                    RETURN n.name AS entity_name,
+                           COALESCE(n.type, labels(n)[0]) AS entity_type,
+                           COALESCE(n.description, '') AS entity_desc,
+                           direct_connections[..30] AS direct,
+                           two_hop_connections[..30] AS two_hop
                 """, params)
-                for rec in await res1.data():
-                    nodes.add(rec["source_name"])
-                    if rec["related_name"]:
-                        nodes.add(rec["related_name"])
-                        rels.append(f"{rec['source_name']} -[{rec['rel_type']}]-> {rec['related_name']}")
+
+                for rec in await profile_res.data():
+                    entity_name = rec.get("entity_name")
+                    if not entity_name:
+                        continue
+                    nodes.add(entity_name)
+
+                    # Build a structured profile
+                    profile_lines = [f"## {entity_name} [{rec.get('entity_type', 'Entity')}]"]
+                    if rec.get("entity_desc"):
+                        profile_lines.append(f"   Description: {rec['entity_desc']}")
+
+                    # Group direct connections by relationship type
+                    direct_by_rel = {}
+                    for conn in rec.get("direct", []):
+                        if conn.get("name"):
+                            rel_type = conn.get("rel", "RELATED_TO")
+                            if rel_type not in direct_by_rel:
+                                direct_by_rel[rel_type] = []
+                            entry = conn["name"]
+                            if conn.get("desc"):
+                                entry += f" ({conn['desc'][:100]})"
+                            direct_by_rel[rel_type].append(entry)
+                            nodes.add(conn["name"])
+                            rels.append(f"{entity_name} -[{rel_type}]-> {conn['name']}")
+
+                    for rel_type, items in direct_by_rel.items():
+                        profile_lines.append(f"   {rel_type}: {', '.join(items)}")
+
+                    # 2-hop connections (e.g., Property -> EXPRESSED_AS -> Quality)
+                    two_hop_chains = []
+                    for conn2 in rec.get("two_hop", []):
+                        if conn2.get("name") and conn2.get("from_name"):
+                            chain = f"{conn2['from_name']} -[{conn2.get('rel', '?')}]-> {conn2['name']}"
+                            if chain not in two_hop_chains:
+                                two_hop_chains.append(chain)
+                                nodes.add(conn2["name"])
+                                rels.append(f"{entity_name} -> {conn2['from_name']} -[{conn2.get('rel', '?')}]-> {conn2['name']}")
+
+                    if two_hop_chains:
+                        profile_lines.append(f"   Extended connections: {'; '.join(two_hop_chains[:15])}")
+
+                    entity_profiles.append("\n".join(profile_lines))
 
                 # Shortest paths between seed entities
                 res2 = await session.run(f"""
@@ -553,10 +648,16 @@ RULES:
                 """, params)
                 backbone = [r["relationshipType"] for r in await res3.data()]
 
-            return {"graph_context": {"nodes": list(nodes), "relationships": rels, "backbone_types": backbone}}
+            logger.info(f"[RAG] Graph expansion: {len(entity_profiles)} entity profiles, {len(rels)} relationships")
+            return {"graph_context": {
+                "nodes": list(nodes),
+                "relationships": rels,
+                "backbone_types": backbone,
+                "entity_profiles": entity_profiles,
+            }}
         except Exception as e:
             logger.error(f"[RAG] Graph expansion failed: {e}")
-            return {"graph_context": {"nodes": [], "relationships": [], "backbone_types": []}}
+            return {"graph_context": {"nodes": [], "relationships": [], "backbone_types": [], "entity_profiles": []}}
 
     async def _prediction_injection_node(self, state: EnhancedRAGState) -> Dict[str, Any]:
         """
@@ -622,7 +723,7 @@ RULES:
     async def _answer_generation_node(self, state: EnhancedRAGState) -> Dict[str, Any]:
         """
         Generate answer with:
-          Feature 1: Strict context grounding
+          Feature 1: Strict context grounding (database-only)
           Feature 10: Grounding score calculation
         """
         # ── Build context ──
@@ -632,8 +733,15 @@ RULES:
         if state.get("conversation_summary"):
             context_parts.append(f"[Previous conversation context: {state['conversation_summary']}]")
 
-        # Vector results
-        context_parts.append("═══ DATABASE EVIDENCE ═══")
+        # Entity Profiles (the most important part — full structured data per entity)
+        entity_profiles = state.get("graph_context", {}).get("entity_profiles", [])
+        if entity_profiles:
+            context_parts.append("═══ COMPLETE ENTITY PROFILES FROM DATABASE ═══")
+            for profile in entity_profiles:
+                context_parts.append(profile)
+
+        # Vector results (basic list)
+        context_parts.append("\n═══ DATABASE EVIDENCE (Matched Entities) ═══")
         entity_names = []
         for r in state["vector_results"][:15]:
             type_label = r.get("type") or "Entity"
@@ -641,6 +749,14 @@ RULES:
             centrality_note = f" (centrality: {r.get('centrality', 0):.2f})" if r.get("centrality") else ""
             context_parts.append(f"• {r['name']} [{type_label}]{centrality_note}: {desc}")
             entity_names.append(r["name"].lower())
+
+        # Also add entity names from profiles to the grounding check
+        for profile in entity_profiles:
+            for line in profile.split("\n"):
+                if line.startswith("## "):
+                    pname = line.replace("## ", "").split(" [")[0].strip().lower()
+                    if pname and pname not in entity_names:
+                        entity_names.append(pname)
 
         # ML similar nodes (Feature 3+6)
         if state.get("ml_similar_nodes"):
@@ -659,9 +775,13 @@ RULES:
 
         # Graph relationships
         if state.get("graph_context", {}).get("relationships"):
-            context_parts.append("\n═══ GRAPH CONNECTIONS ═══")
-            for rel in state["graph_context"]["relationships"][:15]:
-                context_parts.append(f"• {rel}")
+            context_parts.append("\n═══ GRAPH CONNECTIONS (All Relationship Paths) ═══")
+            # Deduplicate and show up to 40 relationships
+            seen_rels = set()
+            for rel in state["graph_context"]["relationships"][:40]:
+                if rel not in seen_rels:
+                    context_parts.append(f"• {rel}")
+                    seen_rels.add(rel)
 
         # Backbone
         backbone = ", ".join(state.get("graph_context", {}).get("backbone_types", []))
@@ -676,26 +796,59 @@ RULES:
 
         full_context = "\n".join(context_parts)
 
-        # Feature 1: STRICT GROUNDING — ZERO tolerance for generalizing
+        # Feature 1: Strict database grounding + natural language response
         system_prompt = (
-            "You are the Neural Nexus Intelligence Engine. ABSOLUTE RULES:\n\n"
-            "1. **DATABASE ONLY**: You answer STRICTLY from the DATABASE EVIDENCE below. "
-            "Do NOT add any general knowledge, textbook facts, or information from outside the evidence. "
-            "If the evidence contains the answer, present it clearly and completely.\n\n"
-            "2. **NO GENERALIZING**: If the database evidence does NOT contain the answer, "
-            "you MUST say: 'The database does not contain specific information about [topic]. "
-            "However, I found these related entries: [list relevant items from evidence].' "
-            "NEVER fill gaps with general knowledge. NEVER make up information.\n\n"
-            "3. **CONVERSATIONAL**: Be warm and professional. End with a relevant follow-up question "
-            "about something the database DOES have. Example: 'Would you like to explore [topic from evidence]?'\n\n"
-            "4. **MARKDOWN**: Use headers, bullets, bold for clarity.\n\n"
-            "5. **ML INSIGHTS**: If AI Predictions section exists, mention as: 'Our ML model also suggests...'\n\n"
-            "6. **GREETINGS**: For hi/hello, respond warmly and briefly.\n\n"
-            "7. **HONESTY OVER HELPFULNESS**: It is BETTER to say 'this data is not in the database' "
-            "than to guess or generalize. The user trusts you to reflect their data accurately."
+            "You are the Neural Nexus, a brilliant and friendly wellness expert powered EXCLUSIVELY by a knowledge graph database. "
+            "Every piece of information you share MUST come from the provided database evidence. "
+            "You do NOT generate any information from your own training data.\n\n"
+
+            "ABSOLUTE RULES:\n\n"
+
+            "1. **DATABASE-ONLY ANSWERS**: Your answer must come ONLY from the ENTITY PROFILES, DATABASE EVIDENCE, "
+            "and GRAPH CONNECTIONS provided below. If information is in the evidence, USE IT. If it's NOT in the evidence, "
+            "say 'This specific information is not in our database.' Do NOT invent or generalize.\n\n"
+
+            "2. **SEMANTIC MATCHING (CRITICAL)**: The user's phrasing and the database names may differ. "
+            "YOU MUST intelligently match them:\n"
+            "   - User says 'medications for menopause' → Match 'Menopause Relief', 'Hormonal Balance', 'Estrogenic' etc.\n"
+            "   - User says 'what helps with memory' → Match 'Memory Enhancer', 'Brain Tonic', 'Cognitive Support' etc.\n"
+            "   - User says 'stress remedies' → Match 'Stress Relief', 'Adaptogen', 'Calms Nervous System' etc.\n"
+            "   ANY entity in the evidence that semantically relates to the question IS relevant — use it!\n\n"
+
+            "3. **READ THE ENTITY PROFILES CAREFULLY**: The COMPLETE ENTITY PROFILES section contains full details for each entity, "
+            "including ALL their connections (what they treat, their properties, aliases, qualities, etc.). "
+            "Use this structured data to build comprehensive answers. For example, if the profile shows:\n"
+            "   'Shatavari [Herb]\n   TREATS: Menopause Relief\n   HAS_PROPERTY: Estrogenic\n   ALSO_KNOWN_AS: Asparagus Racemosus'\n"
+            "Then when asked about menopause, include Shatavari AND explain its connection pathway.\n\n"
+
+            "4. **FOLLOW ALL CONNECTION PATHS**: When the evidence shows multi-hop connections like:\n"
+            "   'Brahmi -> Brain Tonic -> Memory Enhancer'\n"
+            "   Explain the FULL chain naturally: 'Brahmi is expressed as a Brain Tonic, which directly treats Memory Enhancement.'\n\n"
+
+            "5. **INCLUDE 'ALSO KNOWN AS' / ALIASES**: If the database shows an entity has aliases or alternative names, "
+            "ALWAYS mention them: 'Shatavari (also known as Asparagus Racemosus)...'\n\n"
+
+            "6. **NATURAL, CONVERSATIONAL LANGUAGE**: Write like a knowledgeable friend explaining to a patient. "
+            "Use complete sentences with proper grammar. NO bullet-only lists — explain with context:\n"
+            "   BAD: '• Brahmi - Memory Enhancer'\n"
+            "   GOOD: 'Based on our database, **Brahmi** is specifically linked to memory enhancement. "
+            "It functions as a Brain Tonic and has direct TREATS connections to Memory Enhancer properties.'\n\n"
+
+            "7. **BE COMPREHENSIVE**: If the question matches multiple entities, discuss ALL of them. "
+            "Don't stop at the first match. Group by relevance and explain how each one relates to the question.\n\n"
+
+            "8. **HONEST GAPS**: If the database truly has NO related information, say so clearly and helpfully. "
+            "But FIRST, thoroughly check ALL entity profiles and connections — often the answer is there under a different name.\n\n"
+
+            "9. **ML INSIGHTS**: If AI Predictions are present, mention them naturally as 'Our ML analysis also suggests...'\n\n"
+
+            "10. **FORMATTING**: Use markdown (bold, headers, bullet points) for clarity. Start with a direct answer, "
+            "then provide supporting details.\n\n"
+
+            "11. **GREETINGS**: For hi/hello, respond warmly and briefly describe what you can help with."
         )
 
-        user_prompt = f"Evidence & Knowledge:\n{full_context}\n\nQuestion: {state['question']}"
+        user_prompt = f"Database Evidence & Knowledge Graph Data:\n{full_context}\n\nUser's Question: {state['question']}"
 
         try:
             answer = await self.ai.chat([
@@ -710,20 +863,19 @@ RULES:
             grounding_score = round(grounding_score, 2)
 
             # ── ANTI-HALLUCINATION GATE ──
-            # If grounding is very low (<25%), the LLM is mostly generalizing.
-            # Replace with an honest "not in database" answer.
-            if grounding_score < 0.25 and entity_names:
+            # Only trigger when there's truly NO relevant data at all (<10%).
+            if grounding_score < 0.10 and entity_names:
                 available_items = ", ".join(
                     f"**{r['name']}**" for r in state["vector_results"][:8]
                 )
                 answer = (
-                    f"The database does not contain enough specific information to fully answer "
-                    f"your question about *\"{state['question']}\"*.\n\n"
-                    f"However, here are the closest entries I found:\n"
+                    f"I found some related entries in the knowledge graph, but couldn't build a "
+                    f"detailed answer for *\"{state['question']}\"*.\n\n"
+                    f"Here's what I found that might be relevant:\n"
                     f"- {available_items}\n\n"
                     f"Would you like me to explore any of these in detail?"
                 )
-                grounding_score = 1.0  # This honest answer IS grounded (it's truthful)
+                grounding_score = 1.0
 
             citations = [
                 {

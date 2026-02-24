@@ -1,5 +1,6 @@
 import logging
 import json
+import operator
 from typing import Dict, Any, List, Optional, Annotated, TypedDict
 from langgraph.graph import StateGraph, END
 
@@ -10,6 +11,7 @@ from app.agents.graph_analytics_agent import GraphAnalyticsAgent
 from app.services.graph_reasoning_service import GraphReasoningService
 from app.services.hybrid_rag import HybridRAGService
 from app.services.ai_service import get_ollama_service
+from app.db.connections import get_neo4j_driver
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +25,11 @@ class PipelineState(TypedDict):
     folder_id: str
     
     # Processed Data
-    extracted_indicators: List[Dict[str, Any]]
+    extracted_indicators: Annotated[List[Dict[str, Any]], operator.add]
     safety_report: Dict[str, Any]
-    inferred_states: List[Dict[str, Any]]
+    inferred_states: Annotated[List[Dict[str, Any]], operator.add]
     graph_analytics: Optional[Dict[str, Any]]
-    graph_interventions: List[Dict[str, Any]]
+    graph_interventions: Annotated[List[Dict[str, Any]], operator.add]
     rag_context: Dict[str, Any]
     recommendation: Dict[str, Any]
     
@@ -52,6 +54,10 @@ class ReasoningPipeline:
         self.graph_reasoning = GraphReasoningService()
         self.recommendation_engine = RecommendationEngine()
         
+        # Initialize HybridRAGService for real knowledge retrieval
+        neo4j_driver = get_neo4j_driver()
+        self.rag_service = HybridRAGService(neo4j_driver, ai_service)
+        
         self.workflow = self._build_graph()
 
     def _build_graph(self):
@@ -68,20 +74,19 @@ class ReasoningPipeline:
         graph.add_node("compose_response", self._composition_node)
         graph.add_node("logging", self._logging_node)
         
-        # Define Edges (Parallelized for Speed)
-        graph.set_entry_point("extraction") # Primary chain
-        # Add secondary entry point for parallel analytics
+        # Define Edges
+        graph.set_entry_point("extraction")
+        
+        # Fan out from extraction: safety chain + analytics in parallel
         graph.add_edge("extraction", "safety_check")
+        graph.add_edge("extraction", "graph_analytics")
+        
+        # Safety chain continues sequentially
         graph.add_edge("safety_check", "state_inference")
         graph.add_edge("state_inference", "graph_reasoning")
         
-        # Branch Analytics
-        graph.add_node("analytics_start", lambda x: x) # Sync node
-        graph.set_entry_point("analytics_start")
-        graph.add_edge("analytics_start", "graph_analytics")
-        
-        # Merge Point
-        graph.add_node("parallel_merge", lambda x: x)
+        # Merge point: both parallel branches must complete before continuing
+        graph.add_node("parallel_merge", lambda x: {})
         graph.add_edge("graph_reasoning", "parallel_merge")
         graph.add_edge("graph_analytics", "parallel_merge")
         
@@ -136,12 +141,38 @@ Output JSON: {{"indicators": [{{"name": "...", "type": "...", "level": "High/Nor
         return {"graph_interventions": interventions}
 
     async def _rag_node(self, state: PipelineState) -> Dict[str, Any]:
-        """Step 8: RAG Retrieval."""
-        # Generic retrieval based on interventions
-        query = ", ".join([i["intervention"] for i in state["graph_interventions"][:3]])
-        # Assuming hybrid RAG service is initialized elsewhere or accessible
-        # For now, we'll return a placeholder or mock
-        return {"rag_context": {"references": "Authoritative domain monographs retrieved."}}
+        """Step 8: RAG Retrieval using HybridRAGService."""
+        try:
+            # Use the original user question for RAG - this is critical
+            # for knowledge queries like "What are the symptoms of menopause?"
+            query = state["user_input"]
+            
+            # If we have graph interventions, enrich the query with them
+            if state["graph_interventions"]:
+                intervention_names = ", ".join(
+                    [i["intervention"] for i in state["graph_interventions"][:3]]
+                )
+                query = f"{state['user_input']} (related interventions: {intervention_names})"
+            
+            # Build scope from folder_id
+            scope = {"folder_id": state["folder_id"]} if state.get("folder_id") else None
+            
+            rag_result = await self.rag_service.query(
+                question=query,
+                session_id=state["session_id"],
+                scope=scope
+            )
+            
+            return {
+                "rag_context": {
+                    "answer": rag_result.get("answer", ""),
+                    "citations": rag_result.get("citations", []),
+                    "related_nodes": rag_result.get("related_nodes", []),
+                }
+            }
+        except Exception as e:
+            logger.error(f"RAG enrichment failed: {e}")
+            return {"rag_context": {"answer": "", "citations": [], "error": str(e)}}
 
     async def _recommendation_node(self, state: PipelineState) -> Dict[str, Any]:
         """Step 9: Recommendation Engine (Dose sizing)."""
@@ -162,22 +193,35 @@ Output JSON: {{"indicators": [{{"name": "...", "type": "...", "level": "High/Nor
         if state["safety_report"].get("status") == "DANGEROUS":
             response = f"⚠️ EMERGENCY ALERT: {state['safety_report'].get('reason')}. {state['safety_report'].get('advice')}"
         else:
-            prompt = f"""Compose a patient-safe response based SOLELY on the provided data:
-Indicators: {state['extracted_indicators']}
+            # Extract the RAG answer if available
+            rag_answer = ""
+            rag_citations = []
+            if isinstance(state.get("rag_context"), dict):
+                rag_answer = state["rag_context"].get("answer", "")
+                rag_citations = state["rag_context"].get("citations", [])
+            
+            prompt = f"""You are a knowledgeable assistant. The user asked: "{state['user_input']}"
+
+Below is all the data gathered from the knowledge graph and RAG system. Use it to compose a comprehensive, accurate response.
+
+--- RETRIEVED DATA ---
+RAG Answer: {rag_answer}
+RAG Citations: {rag_citations}
+Extracted Indicators: {state['extracted_indicators']}
 Inferred States: {state['inferred_states']}
 Graph Analytics (Structural Insights): {state['graph_analytics']}
-Interventions: {state['graph_interventions']}
-RAG Context: {state['rag_context']}
+Graph Interventions: {state['graph_interventions']}
 Recommendation: {state['recommendation']}
+--- END DATA ---
 
-### STRICT COMPLIANCE RULES:
-1. **NO EXTERNAL KNOWLEDGE**: Do NOT include information not explicitly mentioned in the RAG Context or Graph Interventions.
-2. **NO HALLUCINATIONS**: Only report relationships and properties found in the provided Graph Analytics and Interventions.
-3. **GROUNDING**: If the provided data is insufficient to answer a specific part of the user's query, state that the information is not available in the current knowledge graph.
-4. **DIAGNOSTIC FEEDBACK**: If the Graph Interventions or Inferred States suggest a condition but some critical symptoms are missing, explicitly ask the user about those specific connected symptoms found in the Graph.
-5. **SAFETY**: Be professional, empathetic, and always include safety precautions.
-6. **EXPLAINING ANALYTICS**: If structural analytics (PageRank, Centrality, etc.) are present, explain their significance based ONLY on the provided results.
-7. **CITATIONS**: Cite references from the RAG context for every claim.
+### RESPONSE RULES:
+1. **PRIORITIZE RAG ANSWER**: If the RAG Answer contains relevant information, use it as the primary basis for your response.
+2. **SUPPLEMENT WITH GRAPH DATA**: Enrich the response with Graph Interventions, Analytics, and Inferred States where available.
+3. **NO HALLUCINATIONS**: Only report information found in the provided data above.
+4. **GROUNDING**: If the provided data is insufficient to fully answer the user's query, state what information is available and what is not found in the current knowledge graph.
+5. **SAFETY**: Be professional, empathetic, and always include safety precautions where relevant.
+6. **CITATIONS**: Cite references from the RAG citations for claims when available.
+7. **EXPLAINING ANALYTICS**: If structural analytics (PageRank, Centrality, etc.) are present, explain their significance based ONLY on the provided results.
 """
             response = await self.ai.chat([{"role": "user", "content": prompt}])
             
