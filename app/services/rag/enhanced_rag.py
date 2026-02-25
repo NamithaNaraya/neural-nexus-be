@@ -168,7 +168,9 @@ class EnhancedRAGService:
 
     async def _smart_scope_node(self, state: EnhancedRAGState) -> Dict[str, Any]:
         """Feature 7: Auto-detect scope from question if not provided."""
+        logger.info("[EnhancedRAG] Entering _smart_scope_node")
         if state.get("scope"):
+            logger.info(f"[EnhancedRAG] Scope already provided: {state['scope']}")
             return {"auto_scope": state["scope"]}
 
         question_lower = state["question"].lower()
@@ -218,6 +220,7 @@ class EnhancedRAGService:
 
     async def _clarification_node(self, state: EnhancedRAGState) -> Dict[str, Any]:
         """Feature 2: Detect vague queries and ask for clarification."""
+        logger.info("[EnhancedRAG] Entering _clarification_node")
         question = state["question"].strip()
         words = [w for w in question.split() if len(w) > 1]
 
@@ -278,7 +281,10 @@ class EnhancedRAGService:
         Hybrid search: Vector (semantic) + Lexical (keyword) + Relationship-aware.
         Feature 8: Rerank by relevance × centrality.
         """
+        logger.info(f"[EnhancedRAG] Entering _vector_search_node for: '{state['question'][:60]}...'")
+        logger.info("[EnhancedRAG] Generating embedding via Ollama...")
         question_embedding = await self.ai.embed(state["question"])
+        logger.info(f"[EnhancedRAG] Embedding generated ({len(question_embedding)} dims)")
 
         params = {
             "terms": [w.strip("?,.!").lower() for w in state["question"].split() if len(w) > 2][:10],
@@ -405,6 +411,7 @@ class EnhancedRAGService:
         Combined: Deep graph expansion + ML enrichment + prediction injection.
         All in one step to avoid sequential overhead.
         """
+        logger.info(f"[EnhancedRAG] Entering _graph_expansion_node with {len(state.get('vector_results', []))} vector results")
         import asyncio
         import time as _time
 
@@ -635,6 +642,7 @@ class EnhancedRAGService:
           Feature 1: Strict context grounding (database-only)
           Feature 10: Grounding score calculation
         """
+        logger.info(f"[EnhancedRAG] Entering _answer_generation_node with {len(state.get('vector_results', []))} vector results")
         # ── Build context ──
         context_parts = []
 
@@ -844,9 +852,35 @@ class EnhancedRAGService:
             "error": None,
         }
 
+        # Quick-response for greetings and simple chat — no need for full RAG pipeline
+        greeting_words = {"hi", "hello", "hey", "howdy", "thanks", "thank", "bye", "goodbye", "good morning", "good evening"}
+        clean_q = question.strip().lower().rstrip("!.,?")
+        if clean_q in greeting_words or len(clean_q.split()) <= 2 and any(g in clean_q for g in greeting_words):
+            logger.info(f"[EnhancedRAG] Greeting detected: '{question}' — fast LLM response")
+            try:
+                answer = await self.ai.chat([
+                    {"role": "system", "content": "You are a friendly, helpful knowledge assistant for an Ayurveda research database. Respond warmly and briefly to greetings, and tell the user what you can help with (searching their uploaded data, answering questions about herbs, properties, conditions, etc). Keep it to 2-3 sentences."},
+                    {"role": "user", "content": question}
+                ])
+                return {
+                    "answer": answer,
+                    "citations": [],
+                    "related_nodes": [],
+                    "grounding_score": 1.0,
+                    "needs_clarification": False,
+                    "ml_insights_count": 0,
+                    "predictions_count": 0,
+                }
+            except Exception as e:
+                logger.error(f"[EnhancedRAG] Greeting response failed: {e}")
+
         try:
+            import asyncio
             logger.info(f"[EnhancedRAG] Starting LangGraph ainvoke for session {session_id}")
-            result = await self.graph.ainvoke(initial_state)
+            result = await asyncio.wait_for(
+                self.graph.ainvoke(initial_state),
+                timeout=60.0  # 60 second timeout to prevent infinite hang
+            )
             logger.info(f"[EnhancedRAG] LangGraph ainvoke completed for session {session_id}")
             return {
                 "answer": result.get("answer", "No answer generated"),
@@ -857,8 +891,16 @@ class EnhancedRAGService:
                 "ml_insights_count": len(result.get("ml_similar_nodes", [])),
                 "predictions_count": len(result.get("prediction_context", [])),
             }
+        except asyncio.TimeoutError:
+            logger.error(f"[EnhancedRAG] Pipeline timed out after 60s for session {session_id}")
+            return {
+                "answer": "I'm sorry, the query took longer than expected. Please try a simpler or more specific question.",
+                "citations": [],
+                "related_nodes": [],
+                "grounding_score": 0.0,
+            }
         except Exception as e:
-            logger.error(f"Enhanced RAG pipeline failed: {e}")
+            logger.error(f"Enhanced RAG pipeline failed: {e}", exc_info=True)
             return {
                 "answer": f"Error: {e}",
                 "citations": [],
