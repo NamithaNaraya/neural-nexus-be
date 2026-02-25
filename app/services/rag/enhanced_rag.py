@@ -128,6 +128,7 @@ class EnhancedRAGService:
 
     async def _load_context_node(self, state: EnhancedRAGState) -> Dict[str, Any]:
         """Load history + Feature 9: compress old history into summary."""
+        logger.info("[EnhancedRAG] Entering _load_context_node")
         history = state.get("history", [])
         summary = ""
 
@@ -844,7 +845,9 @@ class EnhancedRAGService:
         }
 
         try:
+            logger.info(f"[EnhancedRAG] Starting LangGraph ainvoke for session {session_id}")
             result = await self.graph.ainvoke(initial_state)
+            logger.info(f"[EnhancedRAG] LangGraph ainvoke completed for session {session_id}")
             return {
                 "answer": result.get("answer", "No answer generated"),
                 "citations": result.get("citations", []),

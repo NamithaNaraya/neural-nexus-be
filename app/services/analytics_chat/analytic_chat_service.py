@@ -18,8 +18,12 @@ class AnalyticChatService:
         Processes a natural language query by deciding and running a graph algorithm.
         Always scoped to the active folder/selected nodes — never runs on the full database.
         """
+        logger.info(f"[AnalyticChat] process_query: query='{query}', folder_id={folder_id}, node_ids={node_ids}")
+        
         # 0. Gather scope context for the LLM
-        scope_info = await self._get_scope_context(folder_id, node_ids)
+        scope_info, available_types = await self._get_scope_context(folder_id, node_ids)
+        logger.info(f"[AnalyticChat] Scope context: {scope_info}")
+        logger.info(f"[AnalyticChat] Available types: {available_types}")
 
         # 1. Decide which algorithm to use (with scope awareness)
         decision = await self._decide_algorithm(query, scope_info)
@@ -28,19 +32,22 @@ class AnalyticChatService:
         entities_to_resolve = decision.get("entities", [])
         
         # 2. Resolve entities if mentioned by name
+        # IMPORTANT: Resolved entities are for CONTEXT only, not for scoping the projection.
+        # The projection should always use the full folder_id scope (or user-selected nodes).
+        # Only the "path" algorithm needs specific node IDs to find shortest path between them.
         resolved_node_ids = []
         if entities_to_resolve:
             resolved_node_ids = await self._resolve_entities(entities_to_resolve, folder_id)
-            if node_ids:
-                node_ids = list(set(node_ids + resolved_node_ids))
-            else:
-                node_ids = resolved_node_ids
+            logger.info(f"[AnalyticChat] Resolved entities: {entities_to_resolve} -> {resolved_node_ids}")
+
+        # Keep original user-selected node_ids for projection scoping (from UI selection)
+        scope_node_ids = node_ids  # These come from the frontend (user clicked on nodes)
 
         if not algo_name or algo_name == "none":
             # Fallback to standard chat
             answer = await self.ai.chat([
                 {"role": "system", "content": "You are a graph analytics assistant. Answer the user's question accurately based ONLY on the selected dataset. If they mention specific entities, use the context provided."},
-                {"role": "user", "content": f"Context: {scope_info}\nResolved Entities={node_ids}\nQuestion: {query}"}
+                {"role": "user", "content": f"Context: {scope_info}\nResolved Entities={resolved_node_ids}\nQuestion: {query}"}
             ])
             return {
                 "answer": answer,
@@ -49,9 +56,24 @@ class AnalyticChatService:
                 "resolved_entities": resolved_node_ids
             }
 
-        # 3. Run the chosen algorithm (scoped)
+        # 3. Run the chosen algorithm (scoped to folder or user-selected nodes)
         target_type = decision.get("target_type")
-        results = await self._run_algorithm(algo_name, folder_id, node_ids, params, target_type)
+        
+        # Validate target_type: if it doesn't match any available type, don't filter
+        # (e.g. LLM picks "Herb" but data only has "Entity" — filtering would return 0)
+        if target_type and available_types:
+            type_match = any(t.lower() == target_type.lower() for t in available_types)
+            if not type_match:
+                logger.warning(f"[AnalyticChat] target_type '{target_type}' not found in available types {available_types} — removing filter")
+                target_type = None
+        
+        # For "path" algorithm, we need the resolved entity IDs as start/end points
+        if algo_name == "path" and resolved_node_ids and len(resolved_node_ids) >= 2:
+            algo_node_ids = resolved_node_ids
+        else:
+            algo_node_ids = scope_node_ids  # Use original UI selection, NOT resolved entities
+        
+        results = await self._run_algorithm(algo_name, folder_id, algo_node_ids, params, target_type)
         
         # 4. Generate response (scope-aware)
         answer = await self._interpret_results(query, algo_name, results, scope_info)
@@ -64,31 +86,34 @@ class AnalyticChatService:
             "resolved_entities": resolved_node_ids
         }
 
-    async def _get_scope_context(self, folder_id: Optional[str], node_ids: Optional[List[str]]) -> str:
-        """Builds a human-readable scope description for the LLM."""
+    async def _get_scope_context(self, folder_id: Optional[str], node_ids: Optional[List[str]]) -> tuple:
+        """Builds a human-readable scope description for the LLM. Returns (scope_info_str, available_types_list)."""
         parts = []
+        available_types = []
         async with self.driver.session() as session:
             if folder_id:
-                # Count nodes in this folder
+                # Count ALL nodes in this folder (not just Entity label)
                 result = await session.run(
-                    "MATCH (n:Entity) WHERE n.folder_id = $fid RETURN count(n) AS cnt",
+                    "MATCH (n) WHERE n.folder_id = $fid RETURN count(n) AS cnt",
                     fid=folder_id
                 )
                 rec = await result.single()
                 count = rec["cnt"] if rec else 0
                 # Get available types in this folder
                 type_result = await session.run(
-                    "MATCH (n:Entity) WHERE n.folder_id = $fid RETURN DISTINCT coalesce(n.type, labels(n)[0]) AS t, count(n) AS c ORDER BY c DESC LIMIT 10",
+                    "MATCH (n) WHERE n.folder_id = $fid RETURN DISTINCT coalesce(n.type, labels(n)[0]) AS t, count(n) AS c ORDER BY c DESC LIMIT 10",
                     fid=folder_id
                 )
                 types_data = await type_result.data()
+                available_types = [t['t'] for t in types_data if t['t']]
                 type_summary = ", ".join([f"{t['t']}({t['c']})" for t in types_data])
                 parts.append(f"Active folder: {folder_id} with {count} nodes. Types: [{type_summary}]")
             elif node_ids:
                 parts.append(f"Selected {len(node_ids)} specific nodes")
             else:
                 parts.append("No folder selected — using the full database")
-        return "; ".join(parts) if parts else "Full database"
+        scope_str = "; ".join(parts) if parts else "Full database"
+        return scope_str, available_types
 
     async def _resolve_entities(self, names: List[str], folder_id: Optional[str]) -> List[str]:
         """Finds node IDs for names mentioned in a query, scoped to folder."""
@@ -150,24 +175,35 @@ class AnalyticChatService:
     async def _run_algorithm(self, algo: str, folder_id: Optional[str], node_ids: Optional[List[str]], params: Dict[str, Any], target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """Executes the selected algorithm via GDSService."""
         top_k = params.get("top_k", 10)
+        logger.info(f"[AnalyticChat] Running algorithm '{algo}' | folder_id={folder_id} | node_ids={node_ids} | top_k={top_k} | target_type={target_type}")
         
         try:
             if algo == "pagerank":
-                return await self.gds.run_pagerank(folder_id, node_ids, top_k=top_k, target_type=target_type)
+                results = await self.gds.run_pagerank(folder_id, node_ids, top_k=top_k, target_type=target_type)
             elif algo == "betweenness":
-                return await self.gds.run_betweenness(folder_id, node_ids, top_k=top_k, target_type=target_type)
+                results = await self.gds.run_betweenness(folder_id, node_ids, top_k=top_k, target_type=target_type)
             elif algo == "closeness":
-                return await self.gds.run_closeness(folder_id, node_ids, top_k=top_k, target_type=target_type)
+                results = await self.gds.run_closeness(folder_id, node_ids, top_k=top_k, target_type=target_type)
             elif algo == "louvain":
-                return await self.gds.run_louvain(folder_id, node_ids, target_type=target_type)
+                results = await self.gds.run_louvain(folder_id, node_ids, target_type=target_type)
             elif algo == "wcc":
-                return await self.gds.run_wcc(folder_id, node_ids, target_type=target_type)
+                results = await self.gds.run_wcc(folder_id, node_ids, target_type=target_type)
             elif algo == "path":
                 if node_ids and len(node_ids) >= 2:
-                    return await self._run_shortest_path(node_ids[0], node_ids[1])
-            return []
+                    results = await self._run_shortest_path(node_ids[0], node_ids[1])
+                else:
+                    logger.warning(f"[AnalyticChat] Path algorithm requires at least 2 node_ids, got: {node_ids}")
+                    results = []
+            else:
+                logger.warning(f"[AnalyticChat] Unknown algorithm: {algo}")
+                results = []
+            
+            logger.info(f"[AnalyticChat] Algorithm '{algo}' returned {len(results)} results")
+            if results:
+                logger.info(f"[AnalyticChat] Sample result: {results[0]}")
+            return results
         except Exception as e:
-            logger.error(f"Algorithm execution failed: {e}")
+            logger.error(f"[AnalyticChat] Algorithm '{algo}' execution FAILED: {e}", exc_info=True)
             return []
 
     async def _run_shortest_path(self, start_id: str, end_id: str) -> List[Dict[str, Any]]:

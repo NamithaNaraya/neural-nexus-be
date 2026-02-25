@@ -15,6 +15,7 @@ class GDSService:
     def __init__(self):
         self.driver = get_neo4j_driver()
         self.active_projections = set()
+        self._needs_refresh = True  # Force refresh on first run to clear stale Entity-only projections
 
     def _get_graph_name(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, undirected: bool = False) -> str:
         """Generate a consistent graph name for a given scope."""
@@ -31,13 +32,14 @@ class GDSService:
         check = await session.run("CALL gds.graph.exists($name) YIELD exists RETURN exists", name=global_name)
         rec = await check.single()
         if rec and rec["exists"]:
+            logger.info(f"Global undirected projection '{global_name}' already exists, reusing.")
             return global_name
         
         logger.info(f"Creating global undirected native projection: {global_name}")
         await session.run(f"""
             CALL gds.graph.project(
                 $name,
-                'Entity',
+                '*',
                 {{
                     _ALL_: {{
                         type: '*',
@@ -64,6 +66,12 @@ class GDSService:
         For undirected + scoped (folder/nodes): returns the global native UNDIRECTED
         projection. Algorithm callers must filter results by folder_id/node_ids.
         """
+        # On first run, clear all stale projections (they may use old Entity-only label)
+        if self._needs_refresh:
+            logger.info("[GDS] First run — invalidating all stale projections")
+            await self.invalidate_all()
+            self._needs_refresh = False
+        
         graph_name = self._get_graph_name(folder_id, node_ids, undirected)
         
         async with self.driver.session() as session:
@@ -98,11 +106,12 @@ class GDSService:
                     
                 elif node_ids:
                     # Directed Cypher projection for specific nodes (highest priority)
+                    logger.info(f"Creating Cypher projection for {len(node_ids)} specific nodes")
                     await session.run("""
                         CALL gds.graph.project.cypher(
                             $name,
-                            'MATCH (n:Entity) WHERE n.id IN $node_ids RETURN id(n) AS id, labels(n) AS labels',
-                            'MATCH (a:Entity)-[r]->(b:Entity) 
+                            'MATCH (n) WHERE n.id IN $node_ids RETURN id(n) AS id, labels(n) AS labels',
+                            'MATCH (a)-[r]->(b) 
                              WHERE a.id IN $node_ids AND b.id IN $node_ids 
                              RETURN id(a) AS source, id(b) AS target, type(r) AS type, 
                                     coalesce(r.strength, 1.0) AS weight',
@@ -111,11 +120,12 @@ class GDSService:
                     """, name=graph_name, node_ids=node_ids)
                 elif folder_id:
                     # Directed Cypher projection for folder scope
+                    logger.info(f"Creating Cypher projection for folder: {folder_id}")
                     await session.run("""
                         CALL gds.graph.project.cypher(
                             $name,
-                            'MATCH (n:Entity) WHERE n.folder_id = $folder_id RETURN id(n) AS id, labels(n) AS labels',
-                            'MATCH (a:Entity)-[r]->(b:Entity) 
+                            'MATCH (n) WHERE n.folder_id = $folder_id RETURN id(n) AS id, labels(n) AS labels',
+                            'MATCH (a)-[r]->(b) 
                              WHERE a.folder_id = $folder_id AND b.folder_id = $folder_id 
                              RETURN id(a) AS source, id(b) AS target, type(r) AS type, 
                                     coalesce(r.strength, 1.0) AS weight',
@@ -125,10 +135,11 @@ class GDSService:
                 else:
                     # Native projection for full graph (fastest)
                     orientation = "UNDIRECTED" if undirected else "NATURAL"
+                    logger.info(f"Creating native projection with orientation={orientation}")
                     await session.run(f"""
                         CALL gds.graph.project(
                             $name,
-                            'Entity',
+                            '*',
                             {{
                                 _ALL_: {{
                                     type: '*',
@@ -177,40 +188,47 @@ class GDSService:
     # === GDS Algorithm Implementations ===
 
     async def run_pagerank(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        logger.info(f"[GDS] run_pagerank: folder_id={folder_id}, node_ids={node_ids}, top_k={top_k}, target_type={target_type}")
         graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
+        logger.info(f"[GDS] Using projection: {graph_name}")
         query = """
             CALL gds.pageRank.stream($graph_name)
             YIELD nodeId, score
             WITH gds.util.asNode(nodeId) AS node, score
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($node_ids IS NULL OR node.id IN $node_ids)
-            AND ($target_type IS NULL OR toLower(node.type) = toLower($target_type))
-            RETURN node.id AS id, node.name AS name, node.type AS type, score
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
             ORDER BY score DESC
             LIMIT $top_k
         """
         async with self.driver.session() as session:
-            result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id, node_ids=node_ids)
-            return await result.data()
+            result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id)
+            data = await result.data()
+            logger.info(f"[GDS] PageRank returned {len(data)} results")
+            return data
 
     async def run_betweenness(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        logger.info(f"[GDS] run_betweenness: folder_id={folder_id}, node_ids={node_ids}, top_k={top_k}, target_type={target_type}")
         graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
+        logger.info(f"[GDS] Using projection: {graph_name}")
         query = """
             CALL gds.betweenness.stream($graph_name)
             YIELD nodeId, score
             WITH gds.util.asNode(nodeId) AS node, score
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($node_ids IS NULL OR node.id IN $node_ids)
-            AND ($target_type IS NULL OR toLower(node.type) = toLower($target_type))
-            RETURN node.id AS id, node.name AS name, node.type AS type, score
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
             ORDER BY score DESC
             LIMIT $top_k
         """
         async with self.driver.session() as session:
-            result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id, node_ids=node_ids)
-            return await result.data()
+            result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id)
+            data = await result.data()
+            logger.info(f"[GDS] Betweenness returned {len(data)} results")
+            return data
 
     async def run_closeness(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        logger.info(f"[GDS] run_closeness: folder_id={folder_id}, top_k={top_k}, target_type={target_type}")
         graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
         query = """
             CALL gds.closeness.stream($graph_name)
@@ -218,47 +236,52 @@ class GDSService:
             WITH gds.util.asNode(nodeId) AS node, score
             WHERE score > 0
             AND ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($node_ids IS NULL OR node.id IN $node_ids)
-            AND ($target_type IS NULL OR toLower(node.type) = toLower($target_type))
-            RETURN node.id AS id, node.name AS name, node.type AS type, score
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
             ORDER BY score DESC
             LIMIT $top_k
         """
         async with self.driver.session() as session:
-            result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id, node_ids=node_ids)
-            return await result.data()
+            result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id)
+            data = await result.data()
+            logger.info(f"[GDS] Closeness returned {len(data)} results")
+            return data
 
     async def run_louvain(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        logger.info(f"[GDS] run_louvain: folder_id={folder_id}, target_type={target_type}")
         graph_name = await self.ensure_projection(folder_id, node_ids, undirected=True)
         query = """
             CALL gds.louvain.stream($graph_name)
             YIELD nodeId, communityId
             WITH gds.util.asNode(nodeId) AS node, communityId
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($node_ids IS NULL OR node.id IN $node_ids)
-            AND ($target_type IS NULL OR toLower(node.type) = toLower($target_type))
-            RETURN node.id AS id, node.name AS name, node.type AS type, communityId AS community_id
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, communityId AS community_id
             ORDER BY community_id ASC
         """
         async with self.driver.session() as session:
-            result = await session.run(query, graph_name=graph_name, folder_id=folder_id, node_ids=node_ids, target_type=target_type)
-            return await result.data()
+            result = await session.run(query, graph_name=graph_name, folder_id=folder_id, target_type=target_type)
+            data = await result.data()
+            logger.info(f"[GDS] Louvain returned {len(data)} results")
+            return data
 
     async def run_wcc(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        logger.info(f"[GDS] run_wcc: folder_id={folder_id}, target_type={target_type}")
         graph_name = await self.ensure_projection(folder_id, node_ids, undirected=True)
         query = """
             CALL gds.wcc.stream($graph_name)
             YIELD nodeId, componentId
             WITH gds.util.asNode(nodeId) AS node, componentId
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($node_ids IS NULL OR node.id IN $node_ids)
-            AND ($target_type IS NULL OR toLower(node.type) = toLower($target_type))
-            RETURN node.id AS id, node.name AS name, node.type AS type, componentId AS community_id
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, componentId AS community_id
             ORDER BY community_id ASC
         """
         async with self.driver.session() as session:
-            result = await session.run(query, graph_name=graph_name, folder_id=folder_id, node_ids=node_ids, target_type=target_type)
-            return await result.data()
+            result = await session.run(query, graph_name=graph_name, folder_id=folder_id, target_type=target_type)
+            data = await result.data()
+            logger.info(f"[GDS] WCC returned {len(data)} results")
+            return data
 
 # Dependency
 _gds_service = None

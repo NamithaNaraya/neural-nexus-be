@@ -92,6 +92,7 @@ async def run_query(
                 history = [dict(r) for r in reversed(hist_result.mappings().all())]
 
         # 2. Execute query via LangGraph-powered RAG Service
+        logger.info(f"Initiating RAG service query for session: {session_id}")
         result = await rag_service.query(
             question=request.question,
             session_id=session_id,
