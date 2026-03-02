@@ -314,14 +314,15 @@ class GraphService:
         Uses apoc.refactor.setType for efficiency.
         """
         # Sanitize new_type
-        new_type = new_type.upper().replace(" ", "_").replace("-", "_")
+        sanitized_new_type = new_type.upper().replace(" ", "_").replace("-", "_")
         
         # Build dynamic query parts
         where_clauses = []
-        params = {"new_type": new_type, "folder_id": folder_id, "file_id": file_id}
+        params = {"new_type": sanitized_new_type, "folder_id": folder_id, "file_id": file_id}
         
         if folder_id:
-            where_clauses.append("a.folder_id = $folder_id")
+            # Handle both property naming conventions
+            where_clauses.append("(a.folder_id = $folder_id OR a.folderId = $folder_id)")
         if file_id:
             # Check if relationship has this file_id in its metadata
             where_clauses.append("$file_id IN r.file_ids")
@@ -329,11 +330,14 @@ class GraphService:
         scope_filter = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
         
         async with self.driver.session() as session:
+            # We use backticks around old_type to handle spaces or special characters
+            # and we update the redundant 'type' property on the new relationship
             result = await session.run(f"""
-                MATCH (a)-[r:{old_type}]->(b)
+                MATCH (a)-[r:`{old_type}`]->(b)
                 {scope_filter}
                 WITH r, $new_type AS nt
                 CALL apoc.refactor.setType(r, nt) YIELD output
+                SET output.type = nt
                 RETURN count(*) AS count
             """, params)
             
@@ -352,15 +356,15 @@ class GraphService:
         Handles type changes via apoc.refactor.setType and property updates via SET.
         """
         async with self.driver.session() as session:
-            # 1. Update type if provided
             if new_type:
-                new_type = new_type.upper().replace(" ", "_").replace("-", "_")
+                sanitized_new_type = new_type.upper().replace(" ", "_").replace("-", "_")
                 await session.run("""
                     MATCH ()-[r]->()
                     WHERE r.id = $rel_id
                     CALL apoc.refactor.setType(r, $new_type) YIELD output
+                    SET output.type = $new_type
                     RETURN count(output)
-                """, rel_id=relationship_id, new_type=new_type)
+                """, rel_id=relationship_id, new_type=sanitized_new_type)
 
             # 2. Update properties if provided
             set_clauses = []
