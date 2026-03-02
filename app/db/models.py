@@ -109,6 +109,55 @@ class User(Base):
     )
 
 
+class FolderPermissionDB(Base):
+    """
+    Folder sharing / permission model.
+
+    Tracks which users have been granted access to which folders.
+    Permission levels: 'read' (view only) or 'write' (can edit nodes/relationships).
+    """
+    __tablename__ = "folder_permissions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    folder_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("folders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    permission: Mapped[str] = mapped_column(
+        String(20),
+        default="read",
+    )
+    granted_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id"),
+        nullable=True,
+    )
+    granted_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+    )
+
+    # Relationships
+    folder: Mapped["Folder"] = relationship("Folder", foreign_keys=[folder_id])
+    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
+
+    __table_args__ = (
+        Index("idx_fp_folder", "folder_id"),
+        Index("idx_fp_user", "user_id"),
+        CheckConstraint("permission IN ('read', 'write', 'admin')", name="valid_folder_permission"),
+    )
+
+
 class Folder(Base):
     """
     Folder/Topic model.

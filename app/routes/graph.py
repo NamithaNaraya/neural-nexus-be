@@ -12,9 +12,10 @@ import logging
 from app.core.security import get_current_user
 from app.services.cache_service import get_cache_service, CacheService
 from app.services.gds_service import get_gds_service, GDSService
-from app.db.connections import get_neo4j
+from app.db.connections import get_neo4j, get_postgres_session
 from app.core.config import settings
 from app.utils.graph_utils import get_node_type, get_node_name, clean_label
+from sqlalchemy import text
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -128,6 +129,45 @@ class MergeNodesRequest(BaseModel):
 
 
 # === Utilities ===
+
+async def check_folder_write_permission(folder_id: Optional[str], user_id: str) -> None:
+    """
+    Verify the user has write permission for the given folder.
+    Owners and users with 'write' permission pass; 'read'-only users get 403.
+    If folder_id is None, we skip the check (global operations).
+    """
+    if not folder_id:
+        return  # Can't enforce without knowing the folder
+    
+    async with get_postgres_session() as session:
+        # Check if user is the owner
+        owner_check = await session.execute(
+            text("SELECT id FROM neural_nexus.folders WHERE id = :fid AND user_id = :uid"),
+            {"fid": folder_id, "uid": user_id}
+        )
+        if owner_check.fetchone():
+            return  # Owner — full access
+        
+        # Check shared permission level
+        perm_check = await session.execute(
+            text("""
+                SELECT permission FROM neural_nexus.folder_permissions 
+                WHERE folder_id = :fid AND user_id = :uid
+            """),
+            {"fid": folder_id, "uid": user_id}
+        )
+        row = perm_check.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=403, detail="You do not have access to this folder.")
+        
+        if row.permission == 'read':
+            raise HTTPException(
+                status_code=403, 
+                detail="You have view-only access to this folder. Contact the owner for edit permissions."
+            )
+
+
 def serialize_neo4j_values(data: Any) -> Any:
     """Recursively convert Neo4j types to JSON-serializable Python types."""
     if isinstance(data, dict):
@@ -858,6 +898,9 @@ async def create_node(
     import uuid
     from datetime import datetime
     
+    # Permission check: only owners and editors can create nodes
+    await check_folder_write_permission(request.folder_id, current_user["id"])
+    
     try:
         node_id = str(uuid.uuid4())
         
@@ -933,6 +976,13 @@ async def update_node(
     from datetime import datetime
     
     try:
+        # Look up the folder_id from the node to check permission
+        folder_query = "MATCH (n) WHERE n.id = $node_id RETURN n.folder_id as folder_id"
+        folder_result = await neo4j.execute_query(folder_query, {"node_id": node_id})
+        if folder_result.records:
+            fid = folder_result.records[0].get("folder_id")
+            await check_folder_write_permission(fid, current_user["id"])
+        
         # Build SET clauses for provided fields
         set_clauses = []
         params = {"node_id": node_id}
@@ -1008,6 +1058,13 @@ async def delete_node(
 ) -> Dict[str, Any]:
     """Delete an entity node."""
     try:
+        # Look up the folder_id from the node to check permission
+        folder_query = "MATCH (n) WHERE n.id = $node_id RETURN n.folder_id as folder_id"
+        folder_result = await neo4j.execute_query(folder_query, {"node_id": node_id})
+        if folder_result.records:
+            fid = folder_result.records[0].get("folder_id")
+            await check_folder_write_permission(fid, current_user["id"])
+        
         # First check if node exists
         check_query = "MATCH (n) WHERE n.id = $node_id RETURN n"
         check_result = await neo4j.execute_query(check_query, {"node_id": node_id})
@@ -1058,6 +1115,13 @@ async def create_relationship(
     
     try:
         rel_id = str(uuid.uuid4())
+        
+        # Look up the folder from the source node to check permission
+        folder_query = "MATCH (n:Entity) WHERE n.id = $source_id RETURN n.folder_id as folder_id"
+        folder_result = await neo4j.execute_query(folder_query, {"source_id": request.source_id})
+        if folder_result.records:
+            fid = folder_result.records[0].get("folder_id")
+            await check_folder_write_permission(fid, current_user["id"])
         
         # Sanitize relationship type (Neo4j relationship types must be uppercase/underscore)
         rel_type = request.type.upper().replace(" ", "_").replace("-", "_")

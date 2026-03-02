@@ -99,13 +99,14 @@ async def get_extraction_preview(
     user_id = current_user["id"]
     
     async with get_postgres_session() as session:
-        # Verify file belongs to user and is pending review
+        # Verify file belongs to user (owner or shared)
         result = await session.execute(
             text("""
                 SELECT f.id, f.filename, f.status, f.folder_id
                 FROM neural_nexus.files f
                 JOIN neural_nexus.folders fo ON fo.id = f.folder_id
-                WHERE f.id = :file_id AND fo.user_id = :user_id
+                LEFT JOIN neural_nexus.folder_permissions fp ON fp.folder_id = fo.id AND fp.user_id = :user_id
+                WHERE f.id = :file_id AND (fo.user_id = :user_id OR fp.user_id IS NOT NULL)
             """),
             {"file_id": file_id, "user_id": user_id}
         )
@@ -616,7 +617,8 @@ async def get_file_status(
                 SELECT f.id, f.status, f.node_count, f.relationship_count, f.progress, f.error_message
                 FROM neural_nexus.files f
                 JOIN neural_nexus.folders fo ON fo.id = f.folder_id
-                WHERE f.id = :file_id AND fo.user_id = :user_id
+                LEFT JOIN neural_nexus.folder_permissions fp ON fp.folder_id = fo.id AND fp.user_id = :user_id
+                WHERE f.id = :file_id AND (fo.user_id = :user_id OR fp.user_id IS NOT NULL)
             """),
             {"file_id": file_id, "user_id": user_id}
         )
@@ -647,13 +649,14 @@ async def delete_file(
     user_id = current_user["id"]
     
     async with get_postgres_session() as session:
-        # Verify file belongs to user
+        # Verify file belongs to user (owner or shared with write permission)
         result = await session.execute(
             text("""
                 SELECT f.id, f.folder_id
                 FROM neural_nexus.files f
                 JOIN neural_nexus.folders fo ON fo.id = f.folder_id
-                WHERE f.id = :file_id AND fo.user_id = :user_id
+                LEFT JOIN neural_nexus.folder_permissions fp ON fp.folder_id = fo.id AND fp.user_id = :user_id
+                WHERE f.id = :file_id AND (fo.user_id = :user_id OR (fp.user_id IS NOT NULL AND fp.permission = 'write'))
             """),
             {"file_id": file_id, "user_id": user_id}
         )
@@ -718,13 +721,14 @@ async def update_file(
     user_id = current_user["id"]
     
     async with get_postgres_session() as session:
-        # Verify file belongs to user
+        # Verify file belongs to user (owner or shared with write permission)
         result = await session.execute(
             text("""
                 SELECT f.id, f.filename
                 FROM neural_nexus.files f
                 JOIN neural_nexus.folders fo ON fo.id = f.folder_id
-                WHERE f.id = :file_id AND fo.user_id = :user_id
+                LEFT JOIN neural_nexus.folder_permissions fp ON fp.folder_id = fo.id AND fp.user_id = :user_id
+                WHERE f.id = :file_id AND (fo.user_id = :user_id OR (fp.user_id IS NOT NULL AND fp.permission = 'write'))
             """),
             {"file_id": file_id, "user_id": user_id}
         )
@@ -765,7 +769,8 @@ async def get_file(
                        f.error_message, f.created_at, f.processed_at
                 FROM neural_nexus.files f
                 JOIN neural_nexus.folders fo ON fo.id = f.folder_id
-                WHERE f.id = :file_id AND fo.user_id = :user_id
+                LEFT JOIN neural_nexus.folder_permissions fp ON fp.folder_id = fo.id AND fp.user_id = :user_id
+                WHERE f.id = :file_id AND (fo.user_id = :user_id OR fp.user_id IS NOT NULL)
             """),
             {"file_id": file_id, "user_id": user_id}
         )

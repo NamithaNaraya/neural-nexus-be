@@ -43,6 +43,7 @@ class FolderResponse(BaseModel):
     node_count: int
     created_at: str
     updated_at: str
+    permission: str = "owner"  # 'owner', 'write', 'read'
 
 
 class FileInFolder(BaseModel):
@@ -63,7 +64,7 @@ async def list_folders(
     current_user: dict = Depends(get_current_user),
 ) -> List[FolderResponse]:
     """
-    List all folders for the current user.
+    List all folders the user owns or has been shared with.
     Includes file and node counts for each folder.
     """
     user_id = current_user["id"]
@@ -78,12 +79,31 @@ async def list_folders(
                     f.created_at,
                     f.updated_at,
                     COUNT(DISTINCT fi.id) as file_count,
-                    COALESCE(SUM(fi.node_count), 0) as node_count
+                    COALESCE(SUM(fi.node_count), 0) as node_count,
+                    'owner' as permission
                 FROM neural_nexus.folders f
                 LEFT JOIN neural_nexus.files fi ON fi.folder_id = f.id
                 WHERE f.user_id = :user_id
                 GROUP BY f.id
-                ORDER BY f.updated_at DESC
+                
+                UNION ALL
+                
+                SELECT 
+                    f.id, 
+                    f.name, 
+                    f.description,
+                    f.created_at,
+                    f.updated_at,
+                    COUNT(DISTINCT fi.id) as file_count,
+                    COALESCE(SUM(fi.node_count), 0) as node_count,
+                    fp.permission as permission
+                FROM neural_nexus.folders f
+                INNER JOIN neural_nexus.folder_permissions fp 
+                    ON fp.folder_id = f.id AND fp.user_id = :user_id
+                LEFT JOIN neural_nexus.files fi ON fi.folder_id = f.id
+                GROUP BY f.id, fp.permission
+                
+                ORDER BY updated_at DESC
             """),
             {"user_id": user_id}
         )
@@ -98,6 +118,7 @@ async def list_folders(
             node_count=row.node_count or 0,
             created_at=row.created_at.isoformat() if row.created_at else "",
             updated_at=row.updated_at.isoformat() if row.updated_at else "",
+            permission=row.permission,
         )
         for row in rows
     ]
@@ -164,10 +185,11 @@ async def get_folder(
     folder_id: str,
     current_user: dict = Depends(get_current_user),
 ) -> FolderResponse:
-    """Get a specific folder with its stats."""
+    """Get a specific folder with its stats. Works for owners and shared users."""
     user_id = current_user["id"]
     
     async with get_postgres_session() as session:
+        # First try as owner
         result = await session.execute(
             text("""
                 SELECT 
@@ -177,7 +199,8 @@ async def get_folder(
                     f.created_at,
                     f.updated_at,
                     COUNT(DISTINCT fi.id) as file_count,
-                    COALESCE(SUM(fi.node_count), 0) as node_count
+                    COALESCE(SUM(fi.node_count), 0) as node_count,
+                    'owner' as permission
                 FROM neural_nexus.folders f
                 LEFT JOIN neural_nexus.files fi ON fi.folder_id = f.id
                 WHERE f.id = :folder_id AND f.user_id = :user_id
@@ -186,6 +209,30 @@ async def get_folder(
             {"folder_id": folder_id, "user_id": user_id}
         )
         row = result.fetchone()
+        
+        # If not owner, try as shared user
+        if not row:
+            result = await session.execute(
+                text("""
+                    SELECT 
+                        f.id, 
+                        f.name, 
+                        f.description,
+                        f.created_at,
+                        f.updated_at,
+                        COUNT(DISTINCT fi.id) as file_count,
+                        COALESCE(SUM(fi.node_count), 0) as node_count,
+                        fp.permission as permission
+                    FROM neural_nexus.folders f
+                    INNER JOIN neural_nexus.folder_permissions fp 
+                        ON fp.folder_id = f.id AND fp.user_id = :user_id
+                    LEFT JOIN neural_nexus.files fi ON fi.folder_id = f.id
+                    WHERE f.id = :folder_id
+                    GROUP BY f.id, fp.permission
+                """),
+                {"folder_id": folder_id, "user_id": user_id}
+            )
+            row = result.fetchone()
     
     if not row:
         raise HTTPException(status_code=404, detail="Folder not found")
@@ -198,6 +245,7 @@ async def get_folder(
         node_count=row.node_count or 0,
         created_at=row.created_at.isoformat() if row.created_at else "",
         updated_at=row.updated_at.isoformat() if row.updated_at else "",
+        permission=row.permission,
     )
 
 
@@ -311,15 +359,21 @@ async def list_folder_files(
     folder_id: str,
     current_user: dict = Depends(get_current_user),
 ) -> List[FileInFolder]:
-    """List all files in a folder."""
+    """List all files in a folder. Works for owners and shared users."""
     user_id = current_user["id"]
     
     async with get_postgres_session() as session:
-        # Verify folder belongs to user
+        # Verify folder belongs to user OR is shared with them
         folder_check = await session.execute(
             text("""
-                SELECT id FROM neural_nexus.folders 
-                WHERE id = :folder_id AND user_id = :user_id
+                SELECT f.id FROM neural_nexus.folders f
+                WHERE f.id = :folder_id AND (
+                    f.user_id = :user_id
+                    OR EXISTS (
+                        SELECT 1 FROM neural_nexus.folder_permissions fp 
+                        WHERE fp.folder_id = f.id AND fp.user_id = :user_id
+                    )
+                )
             """),
             {"folder_id": folder_id, "user_id": user_id}
         )
@@ -459,8 +513,8 @@ async def grant_folder_permission(
     user_id = current_user["id"]
     now = datetime.utcnow()
     
-    if data.permission not in ['read', 'write', 'admin']:
-        raise HTTPException(status_code=400, detail="Invalid permission level")
+    if data.permission not in ['read', 'write']:
+        raise HTTPException(status_code=400, detail="Invalid permission level. Must be 'read' or 'write'.")
     
     async with get_postgres_session() as session:
         # Check folder exists and user is owner or admin
@@ -497,9 +551,19 @@ async def grant_folder_permission(
         target_row = target.fetchone()
         
         if not target_row:
-            raise HTTPException(status_code=404, detail="User not found")
+            raise HTTPException(
+                status_code=404, 
+                detail=f"No user found with email '{data.user_email}'. They must create an account first."
+            )
         
         target_user_id = str(target_row.id)
+        
+        # Prevent self-share
+        if target_user_id == user_id:
+            raise HTTPException(
+                status_code=400, 
+                detail="You cannot share a folder with yourself."
+            )
         
         # Upsert permission
         await session.execute(
