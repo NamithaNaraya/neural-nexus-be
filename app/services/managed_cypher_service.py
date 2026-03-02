@@ -3,6 +3,15 @@ Managed Cypher Service
 Handles normalization and enrichment of nodes created via direct Cypher queries.
 Ensures architectural compliance (e.g., :Entity label, file_id sync).
 Syncs created data to PostgreSQL entity_staging for consistency with AI pipeline.
+
+Robust Cypher rewriter that handles:
+- CREATE CONSTRAINT ... IF NOT EXISTS FOR ...
+- CREATE INDEX ... IF NOT EXISTS FOR ...
+- DROP CONSTRAINT / DROP INDEX
+- MERGE / CREATE / MATCH node patterns with folder isolation
+- Multi-statement queries (semicolon-delimited)
+- Comment lines (// and /* ... */)
+- Relationship patterns (not misidentified as nodes)
 """
 import logging
 import re
@@ -14,7 +23,7 @@ from app.agents.embedding_agent import EmbeddingAgent
 
 logger = logging.getLogger(__name__)
 
-# Labels that are part of the system architecture and should NOT be removed
+# Labels that are part of the system architecture and should NOT be prefixed
 STANDARD_LABELS = {'Entity', 'Chunk', 'File', 'Folder'}
 
 
@@ -24,105 +33,193 @@ class ManagedCypherService:
         self.storage = StorageAgent()
         self.embedding_agent = EmbeddingAgent()
 
-    from typing import List
+    # ──────────────────────────────────────────────────────────────────────
+    #  Cypher Rewriter — folder-level isolation via label injection
+    # ──────────────────────────────────────────────────────────────────────
 
     def _rewrite_query_for_folder(self, query: str, folder_id: str) -> List[str]:
         """
-        Injects a folder-specific label into all node patterns in a Cypher query for isolation.
-        Example: '(n:Herb)' becomes '(n:Herb:F_e59c8189)'
-        Ensures MERGE operations are scoped to the folder without manual query edits.
-        """
-        folder_suffix = f"_F_{folder_id.replace('-', '_')}"
-        folder_label = f"F_{folder_id.replace('-', '_')}"
+        Rewrites a Cypher query for folder-level isolation by injecting a
+        folder-specific label (e.g. :F_abc123) into all node patterns.
 
-        def prefix_labels(label_str: str) -> str:
+        Handles:
+        - Schema commands (CREATE/DROP CONSTRAINT/INDEX with IF NOT EXISTS)
+        - Data commands  (MERGE/CREATE/MATCH with node patterns)
+        - Comments       (// line comments and /* block comments */)
+        - Multi-statement queries (semicolon-delimited)
+
+        Returns a list of individual Cypher statements ready for execution.
+        """
+        folder_label = f"F_{folder_id.replace('-', '_')}"
+        folder_suffix = f"_{folder_label}"
+
+        # ── Helper: prefix user labels with folder suffix ──
+        def _prefix_labels(label_str: str) -> str:
+            """
+            Takes a label string like ':Herb:Spice' and returns ':Herb_F_xxx:Spice_F_xxx:F_xxx'.
+            System labels (Entity, Chunk, etc.) and already-prefixed labels are left alone.
+            """
             if not label_str:
                 return ""
-            # label_str looks like ":L1:L2"
-            lbl_parts = label_str.split(':')
+            parts = [p for p in label_str.split(':') if p]
             prefixed = []
-            for p in lbl_parts:
-                if not p:
-                    continue
-                # Skip system labels and already prefixed labels
+            for p in parts:
                 if p in STANDARD_LABELS or p.startswith('F_') or p.endswith(folder_suffix):
                     prefixed.append(p)
                 else:
                     prefixed.append(f"{p}{folder_suffix}")
-            return ":" + ":".join(prefixed)
+            return ":" + ":".join(prefixed) if prefixed else ""
 
-        # Regex to find node patterns: ( [var] [ :Labels] [ {props} ] )
-        node_pattern = r"(\(\s*)([a-zA-Z0-9_]*)(\s*:[a-zA-Z0-9_:]*)?(\s*\{.*?\})?(\s*\))"
+        # ── Split into individual statements ──
+        raw_parts = query.split(';')
+        rewritten_statements: List[str] = []
 
-        parts = query.split(';')
-        rewritten_parts = []
-
-        for part in parts:
-            seen_vars = set()
-
-            def inject(match):
-                prefix = match.group(1)  # '('
-                var = match.group(2)     # 'n' or empty
-                labels = match.group(3) or ""  # ':Label' or empty
-                props = match.group(4) or ""   # ' {..}' or empty
-                suffix = match.group(5)  # ')'
-
-                # If it's a named variable we've already seen in this statement,
-                # don't inject the folder label again.
-                if var and var in seen_vars:
-                    return f"{prefix}{var}{labels}{props}{suffix}"
-
-                if var:
-                    seen_vars.add(var)
-
-                # Prefix all user labels in the pattern
-                new_labels = prefix_labels(labels)
-
-                if var and not new_labels and not props:
-                    return f"{prefix}{var}:{folder_label}{suffix}"
-
-                if not var and not new_labels and not props:
-                    return f"{prefix}:{folder_label}{suffix}"
-
-                # Append the technical isolation label as well
-                return f"{prefix}{var}{new_labels}:{folder_label}{props}{suffix}"
-
-            # Clean up comments
-            check_part = re.sub(r'//.*', '', part)
-            check_part = re.sub(r'/\*.*?\*/', '', check_part, flags=re.DOTALL)
-
-            if not check_part.strip():
-                rewritten_parts.append(part)
+        for part in raw_parts:
+            # Strip the part for analysis but preserve original whitespace for output
+            stripped = part.strip()
+            if not stripped:
                 continue
 
-            # Check for schema commands (CONSTRAINT or INDEX)
-            upper_part = check_part.strip().upper()
-            is_schema = any(upper_part.startswith(kw) for kw in [
-                "CREATE CONSTRAINT", "DROP CONSTRAINT",
-                "CREATE INDEX", "DROP INDEX", "SHOW", "ASSERT"
+            # ── Remove comments for classification ──
+            no_comments = re.sub(r'//.*', '', stripped)
+            no_comments = re.sub(r'/\*.*?\*/', '', no_comments, flags=re.DOTALL)
+            no_comments = no_comments.strip()
+
+            if not no_comments:
+                # Entire statement is comments — skip it entirely
+                continue
+
+            upper = no_comments.upper()
+
+            # ── Classify: Schema command or Data command ──
+            is_schema = any(upper.startswith(kw) for kw in [
+                'CREATE CONSTRAINT', 'DROP CONSTRAINT',
+                'CREATE INDEX', 'DROP INDEX',
+                'SHOW CONSTRAINT', 'SHOW INDEX',
             ])
 
             if is_schema:
-                schema_lbl_pattern = r":([a-zA-Z0-9_]+)"
-
-                def schema_inject(m):
-                    lbl = m.group(1)
-                    if lbl in STANDARD_LABELS or lbl.startswith('F_'):
-                        return f":{lbl}"
-                    return f":{lbl}{folder_suffix}"
-
-                rewritten_part = re.sub(schema_lbl_pattern, schema_inject, part)
-                rewritten_part = re.sub(
-                    r"(CONSTRAINT|INDEX)\s+([a-zA-Z0-9_]+)\s+FOR",
-                    r"\1 \2" + folder_suffix + " FOR",
-                    rewritten_part,
-                    flags=re.IGNORECASE
+                rewritten_statements.append(
+                    self._rewrite_schema_statement(stripped, folder_label, folder_suffix)
                 )
-                rewritten_parts.append(rewritten_part)
             else:
-                rewritten_parts.append(re.sub(node_pattern, inject, part))
+                rewritten_statements.append(
+                    self._rewrite_data_statement(stripped, folder_label, folder_suffix, _prefix_labels)
+                )
 
-        return rewritten_parts
+        return rewritten_statements
+
+    def _rewrite_schema_statement(
+        self, stmt: str, folder_label: str, folder_suffix: str
+    ) -> str:
+        """
+        Rewrites CREATE CONSTRAINT / CREATE INDEX statements.
+
+        Examples:
+          CREATE CONSTRAINT encounter_id IF NOT EXISTS FOR (e:Encounter) REQUIRE e.id IS UNIQUE
+          →  CREATE CONSTRAINT encounter_id_F_xxx IF NOT EXISTS FOR (e:Encounter_F_xxx) REQUIRE e.id IS UNIQUE
+
+          CREATE INDEX encounter_session IF NOT EXISTS FOR (e:Encounter) ON (e.session_id)
+          →  CREATE INDEX encounter_session_F_xxx IF NOT EXISTS FOR (e:Encounter_F_xxx) ON (e.session_id)
+        """
+        result = stmt
+
+        # 1) Rename the constraint/index name to include folder suffix
+        #    Matches: CONSTRAINT  name  (IF NOT EXISTS)?  FOR
+        #    Or:      INDEX       name  (IF NOT EXISTS)?  FOR
+        name_pattern = re.compile(
+            r'((?:CREATE|DROP)\s+(?:CONSTRAINT|INDEX)\s+)'   # prefix: CREATE CONSTRAINT
+            r'([a-zA-Z_][a-zA-Z0-9_]*)'                     # constraint/index name
+            r'(\s+(?:IF\s+NOT\s+EXISTS\s+)?FOR)',            # optional IF NOT EXISTS + FOR
+            re.IGNORECASE
+        )
+        result = name_pattern.sub(
+            lambda m: f"{m.group(1)}{m.group(2)}{folder_suffix}{m.group(3)}",
+            result
+        )
+
+        # 2) Rename the label inside the FOR (...) pattern
+        #    Matches: FOR (var:Label)
+        for_label_pattern = re.compile(
+            r'(FOR\s*\(\s*[a-zA-Z_][a-zA-Z0-9_]*\s*):([a-zA-Z_][a-zA-Z0-9_]*)(\s*\))',
+            re.IGNORECASE
+        )
+
+        def _replace_for_label(m):
+            lbl = m.group(2)
+            if lbl in STANDARD_LABELS or lbl.startswith('F_'):
+                return m.group(0)
+            return f"{m.group(1)}:{lbl}{folder_suffix}{m.group(3)}"
+
+        result = for_label_pattern.sub(_replace_for_label, result)
+
+        return result
+
+    def _rewrite_data_statement(
+        self, stmt: str, folder_label: str, folder_suffix: str, prefix_fn
+    ) -> str:
+        """
+        Rewrites a data statement (MERGE/CREATE/MATCH/etc.) by injecting
+        the folder label into all node patterns.
+
+        Uses a careful regex that avoids matching relationship patterns like
+        -[:REL_TYPE]-> or -[r:REL_TYPE {props}]->.
+        """
+        seen_vars: set = set()
+
+        # ── Node pattern regex ──
+        # Matches: (var:Label {props}) but NOT [...] (relationship patterns)
+        # Key: We match opening '(' (not '[') to distinguish nodes from rels.
+        node_pattern = re.compile(
+            r'(\(\s*)'                          # Group 1: opening paren + optional whitespace
+            r'([a-zA-Z_][a-zA-Z0-9_]*)?'        # Group 2: optional variable name
+            r'(\s*(?::[a-zA-Z_][a-zA-Z0-9_:]*))?' # Group 3: optional labels like :Herb:Plant
+            r'(\s*\{[^}]*\})?'                  # Group 4: optional properties block { ... }
+            r'(\s*\))'                          # Group 5: closing paren
+        )
+
+        def _inject_folder(match: re.Match) -> str:
+            prefix = match.group(1)     # '('
+            var = match.group(2) or ""  # variable name or empty
+            labels = match.group(3) or ""  # ':Label1:Label2' or empty
+            props = match.group(4) or ""   # ' {name: "x"}' or empty
+            suffix = match.group(5)     # ')'
+
+            # If the variable was already seen in this statement, don't re-inject
+            if var and var in seen_vars:
+                return match.group(0)
+            if var:
+                seen_vars.add(var)
+
+            # Prefix user labels
+            new_labels = prefix_fn(labels)
+
+            # Always ensure the folder label is present
+            if folder_label not in (new_labels or ""):
+                new_labels = f"{new_labels}:{folder_label}" if new_labels else f":{folder_label}"
+
+            return f"{prefix}{var}{new_labels}{props}{suffix}"
+
+        # Before applying the regex, strip comment lines so they don't get modified.
+        # We process line-by-line: comment lines are passed through unchanged,
+        # data lines get the node_pattern replacement.
+        lines = stmt.split('\n')
+        processed_lines = []
+
+        for line in lines:
+            stripped_line = line.strip()
+            # Skip full-line comments
+            if stripped_line.startswith('//') or stripped_line.startswith('/*'):
+                processed_lines.append(line)
+                continue
+            # Apply node pattern injection on data lines
+            processed_lines.append(node_pattern.sub(_inject_folder, line))
+
+        return '\n'.join(processed_lines)
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Main Execution Entry Point
+    # ──────────────────────────────────────────────────────────────────────
 
     async def execute_managed_query(
         self,
@@ -134,77 +231,96 @@ class ManagedCypherService:
         """
         Executes a Cypher query and then normalizes all nodes touched by the operation.
         Steps:
-          1. Execute user's Cypher statements
+          1. Rewrite & execute user's Cypher statements (with folder isolation)
           2. Adopt orphan nodes (add :Entity label, file_id metadata)
           3. Generate UUIDs for nodes missing them
-          4. Normalize type/name properties from original labels
-          5. Remove non-standard labels (e.g., :Herb, :Karma → stored as type property)
-          6. Generate embeddings for nodes missing them
-          7. Sync entities & relationships to PostgreSQL entity_staging
-          8. Return final counts
+          4. Generate embeddings for nodes missing them
+          5. Sync entities & relationships to PostgreSQL entity_staging
+          6. Invalidate caches
+          7. Return final counts
         """
         folder_label = f"F_{folder_id.replace('-', '_')}"
-        rewritten_statements = self._rewrite_query_for_folder(query, folder_id)
-        logger.info(f"Rewrote Cypher for folder isolation: {folder_label}")
+
+        # ── Rewrite query for folder isolation ──
+        try:
+            rewritten_statements = self._rewrite_query_for_folder(query, folder_id)
+        except Exception as e:
+            logger.error(f"Query rewriting failed: {e}")
+            raise ValueError(f"Failed to rewrite Cypher for folder isolation: {e}")
+
+        logger.info(
+            f"Rewrote Cypher into {len(rewritten_statements)} statement(s) "
+            f"for folder isolation: {folder_label}"
+        )
+        for i, stmt in enumerate(rewritten_statements):
+            logger.debug(f"  Statement [{i}]: {stmt[:200]}...")
 
         async with self.driver.session() as session:
-            # 0.5 Pre-Adoption: Restore isolation labels to orphaned or unassigned nodes
-            try:
-                pre_res = await session.run(f"""
-                    MATCH (n)
-                    WHERE (n.folder_id = $folder_id OR (n.folder_id IS NULL AND labels(n) <> []))
-                    AND NOT n:{folder_label}
-                    SET n:{folder_label},
-                        n.folder_id = $folder_id
-                    RETURN count(n) as repaired_count
-                """, {"folder_id": folder_id})
-                pre_rec = await pre_res.single()
-                if pre_rec and pre_rec["repaired_count"] > 0:
-                    logger.info(f"Pre-adopted {pre_rec['repaired_count']} orphaned nodes in folder {folder_id}")
-            except Exception as e:
-                logger.warning(f"Pre-adoption repair failed: {e}")
-
-            # 1. Execute the user's query statements
+            # ── Step 1: Execute the rewritten statements ──
             try:
                 logger.info(f"Executing managed Cypher query for file {file_id}")
-                for stmt in rewritten_statements:
-                    await session.run(stmt, {"file_id": file_id, "folder_id": folder_id, "user_id": user_id})
+                for idx, stmt in enumerate(rewritten_statements):
+                    clean_stmt = stmt.strip()
+                    if not clean_stmt:
+                        continue
+                    logger.debug(f"Running statement [{idx}]: {clean_stmt[:150]}")
+                    try:
+                        await session.run(
+                            clean_stmt,
+                            {
+                                "file_id": file_id,
+                                "folder_id": folder_id,
+                                "user_id": user_id,
+                            }
+                        )
+                    except Exception as stmt_err:
+                        logger.error(
+                            f"Statement [{idx}] failed: {stmt_err}\n"
+                            f"Query was: {clean_stmt}"
+                        )
+                        raise
             except Exception as e:
                 logger.error(f"User Cypher execution failed: {e}")
                 raise
 
-            # 2. Targeted Adoption: Find nodes that should belong to this file.
-            adoption_result = await session.run(f"""
-                MATCH (n)
-                WHERE (n:{folder_label} OR n.folder_id = $folder_id)
-                AND (n.file_id IS NULL OR n.file_id = $file_id OR NOT $file_id IN n.file_ids)
-                SET n.file_id = CASE WHEN n.file_id IS NULL THEN $file_id ELSE n.file_id END,
-                    n.folder_id = CASE WHEN n.folder_id IS NULL THEN $folder_id ELSE n.folder_id END,
-                    n.file_ids = CASE
-                        WHEN n.file_ids IS NULL THEN [$file_id]
-                        WHEN NOT $file_id IN n.file_ids THEN n.file_ids + $file_id
-                        ELSE n.file_ids
-                    END,
-                    n:Entity,
-                    n:{folder_label}
-                RETURN count(n) as adopted_count
-            """, {"file_id": file_id, "folder_id": folder_id})
-            adoption_record = await adoption_result.single()
-            logger.info(f"Adopted {adoption_record['adopted_count']} nodes for file {file_id}")
+            # ── Step 2: Adopt nodes — tag with :Entity, file_id, folder_id ──
+            try:
+                adoption_result = await session.run(f"""
+                    MATCH (n:{folder_label})
+                    WHERE n.file_id IS NULL OR n.file_id = $file_id
+                    SET n.file_id = CASE WHEN n.file_id IS NULL THEN $file_id ELSE n.file_id END,
+                        n.folder_id = CASE WHEN n.folder_id IS NULL THEN $folder_id ELSE n.folder_id END,
+                        n.file_ids = CASE
+                            WHEN n.file_ids IS NULL THEN [$file_id]
+                            WHEN NOT $file_id IN n.file_ids THEN n.file_ids + $file_id
+                            ELSE n.file_ids
+                        END,
+                        n:Entity
+                    RETURN count(n) as adopted_count
+                """, {"file_id": file_id, "folder_id": folder_id})
+                adoption_record = await adoption_result.single()
+                adopted = adoption_record["adopted_count"] if adoption_record else 0
+                logger.info(f"Adopted {adopted} nodes for file {file_id}")
+            except Exception as e:
+                logger.error(f"Node adoption failed: {e}")
+                # Non-fatal — continue with the rest
 
-            # 2.5 Adopt Relationships: Tag relationships between adopted entities
-            await session.run("""
-                MATCH (a:Entity)-[r]->(b:Entity)
-                WHERE ($file_id IN a.file_ids)
-                  AND ($file_id IN b.file_ids)
-                  AND (r.file_ids IS NULL OR NOT $file_id IN r.file_ids)
-                SET r.file_ids = CASE
-                    WHEN r.file_ids IS NULL THEN [$file_id]
-                    ELSE r.file_ids + $file_id
-                END
-            """, {"file_id": file_id})
+            # ── Step 2.5: Adopt Relationships ──
+            try:
+                await session.run("""
+                    MATCH (a:Entity)-[r]->(b:Entity)
+                    WHERE ($file_id IN a.file_ids)
+                      AND ($file_id IN b.file_ids)
+                      AND (r.file_ids IS NULL OR NOT $file_id IN r.file_ids)
+                    SET r.file_ids = CASE
+                        WHEN r.file_ids IS NULL THEN [$file_id]
+                        ELSE r.file_ids + $file_id
+                    END
+                """, {"file_id": file_id})
+            except Exception as e:
+                logger.warning(f"Relationship adoption failed: {e}")
 
-            # 3. UUID Generation — use randomUUID() (built-in Neo4j 4.4+), fallback to Python
+            # ── Step 3: UUID Generation ──
             try:
                 await session.run("""
                     MATCH (n:Entity)
@@ -212,90 +328,58 @@ class ManagedCypherService:
                     SET n.id = randomUUID()
                 """, {"file_id": file_id})
             except Exception as e:
-                logger.warning(f"randomUUID() generation failed, will fallback to Python: {e}")
-
-            # 4. File-to-Entity association is handled via the file_ids array on entities
-            logger.info(f"Entities for file {file_id} are tracked via file_ids array")
-
-            # 5. Normalize names and types from original labels, catch missing IDs
-            # NOTE: Commented out to allow RAW node storage as nodes, not attributes
-            """
-            result = await session.run(\"\"\"
-                MATCH (n:Entity)
-                WHERE $file_id IN n.file_ids OR n.file_id = $file_id
-                SET n.type = CASE
-                        WHEN n.type IS NULL THEN
-                            [l IN labels(n) WHERE NOT l IN ['Entity', 'Chunk', 'File', 'Folder'] AND NOT l STARTS WITH 'F_'][0]
-                        ELSE n.type
-                    END,
-                    // Strip folder suffix from type if present (e.g. 'Herb_F_3c15...' -> 'Herb')
-                    n.type = CASE
-                        WHEN n.type CONTAINS '_F_' THEN split(n.type, '_F_')[0]
-                        ELSE n.type
-                    END,
-                    // Improve naming heuristics to avoid UUIDs in the UI
-                    n.name = CASE
-                        WHEN n.name IS NULL OR n.name = n.id THEN
-                            coalesce(
-                                n.label, n.title, n.herb, n.quality, n.property,
-                                n.value, n.text, n.display_name,
-                                [lbl IN labels(n) WHERE NOT lbl IN ['Entity', 'Chunk', 'File', 'Folder'] AND NOT lbl STARTS WITH 'F_'][0],
-                                n.id, 'Unknown'
-                            )
-                        ELSE n.name
-                    END
-                RETURN DISTINCT id(n) as internal_id, n.id as uuid
-            \"\"\", {"file_id": file_id})
-            """
-            # Placeholder to ensure UUIDs are still generated if missing
-            result = await session.run("""
-                MATCH (n)
-                WHERE ($file_id IN n.file_ids OR n.file_id = $file_id) AND n.id IS NULL
-                RETURN DISTINCT id(n) as internal_id, n.id as uuid
-            """, {"file_id": file_id})
-
-            async for record in result:
-                if not record["uuid"]:
-                    new_uuid = str(uuid.uuid4())
-                    await session.run(
-                        "MATCH (n) WHERE id(n) = $int_id SET n.id = $uuid",
-                        {"int_id": record["internal_id"], "uuid": new_uuid}
-                    )
-
-            # Step 5b: Retain all labels for idempotent Cypher compatibility.
-            # The folder_label (:F_uuid) MUST persist for folder-based query scoping.
-            logger.info("Retaining all labels for idempotent Cypher compatibility.")
-
-            # 6. Generate missing embeddings
-            result = await session.run("""
-                MATCH (n:Entity)
-                WHERE ($file_id IN n.file_ids OR n.file_id = $file_id) AND n.embedding IS NULL
-                RETURN DISTINCT n.id as id, n.name as name, n.type as type, coalesce(n.description, '') as description
-            """, {"file_id": file_id})
-
-            new_nodes = []
-            async for record in result:
-                if record["id"] and record["name"]:
-                    new_nodes.append({
-                        "id": record["id"],
-                        "name": record["name"],
-                        "type": record["type"] or "Entity",
-                        "description": record["description"]
-                    })
-
-            if new_nodes:
+                logger.warning(f"randomUUID() failed, falling back to Python UUIDs: {e}")
+                # Fallback: generate UUIDs via Python
                 try:
-                    embedded_nodes = await self.embedding_agent.embed_entities(new_nodes)
-                    for node in embedded_nodes:
-                        if 'embedding' in node:
-                            await session.run("""
-                                MATCH (n:Entity {id: $id})
-                                SET n.embedding = $embedding
-                            """, {"id": node["id"], "embedding": node["embedding"]})
-                except Exception as e:
-                    logger.error(f"Embedding generation failed: {e}")
+                    result = await session.run("""
+                        MATCH (n)
+                        WHERE ($file_id IN n.file_ids OR n.file_id = $file_id) AND n.id IS NULL
+                        RETURN DISTINCT id(n) as internal_id
+                    """, {"file_id": file_id})
+                    async for record in result:
+                        new_uuid = str(uuid.uuid4())
+                        await session.run(
+                            "MATCH (n) WHERE id(n) = $int_id SET n.id = $uuid",
+                            {"int_id": record["internal_id"], "uuid": new_uuid}
+                        )
+                except Exception as fallback_err:
+                    logger.error(f"Python UUID fallback also failed: {fallback_err}")
 
-            # 7. Sync to PostgreSQL entity_staging
+            # ── Step 4: Generate missing embeddings ──
+            try:
+                result = await session.run("""
+                    MATCH (n:Entity)
+                    WHERE ($file_id IN n.file_ids OR n.file_id = $file_id) AND n.embedding IS NULL
+                    RETURN DISTINCT n.id as id, n.name as name, n.type as type,
+                           coalesce(n.description, '') as description
+                """, {"file_id": file_id})
+
+                new_nodes = []
+                async for record in result:
+                    if record["id"] and record["name"]:
+                        new_nodes.append({
+                            "id": record["id"],
+                            "name": record["name"],
+                            "type": record["type"] or "Entity",
+                            "description": record["description"]
+                        })
+
+                if new_nodes:
+                    try:
+                        embedded_nodes = await self.embedding_agent.embed_entities(new_nodes)
+                        for node in embedded_nodes:
+                            if 'embedding' in node:
+                                await session.run("""
+                                    MATCH (n:Entity {id: $id})
+                                    SET n.embedding = $embedding
+                                """, {"id": node["id"], "embedding": node["embedding"]})
+                        logger.info(f"Generated embeddings for {len(embedded_nodes)} nodes")
+                    except Exception as e:
+                        logger.error(f"Embedding generation failed: {e}")
+            except Exception as e:
+                logger.error(f"Embedding query failed: {e}")
+
+            # ── Step 5: Sync to PostgreSQL entity_staging ──
             try:
                 entities_result = await session.run("""
                     MATCH (n:Entity)
@@ -334,11 +418,14 @@ class ManagedCypherService:
                     })
 
                 await self.storage.store_staging(file_id, entities_for_staging, relationships_for_staging)
-                logger.info(f"Staged {len(entities_for_staging)} entities and {len(relationships_for_staging)} relationships for file {file_id}")
+                logger.info(
+                    f"Staged {len(entities_for_staging)} entities and "
+                    f"{len(relationships_for_staging)} relationships for file {file_id}"
+                )
             except Exception as e:
                 logger.error(f"PostgreSQL staging sync failed: {e}")
 
-            # 8. Get final counts
+            # ── Step 6: Get final counts ──
             count_result = await session.run("""
                 MATCH (n:Entity)
                 WHERE $file_id IN n.file_ids OR n.file_id = $file_id
@@ -357,7 +444,7 @@ class ManagedCypherService:
             rel_count_record = await rel_count_result.single()
             rel_count = rel_count_record["count"] if rel_count_record else 0
 
-            # 9. Invalidate Cache
+            # ── Step 7: Invalidate Cache ──
             try:
                 from app.services.cache_service import get_cache_service
                 cache = get_cache_service()
@@ -371,11 +458,15 @@ class ManagedCypherService:
             return {
                 "node_count": node_count,
                 "relationship_count": rel_count,
-                "message": f"Successfully ingested and normalized {node_count} nodes and {rel_count} relationships."
+                "message": (
+                    f"Successfully ingested and normalized "
+                    f"{node_count} nodes and {rel_count} relationships."
+                )
             }
 
 
 _managed_cypher_service = None
+
 
 def get_managed_cypher_service() -> ManagedCypherService:
     global _managed_cypher_service

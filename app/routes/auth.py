@@ -99,7 +99,7 @@ async def register(user_data: UserRegister) -> TokenResponse:
         new_user = User(
             email=user_data.email,
             password_hash=hash_password(user_data.password),
-            role=user_data.role if user_data.role in ["admin", "user"] else "user",
+            role="user",  # Public registration always creates "user" role; admin is set via admin endpoint only
         )
         session.add(new_user)
         await session.commit()
