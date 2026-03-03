@@ -75,7 +75,8 @@ class AIService:
         try:
             # We use ainvoke for async LangChain execution
             response = await self.llm.ainvoke(lc_messages)
-            return response.content
+            # Guard against None content (safety filters, empty responses, rate limits)
+            return response.content or ""
         except Exception as e:
             logger.error(f"LangChain Chat Error: {e}")
             raise

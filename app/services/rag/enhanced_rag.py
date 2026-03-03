@@ -669,11 +669,13 @@ class EnhancedRAGService:
         context_parts.append("\n═══ DATABASE EVIDENCE (Matched Entities) ═══")
         entity_names = []
         for r in state["vector_results"][:15]:
+            name = r.get("name") or ""
             type_label = r.get("type") or "Entity"
             desc = r.get("description", "")[:500]
             centrality_note = f" (centrality: {r.get('centrality', 0):.2f})" if r.get("centrality") else ""
-            context_parts.append(f"• {r['name']} [{type_label}]{centrality_note}: {desc}")
-            entity_names.append(r["name"].lower())
+            context_parts.append(f"• {name} [{type_label}]{centrality_note}: {desc}")
+            if name:
+                entity_names.append(name.lower())
 
         # Also add entity names from profiles to the grounding check
         for profile in entity_profiles:
@@ -687,11 +689,13 @@ class EnhancedRAGService:
         if state.get("ml_similar_nodes"):
             context_parts.append("\n═══ STRUCTURALLY SIMILAR NODES (ML Discovery) ═══")
             for n in state["ml_similar_nodes"][:5]:
+                ml_name = n.get("name") or ""
                 context_parts.append(
-                    f"• {n['name']} [{n.get('type', 'Entity')}] — "
+                    f"• {ml_name} [{n.get('type', 'Entity')}] — "
                     f"{n.get('similarity', 0)*100:.0f}% structural similarity"
                 )
-                entity_names.append(n["name"].lower())
+                if ml_name:
+                    entity_names.append(ml_name.lower())
 
         # Strategic insights
         if state.get("strategic_results"):
@@ -733,6 +737,7 @@ class EnhancedRAGService:
             ])
 
             # Feature 10: Compute grounding score
+            answer = answer or ""
             answer_lower = answer.lower()
             mentioned = sum(1 for name in entity_names if name in answer_lower)
             grounding_score = min(mentioned / max(len(entity_names), 1), 1.0)
