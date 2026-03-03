@@ -1327,15 +1327,14 @@ async def get_node_types(
         
         types = result.records[0]["types"] if result.records else []
         
-        # Add common defaults if missing
-        default_types = ["Person", "Organization", "Concept", "Event", "Location", "Document", "Topic"]
-        all_types = list(set(types + default_types))
+        # Add configurable defaults if missing
+        all_types = list(set(types + settings.DEFAULT_NODE_TYPES))
         all_types.sort()
         
         return {"types": all_types}
     except Exception as e:
         logger.error(f"Failed to get node types: {e}")
-        return {"types": ["Person", "Organization", "Concept", "Event", "Location"]}
+        return {"types": settings.DEFAULT_NODE_TYPES}
 
 
 @router.get("/relationship-types")
@@ -1355,15 +1354,15 @@ async def get_relationship_types(
         
         types = result.records[0]["types"] if result.records else []
         
-        # Add common defaults
-        default_types = ["RELATED_TO", "BELONGS_TO", "PART_OF", "CREATED_BY", "WORKS_AT", "LOCATED_IN", "KNOWS"]
-        all_types = list(set(types + default_types))
+        # Add configurable defaults
+        all_types = list(set(types + settings.DEFAULT_RELATIONSHIP_TYPES))
         all_types.sort()
         
         return {"types": all_types}
     except Exception as e:
         logger.error(f"Failed to get relationship types: {e}")
-        return {"types": ["RELATED_TO", "BELONGS_TO", "PART_OF"]}
+        return {"types": settings.DEFAULT_RELATIONSHIP_TYPES}
+
 @router.post("/nodes/merge")
 async def merge_nodes(
     request: MergeNodesRequest,
@@ -1487,79 +1486,3 @@ async def merge_nodes(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# === Herb Specific Routes ===
-
-@router.get("/herb/{herb_name}/properties")
-async def get_herb_properties(
-    herb_name: str,
-    current_user: dict = Depends(get_current_user),
-    neo4j = Depends(get_neo4j),
-) -> Dict[str, List[str]]:
-    """Get all properties for a specific herb."""
-    try:
-        # User defined query 1
-        query = """
-        MATCH (h:Herb {name: $herb_name})-[:HAS_PROPERTY]->(p:Property)
-        RETURN p.name AS property
-        """
-        result = await neo4j.execute_query(query, {"herb_name": herb_name})
-        properties = [record["property"] for record in result.records]
-        return {"properties": properties}
-    except Exception as e:
-        logger.error(f"Failed to get herb properties: {e}")
-        return {"properties": []}
-
-
-@router.get("/herb/{herb_name}/property/{property_name}/qualities")
-async def get_herb_property_qualities(
-    herb_name: str,
-    property_name: str,
-    current_user: dict = Depends(get_current_user),
-    neo4j = Depends(get_neo4j),
-) -> Dict[str, List[str]]:
-    """Get qualities for a specific herb property."""
-    try:
-        # User defined query 2
-        query = """
-        MATCH (h:Herb {name: $herb_name})-[:HAS_PROPERTY]->(p:Property {name: $property_name})
-              -[r:HAS_QUALITY {herb: $herb_name}]->(q:Quality)
-        RETURN q.name AS quality
-        """
-        result = await neo4j.execute_query(query, {
-            "herb_name": herb_name, 
-            "property_name": property_name
-        })
-        qualities = [record["quality"] for record in result.records]
-        
-        return {"qualities": qualities}
-    except Exception as e:
-        logger.error(f"Failed to get herb qualities: {e}")
-        return {"qualities": []}
-
-
-@router.get("/herb/{herb_name}/full")
-async def get_herb_full_profile(
-    herb_name: str,
-    current_user: dict = Depends(get_current_user),
-    neo4j = Depends(get_neo4j),
-) -> Dict[str, Any]:
-    """Get full herb profile."""
-    try:
-        # Combined query based on the schema
-        query = """
-        MATCH (h:Herb {name: $herb_name})-[:HAS_PROPERTY]->(p:Property)
-        OPTIONAL MATCH (h)-[:HAS_PROPERTY]->(p)-[r:HAS_QUALITY {herb: $herb_name}]->(q:Quality)
-        RETURN p.name AS property, collect(q.name) AS qualities
-        ORDER BY property
-        """
-        result = await neo4j.execute_query(query, {"herb_name": herb_name})
-        
-        # Format: { "Rasa": ["Madhura"], "Guna": ["Guru", "Snigdha"], ... }
-        profile = {}
-        for record in result.records:
-            profile[record["property"]] = record["qualities"]
-            
-        return {"profile": profile}
-    except Exception as e:
-        logger.error(f"Failed to get full herb profile: {e}")
-        return {"profile": {}}

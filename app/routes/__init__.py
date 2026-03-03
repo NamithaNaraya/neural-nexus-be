@@ -12,6 +12,7 @@ from app.routes import analytics
 from app.routes import sse
 from app.routes import websocket
 from app.routes import deletion
+from app.routes import herb
 
 from app.routes import reasoning
 
@@ -28,5 +29,6 @@ __all__ = [
     "websocket",
     "deletion",
     "reasoning",
+    "herb",
 ]
 

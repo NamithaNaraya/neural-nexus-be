@@ -9,6 +9,9 @@ import json
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple, Annotated, TypedDict, Union
 
+from app.core.config import settings
+from app.core.prompts import get_strategic_scout_prompt, get_hybrid_rag_system_prompt
+
 from langgraph.graph import StateGraph, END
 
 logger = logging.getLogger(__name__)
@@ -147,7 +150,7 @@ class HybridRAGService:
 
         # -- Step A: Vector Search (Semantic) --
         vector_query = f"""
-        CALL db.index.vector.queryNodes('embedding_idx', $top_k, $embedding) YIELD node, score
+        CALL db.index.vector.queryNodes('{settings.VECTOR_INDEX_NAME}', $top_k, $embedding) YIELD node, score
         WHERE node.name IS NOT NULL {scope_filter}
         RETURN 
             COALESCE(node.id, elementId(node)) as node_id,
@@ -255,38 +258,13 @@ class HybridRAGService:
         
         entity_hint = f"Relevant entities in play: {', '.join(entities)}.{scope_clause}"
 
-        # 3. Generate Cypher via LLM
-        scout_prompt = f"""
-        You are the Neural Nexus Strategic Scout. Your task is to generate a READ-ONLY Cypher query to answer complex multi-hop questions.
-        
-        SCOPE RESTRICTION: You MUST filter all nodes and relationships by the provided $sid. 
-        - If scope is File: Use `($sid IN n.file_ids OR n.file_id = $sid)`.
-        - If scope is Folder: Use `n.folder_id = $sid`.
-        - Apply this filter to EVERY node and relationship in your MATCH.
-        
-        SCHEMA:
-        - Labels: {self.schema_cache['labels']}
-        - Relationships: {self.schema_cache['relationships']}
-        
-        {entity_hint}
-        
-        ID for scope filter ($sid): {sid}
-        
-        HISTORICAL STRATEGIC PATTERNS (SCOPED FEW-SHOT):
-        - Q: "Show the chain for Shatavari."
-          A: MATCH (h:Herb {{name:'Shatavari'}}) WHERE h.folder_id = $sid MATCH path=(h)-[r*..3]-(related) WHERE ALL(rel IN r WHERE rel.folder_id = $sid) RETURN h, path
-          
-        - Q: "Which qualities contribute most to outcomes?"
-          A: MATCH (q:Quality)-[r:FACILITATES_EFFECT|ENABLES_KARMA|LEADS_TO_OUTCOME*..5]->(o:Outcome) WHERE ALL(rel IN r WHERE rel.folder_id = $sid) RETURN q.name AS quality, count(*) AS paths ORDER BY paths DESC
-          
-        QUESTION: {state['question']}
-        
-        RULES:
-        1. Output ONLY a JSON object: {{"reasoning": "...", "cypher": "..."}}
-        2. Use only labels and relationships from the SCHEMA.
-        3. Keep the query efficient (LIMIT 50).
-        4. If the question is simple/factual, return an empty cypher string.
-        """
+        # 3. Generate Cypher via LLM using Centralized Prompt
+        scout_prompt = get_strategic_scout_prompt(
+            schema_cache=self.schema_cache,
+            entity_hint=entity_hint,
+            sid=sid,
+            question=state['question']
+        )
         
         try:
             prediction = await self.ai.chat_json([
@@ -440,22 +418,7 @@ class HybridRAGService:
         if backbone:
             context += f"\nDomain Backbone (Primary Structural Relationships): {backbone}\n"
                 
-        system_prompt = (
-            "You are the Neural Nexus, a friendly and knowledgeable wellness expert. "
-            "Speak naturally and conversationally, like a helpful guide explaining things to a friend.\n\n"
-            "HOW TO RESPOND:\n"
-            "1. **Be Conversational**: Write like you're talking to someone, not writing a report. "
-            "Use natural language like 'Here's what I found...' or 'This is interesting because...' or 'Based on what I can see in our data...'\n"
-            "2. **Explain the WHY**: Don't just list names. When you see a connection like 'Shatavari -[HAS_PROPERTY]-> Balances Vata', "
-            "explain it naturally: 'Shatavari could be helpful here because it has the property of balancing Vata, which is often associated with...'\n"
-            "3. **Follow the Chain**: Trace the graph paths to tell a story. "
-            "For example: 'I can see that Shatavari connects to Balances Vata through its properties, and Vata imbalance is linked to the symptoms you're asking about — so that's why it shows up as relevant.'\n"
-            "4. **Give Practical Insights**: Based on the connections found, provide useful recommendations with clear reasoning.\n"
-            "5. **Be Honest About Gaps**: If some info is missing, say so naturally: 'I couldn't find specific details about X in our knowledge base, but here's what I do have...'\n"
-            "6. **Use Light Markdown**: Use bold for emphasis and bullet points for clarity, but keep the overall tone warm and readable.\n"
-            "7. **Greeting & Chatter**: If the user says 'hi' or 'hello', respond warmly and briefly.\n"
-            "8. **Ground Everything**: Base all claims on the provided context data — don't make things up."
-        )
+        system_prompt = get_hybrid_rag_system_prompt(graph_context=context, backbone=backbone)
         user_prompt = f"Context (Strategic Structural Insights & Knowledge):\n{context}\n\nQuestion: {state['question']}"
         
         try:

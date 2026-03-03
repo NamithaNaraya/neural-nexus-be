@@ -25,6 +25,9 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional, TypedDict
 
 from langgraph.graph import StateGraph, END
+from app.core.config import settings
+from app.core.prompts import get_enhanced_rag_system_prompt, get_greeting_prompt
+from app.services.gds_service import get_gds_service
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +84,7 @@ class EnhancedRAGService:
         self.neo4j = neo4j_driver
         self.ai = ai_service
         self.schema_cache = None
-        self._gds_projection_exists = None   # cached: True/False/None
+        self._gds_projection_name = None      # cached graph name
         self._model_catalog_cache = None      # cached model list
         self._model_catalog_ts = 0            # cache timestamp
         self.graph = self._build_graph()
@@ -251,11 +254,14 @@ class EnhancedRAGService:
                             names = ", ".join(r["examples"][:3])
                             suggestions.append(f"**{r['type']}**: {names}")
 
+                        # Build a dynamic example using the first real entity name
+                        example_name = records[0]["examples"][0] if records and records[0].get("examples") else "an entity"
+                        example_type = records[0]["type"] if records else "type"
                         clarification = (
                             f"I'd love to help! Your question \"{question}\" is a bit broad. "
                             f"Could you be more specific? Here's what I know about:\n\n"
                             + "\n".join(f"- {s}" for s in suggestions)
-                            + "\n\nFor example, try: *\"What are the properties of Shatavari?\"*"
+                            + f"\n\nFor example, try: *\"What are the properties of {example_name}?\"*"
                         )
                         return {"needs_clarification": True, "clarification_question": clarification}
             except Exception as e:
@@ -310,7 +316,7 @@ class EnhancedRAGService:
         try:
             async with self.neo4j.session() as session:
                 res = await session.run(f"""
-                    CALL db.index.vector.queryNodes('embedding_idx', $top_k, $embedding) YIELD node, score
+                    CALL db.index.vector.queryNodes('{settings.VECTOR_INDEX_NAME}', $top_k, $embedding) YIELD node, score
                     WHERE node.name IS NOT NULL {scope_filter}
                     RETURN COALESCE(node.id, elementId(node)) AS node_id,
                            node.name AS name,
@@ -533,26 +539,28 @@ class EnhancedRAGService:
             return nodes, rels, entity_profiles, backbone
 
         async def _get_ml_similar():
-            """ML enrichment with cached GDS check."""
+            """ML enrichment using dynamically managed GDS projection."""
             ml_nodes = []
             try:
-                # Use cached check — only query GDS once per service lifetime
-                if self._gds_projection_exists is None:
-                    async with self.neo4j.session() as session:
-                        check = await session.run(
-                            "CALL gds.graph.exists('neural_nexus_all_undirected_native') YIELD exists RETURN exists"
-                        )
-                        rec = await check.single()
-                        self._gds_projection_exists = bool(rec and rec["exists"])
+                # Get the active projection name from our central GDS service (caches locally)
+                if self._gds_projection_name is None:
+                    gds = get_gds_service()
+                    # The RAG service needs the undirected graph for node similarity
+                    # We pass the scope folder_id so GDS service gives us the right context
+                    folder_id = state.get("scope", {}).get("folder_id") if state.get("scope") else None
+                    self._gds_projection_name = await gds.ensure_projection(
+                        folder_id=folder_id, 
+                        undirected=True
+                    )
 
-                if not self._gds_projection_exists:
+                if not self._gds_projection_name:
                     return []
 
                 async with self.neo4j.session() as session:
-                    result = await session.run("""
-                        CALL gds.nodeSimilarity.stream('neural_nexus_all_undirected_native', {
+                    result = await session.run(f"""
+                        CALL gds.nodeSimilarity.stream('{self._gds_projection_name}', {{
                             topK: 3, similarityCutoff: 0.3
-                        })
+                        }})
                         YIELD node1, node2, similarity
                         WITH gds.util.asNode(node1) AS n1, gds.util.asNode(node2) AS n2, similarity
                         WHERE n1.id IN $seeds OR n2.id IN $seeds
@@ -714,56 +722,7 @@ class EnhancedRAGService:
         full_context = "\n".join(context_parts)
 
         # Feature 1: Strict database grounding + natural language response
-        system_prompt = (
-            "You are the Neural Nexus, a brilliant and friendly wellness expert powered EXCLUSIVELY by a knowledge graph database. "
-            "Every piece of information you share MUST come from the provided database evidence. "
-            "You do NOT generate any information from your own training data.\n\n"
-
-            "ABSOLUTE RULES:\n\n"
-
-            "1. **DATABASE-ONLY ANSWERS**: Your answer must come ONLY from the ENTITY PROFILES, DATABASE EVIDENCE, "
-            "and GRAPH CONNECTIONS provided below. If information is in the evidence, USE IT. If it's NOT in the evidence, "
-            "say 'This specific information is not in our database.' Do NOT invent or generalize.\n\n"
-
-            "2. **SEMANTIC MATCHING (CRITICAL)**: The user's phrasing and the database names may differ. "
-            "YOU MUST intelligently match them:\n"
-            "   - User says 'medications for menopause' → Match 'Menopause Relief', 'Hormonal Balance', 'Estrogenic' etc.\n"
-            "   - User says 'what helps with memory' → Match 'Memory Enhancer', 'Brain Tonic', 'Cognitive Support' etc.\n"
-            "   - User says 'stress remedies' → Match 'Stress Relief', 'Adaptogen', 'Calms Nervous System' etc.\n"
-            "   ANY entity in the evidence that semantically relates to the question IS relevant — use it!\n\n"
-
-            "3. **READ THE ENTITY PROFILES CAREFULLY**: The COMPLETE ENTITY PROFILES section contains full details for each entity, "
-            "including ALL their connections (what they treat, their properties, aliases, qualities, etc.). "
-            "Use this structured data to build comprehensive answers. For example, if the profile shows:\n"
-            "   'Shatavari [Herb]\n   TREATS: Menopause Relief\n   HAS_PROPERTY: Estrogenic\n   ALSO_KNOWN_AS: Asparagus Racemosus'\n"
-            "Then when asked about menopause, include Shatavari AND explain its connection pathway.\n\n"
-
-            "4. **FOLLOW ALL CONNECTION PATHS**: When the evidence shows multi-hop connections like:\n"
-            "   'Brahmi -> Brain Tonic -> Memory Enhancer'\n"
-            "   Explain the FULL chain naturally: 'Brahmi is expressed as a Brain Tonic, which directly treats Memory Enhancement.'\n\n"
-
-            "5. **INCLUDE 'ALSO KNOWN AS' / ALIASES**: If the database shows an entity has aliases or alternative names, "
-            "ALWAYS mention them: 'Shatavari (also known as Asparagus Racemosus)...'\n\n"
-
-            "6. **NATURAL, CONVERSATIONAL LANGUAGE**: Write like a knowledgeable friend explaining to a patient. "
-            "Use complete sentences with proper grammar. NO bullet-only lists — explain with context:\n"
-            "   BAD: '• Brahmi - Memory Enhancer'\n"
-            "   GOOD: 'Based on our database, **Brahmi** is specifically linked to memory enhancement. "
-            "It functions as a Brain Tonic and has direct TREATS connections to Memory Enhancer properties.'\n\n"
-
-            "7. **BE COMPREHENSIVE**: If the question matches multiple entities, discuss ALL of them. "
-            "Don't stop at the first match. Group by relevance and explain how each one relates to the question.\n\n"
-
-            "8. **HONEST GAPS**: If the database truly has NO related information, say so clearly and helpfully. "
-            "But FIRST, thoroughly check ALL entity profiles and connections — often the answer is there under a different name.\n\n"
-
-            "9. **ML INSIGHTS**: If AI Predictions are present, mention them naturally as 'Our ML analysis also suggests...'\n\n"
-
-            "10. **FORMATTING**: Use markdown (bold, headers, bullet points) for clarity. Start with a direct answer, "
-            "then provide supporting details.\n\n"
-
-            "11. **GREETINGS**: For hi/hello, respond warmly and briefly describe what you can help with."
-        )
+        system_prompt = get_enhanced_rag_system_prompt()
 
         user_prompt = f"Database Evidence & Knowledge Graph Data:\n{full_context}\n\nUser's Question: {state['question']}"
 
@@ -859,7 +818,7 @@ class EnhancedRAGService:
             logger.info(f"[EnhancedRAG] Greeting detected: '{question}' — fast LLM response")
             try:
                 answer = await self.ai.chat([
-                    {"role": "system", "content": "You are a friendly, helpful knowledge assistant for an Ayurveda research database. Respond warmly and briefly to greetings, and tell the user what you can help with (searching their uploaded data, answering questions about herbs, properties, conditions, etc). Keep it to 2-3 sentences."},
+                    {"role": "system", "content": get_greeting_prompt()},
                     {"role": "user", "content": question}
                 ])
                 return {

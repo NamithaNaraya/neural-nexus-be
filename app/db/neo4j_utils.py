@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime
 
 from app.db.connections import get_neo4j_driver
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -106,34 +107,36 @@ async def create_fulltext_indexes() -> None:
         logger.info("Full-text indexes created (relationship indexes skipped for dynamic types)")
 
 
-async def create_vector_index(dimension: int = 1024, force_recreate: bool = False) -> None:
+async def create_vector_index(dimension: int = None, force_recreate: bool = False) -> None:
     """
     Create vector embedding index for semantic search.
     
     Args:
-        dimension: Embedding vector dimension (default 1024 for mxbai-embed-large)
+        dimension: Embedding vector dimension (defaults to settings.EMBEDDING_DIMENSION)
         force_recreate: If True, drops the existing index first.
     """
     driver = get_neo4j_driver()
+    dim = dimension or settings.EMBEDDING_DIMENSION
+    index_name = settings.VECTOR_INDEX_NAME
     
     async with driver.session() as session:
         if force_recreate:
             try:
-                await session.run("DROP INDEX embedding_idx IF EXISTS")
+                await session.run(f"DROP INDEX {index_name} IF EXISTS")
                 logger.info("Dropped existing vector index for recreation")
             except Exception as e:
                 logger.warning(f"Failed to drop vector index: {e}")
 
         try:
             await session.run(f"""
-                CREATE VECTOR INDEX embedding_idx IF NOT EXISTS
+                CREATE VECTOR INDEX {index_name} IF NOT EXISTS
                 FOR (n:Entity) ON (n.embedding)
                 OPTIONS {{indexConfig: {{
-                    `vector.dimensions`: {dimension},
+                    `vector.dimensions`: {dim},
                     `vector.similarity_function`: 'cosine'
                 }}}}
             """)
-            logger.info(f"Created vector index with dimension {dimension}")
+            logger.info(f"Created vector index '{index_name}' with dimension {dim}")
         except Exception as e:
             logger.debug(f"Vector index exists: {e}")
 
@@ -472,18 +475,19 @@ async def vector_search(
     Returns entities ordered by cosine similarity.
     """
     driver = get_neo4j_driver()
+    index_name = settings.VECTOR_INDEX_NAME
     
     if folder_id:
-        cypher = """
-        CALL db.index.vector.queryNodes('embedding_idx', $top_k, $embedding) YIELD node, score
+        cypher = f"""
+        CALL db.index.vector.queryNodes('{index_name}', $top_k, $embedding) YIELD node, score
         WHERE node.folder_id = $folder_id
         RETURN node, score
         ORDER BY score DESC
         """
         params = {"embedding": embedding, "folder_id": folder_id, "top_k": top_k}
     else:
-        cypher = """
-        CALL db.index.vector.queryNodes('embedding_idx', $top_k, $embedding) YIELD node, score
+        cypher = f"""
+        CALL db.index.vector.queryNodes('{index_name}', $top_k, $embedding) YIELD node, score
         RETURN node, score
         ORDER BY score DESC
         """

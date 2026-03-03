@@ -39,9 +39,8 @@ def get_node_type(labels: List[str], props: Dict[str, Any]) -> str:
 
 def get_node_name(labels: List[str], props: Dict[str, Any], node_id: str) -> str:
     """Find the best display name, avoiding technical IDs."""
-    # 1. Properties priority
-    # common descriptive keys
-    priority_keys = ['name', 'label', 'title', 'herb', 'quality', 'property', 'value', 'text', 'display_name']
+    # 1. Properties priority — configurable display name keys
+    priority_keys = settings.NODE_NAME_PRIORITY_KEYS
     for key in priority_keys:
         val = props.get(key)
         if val and isinstance(val, str) and len(val) < 100:

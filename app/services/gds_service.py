@@ -283,6 +283,155 @@ class GDSService:
             logger.info(f"[GDS] WCC returned {len(data)} results")
             return data
 
+    async def run_articlerank(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """ArticleRank — improved PageRank for graphs with diverse degree distributions."""
+        logger.info(f"[GDS] run_articlerank: folder_id={folder_id}, top_k={top_k}, target_type={target_type}")
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
+        query = """
+            CALL gds.articleRank.stream($graph_name)
+            YIELD nodeId, score
+            WITH gds.util.asNode(nodeId) AS node, score
+            WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
+            ORDER BY score DESC
+            LIMIT $top_k
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id)
+            data = await result.data()
+            logger.info(f"[GDS] ArticleRank returned {len(data)} results")
+            return data
+
+    async def run_hits(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """HITS — identifies hub nodes (link to many) and authority nodes (linked by many)."""
+        logger.info(f"[GDS] run_hits: folder_id={folder_id}, top_k={top_k}, target_type={target_type}")
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
+        query = """
+            CALL gds.hits.stream($graph_name, {})
+            YIELD nodeId, values
+            WITH gds.util.asNode(nodeId) AS node, values.hub AS hubScore, values.auth AS authScore
+            WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type,
+                   hubScore AS hub_score, authScore AS auth_score, (hubScore + authScore) AS score
+            ORDER BY authScore DESC
+            LIMIT $top_k
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id)
+            data = await result.data()
+            logger.info(f"[GDS] HITS returned {len(data)} results")
+            return data
+
+    async def run_leiden(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Leiden — improved community detection over Louvain, better quality communities."""
+        logger.info(f"[GDS] run_leiden: folder_id={folder_id}, target_type={target_type}")
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=True)
+        query = """
+            CALL gds.leiden.stream($graph_name, {
+                gamma: 1.0,
+                relationshipWeightProperty: 'weight'
+            })
+            YIELD nodeId, communityId
+            WITH gds.util.asNode(nodeId) AS node, communityId
+            WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, communityId AS community_id
+            ORDER BY community_id ASC
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, graph_name=graph_name, folder_id=folder_id, target_type=target_type)
+            data = await result.data()
+            logger.info(f"[GDS] Leiden returned {len(data)} results")
+            return data
+
+    async def run_kcore(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 50, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """K-Core — finds the stable, tightly-connected core of the graph."""
+        logger.info(f"[GDS] run_kcore: folder_id={folder_id}, target_type={target_type}")
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=True)
+        query = """
+            CALL gds.kcore.stream($graph_name)
+            YIELD nodeId, coreValue
+            WITH gds.util.asNode(nodeId) AS node, coreValue
+            WHERE coreValue >= 2
+            AND ($folder_id IS NULL OR node.folder_id = $folder_id)
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, coreValue AS score
+            ORDER BY coreValue DESC
+            LIMIT $top_k
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, graph_name=graph_name, top_k=top_k, folder_id=folder_id, target_type=target_type)
+            data = await result.data()
+            logger.info(f"[GDS] K-Core returned {len(data)} results")
+            return data
+
+    async def run_triangle_count(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 20, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Triangle Count — counts triangles per node to measure local clustering density."""
+        logger.info(f"[GDS] run_triangle_count: folder_id={folder_id}, target_type={target_type}")
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=True)
+        query = """
+            CALL gds.triangleCount.stream($graph_name)
+            YIELD nodeId, triangleCount
+            WITH gds.util.asNode(nodeId) AS node, triangleCount
+            WHERE triangleCount > 0
+            AND ($folder_id IS NULL OR node.folder_id = $folder_id)
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, triangleCount AS score
+            ORDER BY triangleCount DESC
+            LIMIT $top_k
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, graph_name=graph_name, top_k=top_k, folder_id=folder_id, target_type=target_type)
+            data = await result.data()
+            logger.info(f"[GDS] Triangle Count returned {len(data)} results")
+            return data
+
+    async def run_node_similarity(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Node Similarity — finds pairs of nodes that share similar neighborhoods (Jaccard)."""
+        logger.info(f"[GDS] run_node_similarity: folder_id={folder_id}, top_k={top_k}, target_type={target_type}")
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=True)
+        query = """
+            CALL gds.nodeSimilarity.stream($graph_name, {
+                topK: $top_k,
+                similarityCutoff: 0.01
+            })
+            YIELD node1, node2, similarity
+            WITH gds.util.asNode(node1) AS n1, gds.util.asNode(node2) AS n2, similarity
+            WHERE ($folder_id IS NULL OR n1.folder_id = $folder_id)
+            RETURN n1.id AS source_id, n1.name AS source_name, coalesce(n1.type, labels(n1)[0]) AS source_type,
+                   n2.id AS target_id, n2.name AS target_name, coalesce(n2.type, labels(n2)[0]) AS target_type,
+                   similarity AS score
+            ORDER BY similarity DESC
+            LIMIT $top_k
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, graph_name=graph_name, top_k=top_k, folder_id=folder_id, target_type=target_type)
+            data = await result.data()
+            logger.info(f"[GDS] Node Similarity returned {len(data)} results")
+            return data
+
+    async def run_degree(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Degree Centrality — counts direct connections per node."""
+        logger.info(f"[GDS] run_degree: folder_id={folder_id}, top_k={top_k}, target_type={target_type}")
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
+        query = """
+            CALL gds.degree.stream($graph_name)
+            YIELD nodeId, score
+            WITH gds.util.asNode(nodeId) AS node, score
+            WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
+            ORDER BY score DESC
+            LIMIT $top_k
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id)
+            data = await result.data()
+            logger.info(f"[GDS] Degree returned {len(data)} results")
+            return data
+
 # Dependency
 _gds_service = None
 

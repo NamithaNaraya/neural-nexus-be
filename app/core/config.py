@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     GEMINI_MODEL: str = "gemini-1.5-pro"
     GOOGLE_API_KEY: Optional[str] = None
     
+    # RAG Context & Persona
+    RAG_PERSONA: str = "knowledge assistant"
+    
     # === Azure Storage ===
     AZURE_STORAGE_CONNECTION_STRING: Optional[str] = None
     AZURE_CONTAINER_NAME: str = "knowledge-files"
@@ -62,9 +65,20 @@ class Settings(BaseSettings):
     
     # === Graph Schema Settings ===
     # Priority for label selection when a node has multiple labels
-    GRAPH_LABEL_PRIORITY: List[str] = ["Herb", "Property", "Quality", "Entity"]
+    # (Domain-specific labels like "Herb" should NOT be here — they come from n.type automatically)
+    GRAPH_LABEL_PRIORITY: List[str] = ["Entity"]
     # Labels that are internal/system and should be ignored for domain discovery
     GRAPH_SYSTEM_LABELS: List[str] = ["Entity", "Chunk", "File", "Folder", "Unknown"]
+    # Default node types shown in dropdowns when DB is empty or query fails
+    DEFAULT_NODE_TYPES: List[str] = ["Person", "Organization", "Concept", "Event", "Location", "Document", "Topic"]
+    # Default relationship types shown in dropdowns when DB is empty or query fails
+    DEFAULT_RELATIONSHIP_TYPES: List[str] = ["RELATED_TO", "BELONGS_TO", "PART_OF", "CREATED_BY", "WORKS_AT", "LOCATED_IN", "KNOWS"]
+    # Property keys to check (in order) when resolving a node's display name
+    NODE_NAME_PRIORITY_KEYS: List[str] = ["name", "label", "title", "value", "text", "display_name"]
+    
+    # === Vector / Embedding Settings ===
+    VECTOR_INDEX_NAME: str = "embedding_idx"
+    EMBEDDING_DIMENSION: int = 1024  # Must match the embedding model output (mxbai-embed-large = 1024)
     
     # === JWT Settings ===
     JWT_SECRET_KEY: str = "jwt-secret-key-change-in-production"
