@@ -17,6 +17,13 @@ class GDSService:
         self.active_projections = set()
         self._needs_refresh = True  # Force refresh on first run to clear stale Entity-only projections
 
+    def _filter_unnamed(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove results where the node name is null (internal/system nodes)."""
+        return [
+            r for r in data
+            if r.get("name") or (r.get("source_name") and r.get("target_name"))
+        ]
+
     def _get_graph_name(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, undirected: bool = False) -> str:
         """Generate a consistent graph name for a given scope."""
         suffix = "_undirected" if undirected else ""
@@ -36,17 +43,14 @@ class GDSService:
             return global_name
         
         logger.info(f"Creating global undirected native projection: {global_name}")
-        await session.run(f"""
-            CALL gds.graph.project(
+        await session.run("""
+            CALL gds.graph.project.cypher(
                 $name,
-                '*',
-                {{
-                    _ALL_: {{
-                        type: '*',
-                        orientation: 'UNDIRECTED',
-                        properties: {{weight: {{property: 'strength', defaultValue: 1.0}}}}
-                    }}
-                }}
+                'MATCH (n) WHERE n.name IS NOT NULL RETURN id(n) AS id, labels(n) AS labels',
+                'MATCH (a)-[r]-(b)
+                 WHERE a.name IS NOT NULL AND b.name IS NOT NULL
+                 RETURN id(a) AS source, id(b) AS target, type(r) AS type,
+                        coalesce(r.strength, 1.0) AS weight'
             )
         """, name=global_name)
         self.active_projections.add(global_name)
@@ -110,9 +114,10 @@ class GDSService:
                     await session.run("""
                         CALL gds.graph.project.cypher(
                             $name,
-                            'MATCH (n) WHERE n.id IN $node_ids RETURN id(n) AS id, labels(n) AS labels',
+                            'MATCH (n) WHERE n.id IN $node_ids AND n.name IS NOT NULL RETURN id(n) AS id, labels(n) AS labels',
                             'MATCH (a)-[r]->(b) 
-                             WHERE a.id IN $node_ids AND b.id IN $node_ids 
+                             WHERE a.id IN $node_ids AND b.id IN $node_ids
+                             AND a.name IS NOT NULL AND b.name IS NOT NULL
                              RETURN id(a) AS source, id(b) AS target, type(r) AS type, 
                                     coalesce(r.strength, 1.0) AS weight',
                             {parameters: {node_ids: $node_ids}}
@@ -124,29 +129,27 @@ class GDSService:
                     await session.run("""
                         CALL gds.graph.project.cypher(
                             $name,
-                            'MATCH (n) WHERE n.folder_id = $folder_id RETURN id(n) AS id, labels(n) AS labels',
+                            'MATCH (n) WHERE n.folder_id = $folder_id AND n.name IS NOT NULL RETURN id(n) AS id, labels(n) AS labels',
                             'MATCH (a)-[r]->(b) 
-                             WHERE a.folder_id = $folder_id AND b.folder_id = $folder_id 
+                             WHERE a.folder_id = $folder_id AND b.folder_id = $folder_id
+                             AND a.name IS NOT NULL AND b.name IS NOT NULL
                              RETURN id(a) AS source, id(b) AS target, type(r) AS type, 
                                     coalesce(r.strength, 1.0) AS weight',
                             {parameters: {folder_id: $folder_id}}
                         )
                     """, name=graph_name, folder_id=folder_id)
                 else:
-                    # Native projection for full graph (fastest)
                     orientation = "UNDIRECTED" if undirected else "NATURAL"
-                    logger.info(f"Creating native projection with orientation={orientation}")
+                    logger.info(f"Creating Cypher projection for full graph with orientation={orientation}")
+                    rel_pattern = 'MATCH (a)-[r]-(b)' if undirected else 'MATCH (a)-[r]->(b)'
                     await session.run(f"""
-                        CALL gds.graph.project(
+                        CALL gds.graph.project.cypher(
                             $name,
-                            '*',
-                            {{
-                                _ALL_: {{
-                                    type: '*',
-                                    orientation: '{orientation}',
-                                    properties: {{weight: {{property: 'strength', defaultValue: 1.0}}}}
-                                }}
-                            }}
+                            'MATCH (n) WHERE n.name IS NOT NULL RETURN id(n) AS id, labels(n) AS labels',
+                            '{rel_pattern}
+                             WHERE a.name IS NOT NULL AND b.name IS NOT NULL
+                             RETURN id(a) AS source, id(b) AS target, type(r) AS type,
+                                    coalesce(r.strength, 1.0) AS weight'
                         )
                     """, name=graph_name)
                 
@@ -205,7 +208,7 @@ class GDSService:
             result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id)
             data = await result.data()
             logger.info(f"[GDS] PageRank returned {len(data)} results")
-            return data
+            return self._filter_unnamed(data)
 
     async def run_betweenness(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         logger.info(f"[GDS] run_betweenness: folder_id={folder_id}, node_ids={node_ids}, top_k={top_k}, target_type={target_type}")
@@ -225,7 +228,7 @@ class GDSService:
             result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id)
             data = await result.data()
             logger.info(f"[GDS] Betweenness returned {len(data)} results")
-            return data
+            return self._filter_unnamed(data)
 
     async def run_closeness(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         logger.info(f"[GDS] run_closeness: folder_id={folder_id}, top_k={top_k}, target_type={target_type}")
@@ -245,7 +248,7 @@ class GDSService:
             result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id)
             data = await result.data()
             logger.info(f"[GDS] Closeness returned {len(data)} results")
-            return data
+            return self._filter_unnamed(data)
 
     async def run_louvain(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         logger.info(f"[GDS] run_louvain: folder_id={folder_id}, target_type={target_type}")
@@ -263,7 +266,7 @@ class GDSService:
             result = await session.run(query, graph_name=graph_name, folder_id=folder_id, target_type=target_type)
             data = await result.data()
             logger.info(f"[GDS] Louvain returned {len(data)} results")
-            return data
+            return self._filter_unnamed(data)
 
     async def run_wcc(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         logger.info(f"[GDS] run_wcc: folder_id={folder_id}, target_type={target_type}")
@@ -281,7 +284,7 @@ class GDSService:
             result = await session.run(query, graph_name=graph_name, folder_id=folder_id, target_type=target_type)
             data = await result.data()
             logger.info(f"[GDS] WCC returned {len(data)} results")
-            return data
+            return self._filter_unnamed(data)
 
     async def run_articlerank(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """ArticleRank — improved PageRank for graphs with diverse degree distributions."""
@@ -301,7 +304,7 @@ class GDSService:
             result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id)
             data = await result.data()
             logger.info(f"[GDS] ArticleRank returned {len(data)} results")
-            return data
+            return self._filter_unnamed(data)
 
     async def run_hits(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """HITS — identifies hub nodes (link to many) and authority nodes (linked by many)."""
@@ -322,7 +325,7 @@ class GDSService:
             result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id)
             data = await result.data()
             logger.info(f"[GDS] HITS returned {len(data)} results")
-            return data
+            return self._filter_unnamed(data)
 
     async def run_leiden(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """Leiden — improved community detection over Louvain, better quality communities."""
@@ -344,7 +347,7 @@ class GDSService:
             result = await session.run(query, graph_name=graph_name, folder_id=folder_id, target_type=target_type)
             data = await result.data()
             logger.info(f"[GDS] Leiden returned {len(data)} results")
-            return data
+            return self._filter_unnamed(data)
 
     async def run_kcore(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 50, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """K-Core — finds the stable, tightly-connected core of the graph."""
@@ -365,7 +368,7 @@ class GDSService:
             result = await session.run(query, graph_name=graph_name, top_k=top_k, folder_id=folder_id, target_type=target_type)
             data = await result.data()
             logger.info(f"[GDS] K-Core returned {len(data)} results")
-            return data
+            return self._filter_unnamed(data)
 
     async def run_triangle_count(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 20, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """Triangle Count — counts triangles per node to measure local clustering density."""
@@ -386,7 +389,7 @@ class GDSService:
             result = await session.run(query, graph_name=graph_name, top_k=top_k, folder_id=folder_id, target_type=target_type)
             data = await result.data()
             logger.info(f"[GDS] Triangle Count returned {len(data)} results")
-            return data
+            return self._filter_unnamed(data)
 
     async def run_node_similarity(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """Node Similarity — finds pairs of nodes that share similar neighborhoods (Jaccard)."""
@@ -410,7 +413,7 @@ class GDSService:
             result = await session.run(query, graph_name=graph_name, top_k=top_k, folder_id=folder_id, target_type=target_type)
             data = await result.data()
             logger.info(f"[GDS] Node Similarity returned {len(data)} results")
-            return data
+            return self._filter_unnamed(data)
 
     async def run_degree(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """Degree Centrality — counts direct connections per node."""
@@ -430,7 +433,7 @@ class GDSService:
             result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id)
             data = await result.data()
             logger.info(f"[GDS] Degree returned {len(data)} results")
-            return data
+            return self._filter_unnamed(data)
 
 # Dependency
 _gds_service = None
