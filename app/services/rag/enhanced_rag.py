@@ -284,17 +284,14 @@ class EnhancedRAGService:
 
     async def _vector_search_node(self, state: EnhancedRAGState) -> Dict[str, Any]:
         """
-        Hybrid search: Vector (semantic) + Lexical (keyword) + Relationship-aware.
+        Hybrid search: Lexical (fast) → Vector (semantic, only if needed) → Relationship-aware.
         Feature 8: Rerank by relevance × centrality.
+        Optimized: Skips expensive embedding if lexical search finds enough results.
         """
         logger.info(f"[EnhancedRAG] Entering _vector_search_node for: '{state['question'][:60]}...'")
-        logger.info("[EnhancedRAG] Generating embedding via Ollama...")
-        question_embedding = await self.ai.embed(state["question"])
-        logger.info(f"[EnhancedRAG] Embedding generated ({len(question_embedding)} dims)")
 
         params = {
             "terms": [w.strip("?,.!").lower() for w in state["question"].split() if len(w) > 2][:10],
-            "embedding": question_embedding,
             "top_k": 15,
         }
 
@@ -303,45 +300,26 @@ class EnhancedRAGService:
         scope_filter = ""
         if scope:
             if scope.get("type") == "folder":
-                scope_filter = "AND node.folder_id = $scope_id"
+                scope_filter = "AND (node.folder_id IS NULL OR node.folder_id = $scope_id)"
                 params["scope_id"] = scope["id"]
             elif scope.get("type") == "file":
-                scope_filter = "AND node.file_id = $scope_id"
+                scope_filter = "AND (node.file_id IS NULL OR node.file_id = $scope_id)"
                 params["scope_id"] = scope["id"]
 
         all_results = []
         seen = set()
 
-        # A. Vector search
-        try:
-            async with self.neo4j.session() as session:
-                res = await session.run(f"""
-                    CALL db.index.vector.queryNodes('{settings.VECTOR_INDEX_NAME}', $top_k, $embedding) YIELD node, score
-                    WHERE node.name IS NOT NULL {scope_filter}
-                    RETURN COALESCE(node.id, elementId(node)) AS node_id,
-                           node.name AS name,
-                           COALESCE(node.description, '') AS description,
-                           COALESCE(node.type, labels(node)[0]) AS type,
-                           score
-                """, params)
-                for r in await res.data():
-                    if r["node_id"] not in seen:
-                        all_results.append(r)
-                        seen.add(r["node_id"])
-        except Exception as e:
-            logger.warning(f"[RAG] Vector search failed: {e}")
-
-        # B. Lexical search (direct name/description match)
+        # ── A. Lexical search FIRST (fast, no embedding needed) ──
         try:
             async with self.neo4j.session() as session:
                 res = await session.run(f"""
                     MATCH (node)
-                    WHERE node.name IS NOT NULL
-                    AND ANY(term IN $terms WHERE toLower(node.name) CONTAINS term
+                    WHERE (node.name IS NOT NULL OR node.text IS NOT NULL OR node.title IS NOT NULL)
+                    AND ANY(term IN $terms WHERE toLower(COALESCE(node.name, node.text, node.title, '')) CONTAINS term
                             OR toLower(COALESCE(node.description,'')) CONTAINS term)
                     {scope_filter}
                     RETURN COALESCE(node.id, elementId(node)) AS node_id,
-                           node.name AS name,
+                           COALESCE(node.name, node.text, node.title, '') AS name,
                            COALESCE(node.description, '') AS description,
                            COALESCE(node.type, labels(node)[0]) AS type,
                            0.85 AS score
@@ -354,32 +332,61 @@ class EnhancedRAGService:
         except Exception as e:
             logger.warning(f"[RAG] Lexical search failed: {e}")
 
-        # C. Relationship-aware search: find nodes connected TO matched terms
-        # This catches cases where user says "medications" but the node is
-        # "Menopause Relief" connected via HAS_PROPERTY/TREATS/etc.
-        try:
-            async with self.neo4j.session() as session:
-                scope_filter_c = scope_filter.replace("node.", "connected.")
-                res = await session.run(f"""
-                    MATCH (node)-[r]-(connected)
-                    WHERE node.name IS NOT NULL AND connected.name IS NOT NULL
-                    AND ANY(term IN $terms WHERE toLower(connected.name) CONTAINS term
-                            OR toLower(COALESCE(connected.description,'')) CONTAINS term)
-                    {scope_filter_c}
-                    WITH DISTINCT node, max(0.80) AS score
-                    RETURN COALESCE(node.id, elementId(node)) AS node_id,
-                           node.name AS name,
-                           COALESCE(node.description, '') AS description,
-                           COALESCE(node.type, labels(node)[0]) AS type,
-                           score
-                    LIMIT 15
-                """, params)
-                for r in await res.data():
-                    if r["node_id"] not in seen:
-                        all_results.append(r)
-                        seen.add(r["node_id"])
-        except Exception as e:
-            logger.warning(f"[RAG] Relationship-aware search failed: {e}")
+        logger.info(f"[RAG] Lexical search found {len(all_results)} results")
+
+        # ── B. Vector search ONLY if lexical didn't find enough ──
+        if len(all_results) < 3:
+            try:
+                logger.info("[EnhancedRAG] Lexical insufficient, generating embedding via Ollama...")
+                question_embedding = await self.ai.embed(state["question"])
+                params["embedding"] = question_embedding
+                logger.info(f"[EnhancedRAG] Embedding generated ({len(question_embedding)} dims)")
+
+                async with self.neo4j.session() as session:
+                    res = await session.run(f"""
+                        CALL db.index.vector.queryNodes('{settings.VECTOR_INDEX_NAME}', $top_k, $embedding) YIELD node, score
+                        WHERE (node.name IS NOT NULL OR node.text IS NOT NULL OR node.title IS NOT NULL) {scope_filter}
+                        RETURN COALESCE(node.id, elementId(node)) AS node_id,
+                               COALESCE(node.name, node.text, node.title, '') AS name,
+                               COALESCE(node.description, '') AS description,
+                               COALESCE(node.type, labels(node)[0]) AS type,
+                               score
+                    """, params)
+                    for r in await res.data():
+                        if r["node_id"] not in seen:
+                            all_results.append(r)
+                            seen.add(r["node_id"])
+            except Exception as e:
+                logger.warning(f"[RAG] Vector search failed: {e}")
+        else:
+            logger.info("[RAG] Skipping vector search — lexical found enough results")
+
+        # ── C. Relationship-aware search (only if still need more) ──
+        if len(all_results) < 8:
+            try:
+                async with self.neo4j.session() as session:
+                    # REMOVED scope_filter_c: We want to find nodes connected to our terms
+                    # regardless of the connected node's folder. If they are connected to
+                    # something relevant, they are relevant.
+                    res = await session.run(f"""
+                        MATCH (node)-[r]-(connected)
+                        WHERE node.name IS NOT NULL AND connected.name IS NOT NULL
+                        AND ANY(term IN $terms WHERE toLower(connected.name) CONTAINS term
+                                OR toLower(COALESCE(connected.description,'')) CONTAINS term)
+                        WITH DISTINCT node, max(0.80) AS score
+                        RETURN COALESCE(node.id, elementId(node)) AS node_id,
+                               node.name AS name,
+                               COALESCE(node.description, '') AS description,
+                               COALESCE(node.type, labels(node)[0]) AS type,
+                               score
+                        LIMIT 15
+                    """, params)
+                    for r in await res.data():
+                        if r["node_id"] not in seen:
+                            all_results.append(r)
+                            seen.add(r["node_id"])
+            except Exception as e:
+                logger.warning(f"[RAG] Relationship-aware search failed: {e}")
 
         # Feature 8: Rerank by relevance × graph centrality
         if all_results:
@@ -405,7 +412,7 @@ class EnhancedRAGService:
                 logger.warning(f"[RAG] Citation reranking failed: {e}")
                 all_results.sort(key=lambda x: x["score"], reverse=True)
 
-        logger.info(f"[RAG] Retrieval: {len(all_results)} results (vector+lexical+relationship+reranked)")
+        logger.info(f"[RAG] Retrieval: {len(all_results)} results (optimized pipeline)")
         return {"vector_results": all_results[:25]}
 
     # ═══════════════════════════════════════════════════════
@@ -439,11 +446,14 @@ class EnhancedRAGService:
         if scope:
             params["sid"] = scope.get("id")
             if scope.get("type") == "folder":
-                scope_filter = "AND (related.folder_id = $sid OR r.folder_id = $sid)"
-                scope_filter_2hop = "AND (hop2.folder_id = $sid OR r2.folder_id = $sid)"
+                # Lenient filter: include nodes WITHOUT folder_id (they're shared/global nodes
+                # like questions, exams, properties that are part of the graph but weren't
+                # tagged with a folder). Seed nodes are already scoped via vector search.
+                scope_filter = "AND (related.folder_id IS NULL OR related.folder_id = $sid)"
+                scope_filter_2hop = "AND (hop2.folder_id IS NULL OR hop2.folder_id = $sid)"
             elif scope.get("type") == "file":
-                scope_filter = "AND ($sid IN related.file_ids OR related.file_id = $sid)"
-                scope_filter_2hop = "AND ($sid IN hop2.file_ids OR hop2.file_id = $sid)"
+                scope_filter = "AND (related.file_id IS NULL OR $sid IN related.file_ids OR related.file_id = $sid)"
+                scope_filter_2hop = "AND (hop2.file_id IS NULL OR $sid IN hop2.file_ids OR hop2.file_id = $sid)"
 
         # ─── Run entity profiles, ML enrichment, and prediction check CONCURRENTLY ───
         t0 = _time.time()
@@ -459,25 +469,27 @@ class EnhancedRAGService:
                         UNWIND $node_ids AS nodeId
                         MATCH (n) WHERE n.id = nodeId OR elementId(n) = nodeId
                         OPTIONAL MATCH (n)-[r1]-(hop1)
-                        WHERE hop1 IS NOT NULL {scope_filter.replace('related', 'hop1').replace(' r.', ' r1.')}
+                        WHERE hop1 IS NOT NULL
+                        WITH n, nodeId, hop1, r1,
+                             COALESCE(hop1.name, hop1.text, hop1.title, hop1.label, elementId(hop1)) as hop1_title
                         OPTIONAL MATCH (hop1)-[r2]-(hop2)
                         WHERE hop2 IS NOT NULL AND hop2 <> n {scope_filter_2hop}
                         WITH n,
                              collect(DISTINCT {{
-                               name: hop1.name,
+                               name: hop1_title,
                                type: COALESCE(hop1.type, labels(hop1)[0]),
                                rel: type(r1),
                                desc: COALESCE(hop1.description, '')
                              }}) AS direct_connections,
                              collect(DISTINCT {{
-                               from_name: hop1.name,
+                               from_name: hop1_title,
                                from_rel: type(r1),
-                               name: hop2.name,
+                               name: COALESCE(hop2.name, hop2.text, hop2.title, hop2.label, elementId(hop2)),
                                type: COALESCE(hop2.type, labels(hop2)[0]),
                                rel: type(r2),
                                desc: COALESCE(hop2.description, '')
                              }}) AS two_hop_connections
-                        RETURN n.name AS entity_name,
+                        RETURN COALESCE(n.name, n.text, n.title, n.label, elementId(n)) AS entity_name,
                                COALESCE(n.type, labels(n)[0]) AS entity_type,
                                COALESCE(n.description, '') AS entity_desc,
                                direct_connections[..25] AS direct,
@@ -539,23 +551,13 @@ class EnhancedRAGService:
             return nodes, rels, entity_profiles, backbone
 
         async def _get_ml_similar():
-            """ML enrichment using dynamically managed GDS projection."""
+            """ML enrichment — only if GDS projection is already cached (don't create in RAG hot path)."""
             ml_nodes = []
+            # Skip if no projection is cached — creating one takes 5-15s and isn't worth it for chat
+            if self._gds_projection_name is None:
+                logger.debug("[RAG] ML enrichment skipped — no cached GDS projection")
+                return []
             try:
-                # Get the active projection name from our central GDS service (caches locally)
-                if self._gds_projection_name is None:
-                    gds = get_gds_service()
-                    # The RAG service needs the undirected graph for node similarity
-                    # We pass the scope folder_id so GDS service gives us the right context
-                    folder_id = state.get("scope", {}).get("folder_id") if state.get("scope") else None
-                    self._gds_projection_name = await gds.ensure_projection(
-                        folder_id=folder_id, 
-                        undirected=True
-                    )
-
-                if not self._gds_projection_name:
-                    return []
-
                 async with self.neo4j.session() as session:
                     result = await session.run(f"""
                         CALL gds.nodeSimilarity.stream('{self._gds_projection_name}', {{
@@ -580,12 +582,16 @@ class EnhancedRAGService:
             return ml_nodes
 
         async def _get_predictions():
-            """Prediction context with cached model catalog."""
+            """Prediction context — only if we already have cached model catalog with LP models."""
             predictions = []
+            # Skip the expensive gds.model.list() call if we haven't cached models yet
+            # or if the last check found no LP models
+            if self._model_catalog_cache is not None and len(self._model_catalog_cache) == 0:
+                return []  # Previously checked, no models exist
             try:
-                # Cache model catalog for 60 seconds
                 now = _time.time()
-                if self._model_catalog_cache is None or (now - self._model_catalog_ts) > 60:
+                if self._model_catalog_cache is None or (now - self._model_catalog_ts) > 300:
+                    # First-time check or refresh every 5 minutes (was 60s)
                     async with self.neo4j.session() as session:
                         models = await session.run(
                             "CALL gds.model.list() YIELD modelName, modelType "
@@ -615,7 +621,7 @@ class EnhancedRAGService:
                 logger.debug(f"[RAG] Predictions skipped: {e}")
             return predictions
 
-        # ─── Run ALL THREE concurrently ───
+        # ─── Run entity profiles ALWAYS + ML/predictions only if fast ───
         (nodes, rels, entity_profiles, backbone), ml_nodes, predictions = await asyncio.gather(
             _get_entity_profiles(),
             _get_ml_similar(),

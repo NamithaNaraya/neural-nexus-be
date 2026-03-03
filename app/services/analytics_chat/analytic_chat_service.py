@@ -58,22 +58,31 @@ class AnalyticChatService:
                 "resolved_entities": resolved_node_ids
             }
 
-        # 3. Run the chosen algorithm (scoped to folder or user-selected nodes)
+        # 3. Determine the graph scope for the algorithm
         target_type = decision.get("target_type")
         
         # Validate target_type: if it doesn't match any available type, don't filter
-        # (e.g. LLM picks "Herb" but data only has "Entity" — filtering would return 0)
         if target_type and available_types:
             type_match = any(t.lower() == target_type.lower() for t in available_types)
             if not type_match:
                 logger.warning(f"[AnalyticChat] target_type '{target_type}' not found in available types {available_types} — removing filter")
                 target_type = None
         
-        # For "path" OR "node_similarity" with specific names, we prioritize those entities
+        # LOGIC FIX:
+        # - For "path" OR "node_similarity" between specific names, use resolved_node_ids.
+        # - For analytical algorithms (pagerank, degree, community, etc.), use the FULL FOLDER scope
+        #   even if specific nodes are selected in the UI. This allows comparative analysis.
+        global_algos = ("pagerank", "articlerank", "betweenness", "closeness", "degree", "hits", "louvain", "leiden", "wcc", "kcore", "triangle_count")
+        
         if algo_name in ("path", "node_similarity") and resolved_node_ids and len(resolved_node_ids) >= 2:
             algo_node_ids = resolved_node_ids
+        elif algo_name in global_algos:
+            # For global/ranking algorithms, we ignore specific node selections to allow folder-wide comparison
+            # Unless NO folder is selected, then we fallback to UI selection
+            algo_node_ids = None if folder_id else node_ids
         else:
-            algo_node_ids = scope_node_ids  # Use UI selection scope
+            # Fallback to UI selection
+            algo_node_ids = node_ids
         
         results = await self._run_algorithm(algo_name, folder_id, algo_node_ids, params, target_type)
         
@@ -117,8 +126,16 @@ class AnalyticChatService:
                     fid=folder_id
                 )
                 types_data = await type_result.data()
-                available_types = [t['t'] for t in types_data if t['t']]
-                type_summary = ", ".join([f"{t['t']}({t['c']})" for t in types_data])
+                # Strip folder suffix (e.g. Student_F_abc -> Student) to provide clean types to the LLM
+                available_types = []
+                type_summary_list = []
+                for t in types_data:
+                    if not t['t']: continue
+                    clean_type = t['t'].split("_F_")[0]
+                    available_types.append(clean_type)
+                    type_summary_list.append(f"{clean_type}({t['c']})")
+                
+                type_summary = ", ".join(type_summary_list)
                 parts.append(f"Active folder: {folder_id} with {count} nodes. Types: [{type_summary}]")
             elif node_ids:
                 parts.append(f"Selected {len(node_ids)} specific nodes")

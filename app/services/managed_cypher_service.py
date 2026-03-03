@@ -162,60 +162,51 @@ class ManagedCypherService:
         Rewrites a data statement (MERGE/CREATE/MATCH/etc.) by injecting
         the folder label into all node patterns.
 
-        Uses a careful regex that avoids matching relationship patterns like
-        -[:REL_TYPE]-> or -[r:REL_TYPE {props}]->.
+        Processes the entire statement to handle multi-line patterns correctly.
         """
         seen_vars: set = set()
 
         # ── Node pattern regex ──
-        # Matches: (var:Label {props}) but NOT [...] (relationship patterns)
-        # Key: We match opening '(' (not '[') to distinguish nodes from rels.
+        # Matches: (var:Label {props})
+        # re.DOTALL allows matching across newlines within the parens
         node_pattern = re.compile(
             r'(\(\s*)'                          # Group 1: opening paren + optional whitespace
             r'([a-zA-Z_][a-zA-Z0-9_]*)?'        # Group 2: optional variable name
-            r'(\s*(?::[a-zA-Z_][a-zA-Z0-9_:]*))?' # Group 3: optional labels like :Herb:Plant
-            r'(\s*\{[^}]*\})?'                  # Group 4: optional properties block { ... }
-            r'(\s*\))'                          # Group 5: closing paren
+            r'(\s*(?::[a-zA-Z_][a-zA-Z0-9_:]*))?' # Group 3: optional labels
+            r'(\s*\{.*?\})?'                    # Group 4: optional properties block (non-greedy)
+            r'(\s*\))',                         # Group 5: closing paren
+            re.DOTALL
         )
 
         def _inject_folder(match: re.Match) -> str:
             prefix = match.group(1)     # '('
             var = match.group(2) or ""  # variable name or empty
-            labels = match.group(3) or ""  # ':Label1:Label2' or empty
-            props = match.group(4) or ""   # ' {name: "x"}' or empty
+            labels = match.group(3) or ""  # ':Label1:Label2'
+            props = match.group(4) or ""   # ' {name: "x"}'
             suffix = match.group(5)     # ')'
 
-            # If the variable was already seen in this statement, don't re-inject
+            # If the variable was already seen in this statement, don't re-inject labels
             if var and var in seen_vars:
                 return match.group(0)
             if var:
                 seen_vars.add(var)
 
-            # Prefix user labels
-            new_labels = prefix_fn(labels)
+            # Prefix existing labels (School -> School_F_xxx)
+            new_labels = prefix_fn(labels) or ""
 
-            # Always ensure the folder label is present
-            if folder_label not in (new_labels or ""):
+            # STRICT CHECK: Ensure the base folder label is present as a standalone label
+            existing_parts = [p for p in new_labels.split(':') if p]
+            if folder_label not in existing_parts:
                 new_labels = f"{new_labels}:{folder_label}" if new_labels else f":{folder_label}"
 
             return f"{prefix}{var}{new_labels}{props}{suffix}"
 
-        # Before applying the regex, strip comment lines so they don't get modified.
-        # We process line-by-line: comment lines are passed through unchanged,
-        # data lines get the node_pattern replacement.
-        lines = stmt.split('\n')
-        processed_lines = []
-
-        for line in lines:
-            stripped_line = line.strip()
-            # Skip full-line comments
-            if stripped_line.startswith('//') or stripped_line.startswith('/*'):
-                processed_lines.append(line)
-                continue
-            # Apply node pattern injection on data lines
-            processed_lines.append(node_pattern.sub(_inject_folder, line))
-
-        return '\n'.join(processed_lines)
+        # We remove comments first so we don't accidentally rewrite inside them
+        # (Already partially handled by the caller, but let's be safe)
+        clean_stmt = re.sub(r'//.*', '', stmt)
+        
+        # Apply replacement on the whole statement
+        return node_pattern.sub(_inject_folder, clean_stmt)
 
     # ──────────────────────────────────────────────────────────────────────
     #  Main Execution Entry Point
@@ -284,10 +275,13 @@ class ManagedCypherService:
                 raise
 
             # ── Step 2: Adopt nodes — tag with :Entity, file_id, folder_id ──
+            # Improved adoption: catch any node that has the folder-specific label
             try:
+                # Normalization: Promote common name-like fields (text, title, label, code) 
+                # to 'name' so RAG and Search can find them.
                 adoption_result = await session.run(f"""
                     MATCH (n:{folder_label})
-                    WHERE n.file_id IS NULL OR n.file_id = $file_id
+                    WHERE NOT n:Entity OR n.file_id IS NULL OR n.file_id = $file_id
                     SET n.file_id = CASE WHEN n.file_id IS NULL THEN $file_id ELSE n.file_id END,
                         n.folder_id = CASE WHEN n.folder_id IS NULL THEN $folder_id ELSE n.folder_id END,
                         n.file_ids = CASE
@@ -295,9 +289,17 @@ class ManagedCypherService:
                             WHEN NOT $file_id IN n.file_ids THEN n.file_ids + $file_id
                             ELSE n.file_ids
                         END,
+                        n.type = CASE 
+                            WHEN n.type IS NULL THEN [lbl IN labels(n) WHERE lbl <> $folder_label AND lbl <> 'Entity'][0]
+                            ELSE n.type 
+                        END,
+                        n.name = CASE
+                            WHEN n.name IS NULL THEN COALESCE(n.text, n.title, n.label, n.code, n.type, 'Unnamed Entity')
+                            ELSE n.name
+                        END,
                         n:Entity
                     RETURN count(n) as adopted_count
-                """, {"file_id": file_id, "folder_id": folder_id})
+                """, {"file_id": file_id, "folder_id": folder_id, "folder_label": folder_label})
                 adoption_record = await adoption_result.single()
                 adopted = adoption_record["adopted_count"] if adoption_record else 0
                 logger.info(f"Adopted {adopted} nodes for file {file_id}")

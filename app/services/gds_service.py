@@ -199,7 +199,7 @@ class GDSService:
             YIELD nodeId, score
             WITH gds.util.asNode(nodeId) AS node, score
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
             RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
             ORDER BY score DESC
             LIMIT $top_k
@@ -219,7 +219,7 @@ class GDSService:
             YIELD nodeId, score
             WITH gds.util.asNode(nodeId) AS node, score
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
             RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
             ORDER BY score DESC
             LIMIT $top_k
@@ -239,7 +239,7 @@ class GDSService:
             WITH gds.util.asNode(nodeId) AS node, score
             WHERE score > 0
             AND ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
             RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
             ORDER BY score DESC
             LIMIT $top_k
@@ -258,7 +258,7 @@ class GDSService:
             YIELD nodeId, communityId
             WITH gds.util.asNode(nodeId) AS node, communityId
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
             RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, communityId AS community_id
             ORDER BY community_id ASC
         """
@@ -276,7 +276,7 @@ class GDSService:
             YIELD nodeId, componentId
             WITH gds.util.asNode(nodeId) AS node, componentId
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
             RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, componentId AS community_id
             ORDER BY community_id ASC
         """
@@ -295,7 +295,7 @@ class GDSService:
             YIELD nodeId, score
             WITH gds.util.asNode(nodeId) AS node, score
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
             RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
             ORDER BY score DESC
             LIMIT $top_k
@@ -315,7 +315,7 @@ class GDSService:
             YIELD nodeId, values
             WITH gds.util.asNode(nodeId) AS node, values.hub AS hubScore, values.auth AS authScore
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
             RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type,
                    hubScore AS hub_score, authScore AS auth_score, (hubScore + authScore) AS score
             ORDER BY authScore DESC
@@ -339,7 +339,7 @@ class GDSService:
             YIELD nodeId, communityId
             WITH gds.util.asNode(nodeId) AS node, communityId
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
             RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, communityId AS community_id
             ORDER BY community_id ASC
         """
@@ -359,7 +359,7 @@ class GDSService:
             WITH gds.util.asNode(nodeId) AS node, coreValue
             WHERE coreValue >= 2
             AND ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
             RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, coreValue AS score
             ORDER BY coreValue DESC
             LIMIT $top_k
@@ -380,7 +380,7 @@ class GDSService:
             WITH gds.util.asNode(nodeId) AS node, triangleCount
             WHERE triangleCount > 0
             AND ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
             RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, triangleCount AS score
             ORDER BY triangleCount DESC
             LIMIT $top_k
@@ -424,7 +424,7 @@ class GDSService:
             YIELD nodeId, score
             WITH gds.util.asNode(nodeId) AS node, score
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
-            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) = toLower($target_type))
+            AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
             RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
             ORDER BY score DESC
             LIMIT $top_k

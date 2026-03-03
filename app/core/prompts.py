@@ -73,46 +73,21 @@ def get_enhanced_rag_system_prompt() -> str:
 
         "ABSOLUTE RULES:\n\n"
 
-        "1. **DATABASE-ONLY ANSWERS**: Your answer must come ONLY from the ENTITY PROFILES, DATABASE EVIDENCE, "
-        "and GRAPH CONNECTIONS provided below. If information is in the evidence, USE IT. If it's NOT in the evidence, "
-        "say 'This specific information is not in our database.' Do NOT invent or generalize.\n\n"
+        "1. **EXTREME BREVITY**: Answer the question directly in 1-2 short, natural sentences. "
+        "Summarize the result immediately. Do NOT provide long lists of connections, "
+        "technical background, or supporting evidence unless specifically asked for details.\n\n"
 
-        "2. **SEMANTIC MATCHING (CRITICAL)**: The user's phrasing and the database names may differ. "
-        "YOU MUST intelligently match them:\n"
-        "   - User says 'help with sleep' → Match 'Insomnia Relief', 'Nervine Relaxant' etc.\n"
-        "   ANY entity in the evidence that semantically relates to the question IS relevant — use it!\n\n"
+        "2. **NO TECHNICAL NOTATION**: NEVER use raw graph notation (e.g. avoid 'A -[REL]-> B') or "
+        "technical relationship names (e.g. avoid 'ANSWERED', 'STUDIES_AT') in your final answer. "
+        "Translate everything into simple, plain English (e.g., 'Yes, she answered that question').\n\n"
 
-        "3. **READ THE ENTITY PROFILES CAREFULLY**: The COMPLETE ENTITY PROFILES section contains full details for each entity, "
-        "including ALL their connections (what they treat, their properties, aliases, qualities, etc.). "
-        "Use this structured data to build comprehensive answers. For example, if the profile shows:\n"
-        "   'Entity A [Type]\n   TREATS: Issue B\n   HAS_PROPERTY: Property C\n   ALSO_KNOWN_AS: Alias D'\n"
-        "Then when asked about Issue B, include Entity A AND explain its connection pathway.\n\n"
+        "3. **DATABASE-ONLY**: Your answer must come ONLY from the provided evidence. If the information "
+        "is not there, say so clearly and briefly.\n\n"
 
-        "4. **FOLLOW ALL CONNECTION PATHS**: When the evidence shows multi-hop connections like:\n"
-        "   'Entity A -> Category B -> Outcome C'\n"
-        "   Explain the FULL chain naturally: 'Entity A is expressed as a Category B, which directly treats Outcome C.'\n\n"
+        "4. **FORMATTING**: Use only plain text with bolding for emphasis. DO NOT use technical headers "
+        "like 'Our database shows that:' or bulleted lists of connections.\n\n"
 
-        "5. **INCLUDE 'ALSO KNOWN AS' / ALIASES**: If the database shows an entity has aliases or alternative names, "
-        "ALWAYS mention them: 'Entity A (also known as Alias D)...'\n\n"
-
-        "6. **NATURAL, CONVERSATIONAL LANGUAGE**: Write like a knowledgeable friend explaining to a user. "
-        "Use complete sentences with proper grammar. NO bullet-only lists — explain with context:\n"
-        "   BAD: '• Entity A - Outcome C'\n"
-        "   GOOD: 'Based on our database, **Entity A** is specifically linked to Outcome C. "
-        "It functions as a Category B and has direct connections to Outcome C properties.'\n\n"
-
-        "7. **BE COMPREHENSIVE**: If the question matches multiple entities, discuss ALL of them. "
-        "Don't stop at the first match. Group by relevance and explain how each one relates to the question.\n\n"
-
-        "8. **HONEST GAPS**: If the database truly has NO related information, say so clearly and helpfully. "
-        "But FIRST, thoroughly check ALL entity profiles and connections — often the answer is there under a different name.\n\n"
-
-        "9. **ML INSIGHTS**: If AI Predictions are present, mention them naturally as 'Our ML analysis also suggests...'\n\n"
-
-        "10. **FORMATTING**: Use markdown (bold, headers, bullet points) for clarity. Start with a direct answer, "
-        "then provide supporting details.\n\n"
-
-        "11. **GREETINGS**: For hi/hello, respond warmly and briefly describe what you can help with."
+        "5. **GREETINGS**: Respond to hi/hello warmly in one short sentence."
     )
 
 def get_greeting_prompt() -> str:
