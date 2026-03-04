@@ -43,14 +43,24 @@ class GDSService:
             return global_name
         
         logger.info(f"Creating global undirected native projection: {global_name}")
+        # Use native projection instead of Cypher to correctly set UNDIRECTED orientation
+        # which is required by algorithms like K-Core.
         await session.run("""
-            CALL gds.graph.project.cypher(
+            CALL gds.graph.project(
                 $name,
-                'MATCH (n) WHERE n.name IS NOT NULL RETURN id(n) AS id, labels(n) AS labels',
-                'MATCH (a)-[r]-(b)
-                 WHERE a.name IS NOT NULL AND b.name IS NOT NULL
-                 RETURN id(a) AS source, id(b) AS target, type(r) AS type,
-                        coalesce(r.strength, 1.0) AS weight'
+                ['Entity'],
+                {
+                    ALL_RELATIONSHIPS: {
+                        type: '*',
+                        orientation: 'UNDIRECTED',
+                        properties: {
+                            weight: {
+                                property: 'strength',
+                                defaultValue: 1.0
+                            }
+                        }
+                    }
+                }
             )
         """, name=global_name)
         self.active_projections.add(global_name)
@@ -333,8 +343,7 @@ class GDSService:
         graph_name = await self.ensure_projection(folder_id, node_ids, undirected=True)
         query = """
             CALL gds.leiden.stream($graph_name, {
-                gamma: 1.0,
-                relationshipWeightProperty: 'weight'
+                gamma: 1.0
             })
             YIELD nodeId, communityId
             WITH gds.util.asNode(nodeId) AS node, communityId
@@ -343,11 +352,18 @@ class GDSService:
             RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, communityId AS community_id
             ORDER BY community_id ASC
         """
-        async with self.driver.session() as session:
-            result = await session.run(query, graph_name=graph_name, folder_id=folder_id, target_type=target_type)
-            data = await result.data()
-            logger.info(f"[GDS] Leiden returned {len(data)} results")
-            return self._filter_unnamed(data)
+        try:
+            async with self.driver.session() as session:
+                result = await session.run(query, graph_name=graph_name, folder_id=folder_id, target_type=target_type)
+                data = await result.data()
+                logger.info(f"[GDS] Leiden returned {len(data)} results")
+                return self._filter_unnamed(data)
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "undirected" in error_msg or "orientation" in error_msg or "not found" in error_msg:
+                logger.warning(f"[GDS] Leiden failed due to graph structure: {e}")
+                return [{"error_message": "Leiden requires sufficient undirected connections. Your current data may not have enough relationships for this algorithm."}]
+            raise
 
     async def run_kcore(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 50, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """K-Core — finds the stable, tightly-connected core of the graph."""
@@ -385,11 +401,20 @@ class GDSService:
             ORDER BY triangleCount DESC
             LIMIT $top_k
         """
-        async with self.driver.session() as session:
-            result = await session.run(query, graph_name=graph_name, top_k=top_k, folder_id=folder_id, target_type=target_type)
-            data = await result.data()
-            logger.info(f"[GDS] Triangle Count returned {len(data)} results")
-            return self._filter_unnamed(data)
+        try:
+            async with self.driver.session() as session:
+                result = await session.run(query, graph_name=graph_name, top_k=top_k, folder_id=folder_id, target_type=target_type)
+                data = await result.data()
+                logger.info(f"[GDS] Triangle Count returned {len(data)} results")
+                if not data:
+                    return [{"error_message": "No triangles found. Your data may not have enough interconnected nodes to form triangles (3 nodes all connected to each other)."}]
+                return self._filter_unnamed(data)
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "undirected" in error_msg or "orientation" in error_msg:
+                logger.warning(f"[GDS] Triangle Count failed due to graph structure: {e}")
+                return [{"error_message": "Triangle Count requires undirected relationships. Your current graph projection may not support this algorithm."}]
+            raise
 
     async def run_node_similarity(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """Node Similarity — finds pairs of nodes that share similar neighborhoods (Jaccard)."""
@@ -433,6 +458,205 @@ class GDSService:
             result = await session.run(query, graph_name=graph_name, top_k=top_k, target_type=target_type, folder_id=folder_id)
             data = await result.data()
             logger.info(f"[GDS] Degree returned {len(data)} results")
+            return self._filter_unnamed(data)
+
+    async def run_link_prediction(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, method: str = "common_neighbors", top_k: int = 20, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Link Prediction — predicts missing links using various methods (common_neighbors, adamic_adar, resource_allocation)."""
+        logger.info(f"[GDS] run_link_prediction: folder_id={folder_id}, method={method}, top_k={top_k}")
+        
+        folder_filter = ""
+        if folder_id:
+            folder_filter = " {folder_id: $folder_id}"
+        
+        if method == "adamic_adar":
+            query = f"""
+                MATCH (a:Entity{folder_filter}), (b:Entity{folder_filter})
+                WHERE a <> b AND NOT (a)--(b) AND id(a) < id(b)
+                WITH a, b
+                MATCH (a)--(neighbor)--(b)
+                WITH a, b, neighbor, COUNT {{ (neighbor)--() }} AS degree
+                WHERE degree > 1
+                WITH a, b, sum(1.0 / log(toFloat(degree))) AS score
+                WHERE score > 0
+                RETURN a.id AS source_id, a.name AS source_name,
+                       b.id AS target_id, b.name AS target_name,
+                       round(score * 1000) / 1000.0 AS score
+                ORDER BY score DESC
+                LIMIT $top_k
+            """
+        elif method == "resource_allocation":
+            query = f"""
+                MATCH (a:Entity{folder_filter}), (b:Entity{folder_filter})
+                WHERE a <> b AND NOT (a)--(b) AND id(a) < id(b)
+                WITH a, b
+                MATCH (a)--(neighbor)--(b)
+                WITH a, b, neighbor, toFloat(COUNT {{ (neighbor)--() }}) AS degree
+                WHERE degree > 0
+                WITH a, b, sum(1.0 / degree) AS score
+                WHERE score > 0
+                RETURN a.id AS source_id, a.name AS source_name,
+                       b.id AS target_id, b.name AS target_name,
+                       round(score * 1000) / 1000.0 AS score
+                ORDER BY score DESC
+                LIMIT $top_k
+            """
+        else:  # common_neighbors (default)
+            query = f"""
+                MATCH (a:Entity{folder_filter}), (b:Entity{folder_filter})
+                WHERE a <> b AND NOT (a)--(b) AND id(a) < id(b)
+                WITH a, b
+                OPTIONAL MATCH (a)--(neighbor)--(b)
+                WITH a, b, count(DISTINCT neighbor) AS score
+                WHERE score > 0
+                RETURN a.id AS source_id, a.name AS source_name,
+                       b.id AS target_id, b.name AS target_name,
+                       score
+                ORDER BY score DESC
+                LIMIT $top_k
+            """
+        
+        params = {"top_k": top_k}
+        if folder_id:
+            params["folder_id"] = folder_id
+        
+        async with self.driver.session() as session:
+            result = await session.run(query, **params)
+            data = await result.data()
+            logger.info(f"[GDS] Link Prediction ({method}) returned {len(data)} results")
+            return data
+
+    async def run_bfs(self, source_id: str, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """BFS Traversal — explores nodes layer by layer from a starting point."""
+        logger.info(f"[GDS] run_bfs: source_id={source_id}, folder_id={folder_id}")
+        # Traversal works best on undirected graphs for discovery
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=True)
+        
+        async with self.driver.session() as session:
+            # Get internal node ID
+            id_res = await session.run("MATCH (n {id: $id}) RETURN id(n) AS neo_id", id=source_id)
+            rec = await id_res.single()
+            if not rec:
+                logger.warning(f"[GDS] BFS source node not found: {source_id}")
+                return []
+            
+            # Build scope filter
+            scope_filter = "WHERE n.name IS NOT NULL"
+            params = {"graph_name": graph_name, "source": rec["neo_id"]}
+            if node_ids:
+                scope_filter += " AND n.id IN $node_ids"
+                params["node_ids"] = node_ids
+            elif folder_id:
+                scope_filter += " AND n.folder_id = $folder_id"
+                params["folder_id"] = folder_id
+
+            result = await session.run(f"""
+                CALL gds.bfs.stream($graph_name, {{
+                    sourceNode: $source
+                }})
+                YIELD nodeIds
+                UNWIND nodeIds AS nid
+                WITH gds.util.asNode(nid) AS n
+                {scope_filter}
+                RETURN n.id AS id, n.name AS name, coalesce(n.type, labels(n)[0]) AS type
+            """, **params)
+            
+            data = await result.data()
+            logger.info(f"[GDS] BFS returned {len(data)} results")
+            return data
+
+    async def run_dfs(self, source_id: str, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """DFS Traversal — follows paths as deep as possible before backtracking."""
+        logger.info(f"[GDS] run_dfs: source_id={source_id}, folder_id={folder_id}")
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=True)
+        
+        async with self.driver.session() as session:
+            id_res = await session.run("MATCH (n {id: $id}) RETURN id(n) AS neo_id", id=source_id)
+            rec = await id_res.single()
+            if not rec:
+                logger.warning(f"[GDS] DFS source node not found: {source_id}")
+                return []
+            
+            # Build scope filter
+            scope_filter = "WHERE n.name IS NOT NULL"
+            params = {"graph_name": graph_name, "source": rec["neo_id"]}
+            if node_ids:
+                scope_filter += " AND n.id IN $node_id_list"
+                params["node_id_list"] = node_ids
+            elif folder_id:
+                scope_filter += " AND n.folder_id = $folder_id"
+                params["folder_id"] = folder_id
+
+            result = await session.run(f"""
+                CALL gds.dfs.stream($graph_name, {{
+                    sourceNode: $source
+                }})
+                YIELD nodeIds
+                UNWIND nodeIds AS nid
+                WITH gds.util.asNode(nid) AS n
+                {scope_filter}
+                RETURN n.id AS id, n.name AS name, coalesce(n.type, labels(n)[0]) AS type
+            """, **params)
+            
+            data = await result.data()
+            logger.info(f"[GDS] DFS returned {len(data)} results")
+            return data
+
+    async def run_random_walk(self, source_id: str, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, walk_length: int = 10, walk_count: int = 1) -> List[Dict[str, Any]]:
+        """Random Walk — simulates a user wandering through the graph randomly."""
+        logger.info(f"[GDS] run_random_walk: source_id={source_id}, folder_id={folder_id}, walk_length={walk_length}, walk_count={walk_count}")
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
+        
+        async with self.driver.session() as session:
+            id_res = await session.run("MATCH (n {id: $id}) RETURN id(n) AS neo_id", id=source_id)
+            rec = await id_res.single()
+            if not rec:
+                logger.warning(f"[GDS] Random Walk source node not found: {source_id}")
+                return []
+            
+            # Build scope filter
+            scope_filter = "WHERE n.name IS NOT NULL"
+            params = {"graph_name": graph_name, "source": rec["neo_id"], "length": walk_length, "count": walk_count}
+            if node_ids:
+                scope_filter += " AND n.id IN $node_id_list"
+                params["node_id_list"] = node_ids
+            elif folder_id:
+                scope_filter += " AND n.folder_id = $folder_id"
+                params["folder_id"] = folder_id
+
+            result = await session.run(f"""
+                CALL gds.randomWalk.stream($graph_name, {{
+                    sourceNodes: [$source],
+                    walkLength: $length,
+                    walksPerNode: $count
+                }})
+                YIELD nodeIds
+                UNWIND nodeIds AS nid
+                WITH DISTINCT gds.util.asNode(nid) AS n
+                {scope_filter}
+                RETURN n.id AS id, n.name AS name, coalesce(n.type, labels(n)[0]) AS type
+            """, **params)
+            
+            data = await result.data()
+            logger.info(f"[GDS] Random Walk returned {len(data)} results")
+            return data
+
+    async def run_topological_sort(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """Topological Sort — orders nodes in a logical linear sequence for DAGs."""
+        logger.info(f"[GDS] run_topological_sort: folder_id={folder_id}")
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
+        
+        async with self.driver.session() as session:
+            result = await session.run("""
+                CALL gds.dag.topologicalSort.stream($graph_name)
+                YIELD nodeId
+                WITH gds.util.asNode(nodeId) AS n
+                WHERE n.name IS NOT NULL
+                AND ($folder_id IS NULL OR n.folder_id = $folder_id)
+                RETURN n.id AS id, n.name AS name, coalesce(n.type, labels(n)[0]) AS type
+            """, graph_name=graph_name, folder_id=folder_id)
+            
+            data = await result.data()
+            logger.info(f"[GDS] Topological Sort returned {len(data)} results")
             return self._filter_unnamed(data)
 
 # Dependency

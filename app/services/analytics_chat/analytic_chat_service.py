@@ -72,7 +72,7 @@ class AnalyticChatService:
         # - For "path" OR "node_similarity" between specific names, use resolved_node_ids.
         # - For analytical algorithms (pagerank, degree, community, etc.), use the FULL FOLDER scope
         #   even if specific nodes are selected in the UI. This allows comparative analysis.
-        global_algos = ("pagerank", "articlerank", "betweenness", "closeness", "degree", "hits", "louvain", "leiden", "wcc", "kcore", "triangle_count")
+        global_algos = ("pagerank", "articlerank", "betweenness", "closeness", "degree", "hits", "louvain", "leiden", "wcc", "kcore", "triangle_count", "link_prediction_common", "link_prediction_adamic", "link_prediction_resource", "topological_sort")
         
         if algo_name in ("path", "node_similarity") and resolved_node_ids and len(resolved_node_ids) >= 2:
             algo_node_ids = resolved_node_ids
@@ -84,7 +84,7 @@ class AnalyticChatService:
             # Fallback to UI selection
             algo_node_ids = node_ids
         
-        results = await self._run_algorithm(algo_name, folder_id, algo_node_ids, params, target_type)
+        results = await self._run_algorithm(algo_name, folder_id, algo_node_ids, params, target_type, resolved_node_ids=resolved_node_ids)
         
         # 4. Hybrid Logic: If they asked about specific entities but DIDN'T get a path, 
         # try to find a direct connection path to augment the algorithmic results.
@@ -191,16 +191,29 @@ class AnalyticChatService:
         — SIMILARITY —
         12. node_similarity: "What is similar to X", "which nodes share neighbors", "find similar entities", Jaccard similarity.
         
-        — PATHFINDING —
-        13. path: "How are X and Y related", "find connection between X and Y", "path between...", shortest path.
+        — LINK PREDICTION (What connections are missing?) —
+        13. link_prediction_common: Predict missing links by counting shared neighbors. "What should be connected?", "predict connections", "common neighbors".
+        14. link_prediction_adamic: Advanced link prediction weighted by rare shared connections. "Non-obvious relationships", "unique connections".
+        15. link_prediction_resource: Flow-based link prediction. "Hidden links", "resource allocation", "high-probability missing links".
+        
+        — PATHFINDING & TRAVERSAL —
+        16. path: "How are X and Y related", "find connection between X and Y", "path between...", shortest path.
+        17. bfs: Explore nodes layer by layer from a starting point. "What's nearby X", "neighbors of", "within N hops".
+        18. dfs: Explore deep paths from a starting point. "Deep hierarchy from X", "follow the chain from X", "trace the lineage".
+        19. random_walk: Simulate wandering through the graph. "Explore from X randomly", "discover associations from X", "serendipitous connections".
+        
+        — TOPOLOGY —
+        20. topological_sort: Order nodes in a logical sequence (for DAGs). "Process flow", "timeline order", "logical sequence", "dependency order".
         
         Entities & Types:
         - If the user mentions specific names list them in "entities".
+        - For traversal algorithms (bfs, dfs, random_walk), the FIRST entity in "entities" will be used as the starting point.
         - If the user specifically asks for a type of result, specify that in "target_type" (e.g. "{types_example[0]}" or "{types_example[1]}").
+        - For link prediction, set "link_method" in parameters to one of: "common_neighbors", "adamic_adar", "resource_allocation".
         
         Respond ONLY with a JSON object:
         {{
-          "algorithm": "pagerank" | "articlerank" | "betweenness" | "closeness" | "degree" | "hits" | "louvain" | "leiden" | "wcc" | "kcore" | "triangle_count" | "node_similarity" | "path" | "none",
+          "algorithm": "pagerank" | "articlerank" | "betweenness" | "closeness" | "degree" | "hits" | "louvain" | "leiden" | "wcc" | "kcore" | "triangle_count" | "node_similarity" | "link_prediction_common" | "link_prediction_adamic" | "link_prediction_resource" | "path" | "bfs" | "dfs" | "random_walk" | "topological_sort" | "none",
           "entities": ["Name1", "Name2"],
           "target_type": {types_str} | null,
           "parameters": {{ "top_k": 10 }},
@@ -220,7 +233,7 @@ class AnalyticChatService:
             logger.error(f"Failed to decide algorithm: {e}")
             return {"algorithm": "none"}
 
-    async def _run_algorithm(self, algo: str, folder_id: Optional[str], node_ids: Optional[List[str]], params: Dict[str, Any], target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def _run_algorithm(self, algo: str, folder_id: Optional[str], node_ids: Optional[List[str]], params: Dict[str, Any], target_type: Optional[str] = None, resolved_node_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         """Executes the selected algorithm via GDSService."""
         top_k = params.get("top_k", 10)
         logger.info(f"[AnalyticChat] Running algorithm '{algo}' | folder_id={folder_id} | node_ids={node_ids} | top_k={top_k} | target_type={target_type}")
@@ -253,6 +266,37 @@ class AnalyticChatService:
                 # If the user mentioned specific nodes, filter results for those pairs
                 if node_ids and len(node_ids) >= 2:
                     results = [r for r in results if r.get('source_id') in node_ids and r.get('target_id') in node_ids]
+            elif algo.startswith("link_prediction"):
+                method_map = {
+                    "link_prediction_common": "common_neighbors",
+                    "link_prediction_adamic": "adamic_adar",
+                    "link_prediction_resource": "resource_allocation",
+                }
+                lp_method = method_map.get(algo, params.get("link_method", "common_neighbors"))
+                results = await self.gds.run_link_prediction(folder_id, node_ids, method=lp_method, top_k=top_k, target_type=target_type)
+            elif algo == "bfs":
+                source_id = resolved_node_ids[0] if resolved_node_ids else (node_ids[0] if node_ids else None)
+                if source_id:
+                    results = await self.gds.run_bfs(source_id, folder_id, node_ids)
+                else:
+                    results = []
+                    logger.warning("[AnalyticChat] BFS requires a source node — none provided")
+            elif algo == "dfs":
+                source_id = resolved_node_ids[0] if resolved_node_ids else (node_ids[0] if node_ids else None)
+                if source_id:
+                    results = await self.gds.run_dfs(source_id, folder_id, node_ids)
+                else:
+                    results = []
+                    logger.warning("[AnalyticChat] DFS requires a source node — none provided")
+            elif algo == "random_walk":
+                source_id = resolved_node_ids[0] if resolved_node_ids else (node_ids[0] if node_ids else None)
+                if source_id:
+                    results = await self.gds.run_random_walk(source_id, folder_id, node_ids)
+                else:
+                    results = []
+                    logger.warning("[AnalyticChat] Random Walk requires a source node — none provided")
+            elif algo == "topological_sort":
+                results = await self.gds.run_topological_sort(folder_id, node_ids)
             elif algo == "path":
                 if node_ids and len(node_ids) >= 2:
                     results = await self._run_shortest_path(node_ids[0], node_ids[1])
@@ -264,11 +308,15 @@ class AnalyticChatService:
             
             logger.info(f"[AnalyticChat] Algorithm '{algo}' returned {len(results)} results")
             if results:
-                logger.info(f"[AnalyticChat] Sample result: {results[0]}")
+                # Check if the result is a friendly error message from GDS
+                if len(results) == 1 and results[0].get("error_message"):
+                    logger.info(f"[AnalyticChat] GDS returned friendly message: {results[0]['error_message']}")
+                else:
+                    logger.info(f"[AnalyticChat] Sample result: {results[0]}")
             return results
         except Exception as e:
             logger.error(f"[AnalyticChat] Algorithm '{algo}' execution FAILED: {e}", exc_info=True)
-            return []
+            return [{"error_message": f"The algorithm could not run on your current data. This usually means the dataset is too small or doesn't have the right structure for this analysis."}]
 
     async def _run_shortest_path(self, start_id: str, end_id: str) -> List[Dict[str, Any]]:
         """Finds shortest path between two specific nodes."""
@@ -323,20 +371,37 @@ class AnalyticChatService:
                 lines.append(f"Group {i} ({len(members)} members): {member_str}")
             algo_str += "\n".join(lines[:20])
         
-        elif algo == "node_similarity":
+        elif algo == "node_similarity" or algo.startswith("link_prediction"):
             lines = []
             # Look specifically for source/target style results
             sim_results = [r for r in results if r.get("source_name")]
+            label = "Predicted link" if algo.startswith("link_prediction") else "Similarity"
             for r in sim_results[:15]:
                 source = r.get('source_name','?')
                 target = r.get('target_name','?')
                 score = r.get('score', 0)
-                lines.append(f"{source} ↔ {target} (Similarity: {score:.0%})")
-            algo_str += "\n".join(lines) if lines else "No clear similarity pairs found above threshold."
+                if algo.startswith("link_prediction"):
+                    lines.append(f"{source} ↔ {target} (Score: {score})")
+                else:
+                    lines.append(f"{source} ↔ {target} (Similarity: {score:.0%})")
+            algo_str += "\n".join(lines) if lines else f"No {label.lower()} pairs found above threshold."
 
         elif algo == "path":
             # Already handled in path_str
             algo_str = ""
+        
+        elif algo in ("bfs", "dfs", "random_walk"):
+            traversal_names = [r.get("name", "?") for r in results[:30]]
+            algo_str += f"Traversed {len(results)} nodes: " + " → ".join(traversal_names)
+            if len(results) > 30:
+                algo_str += f" ... and {len(results) - 30} more"
+        
+        elif algo == "topological_sort":
+            topo_names = [r.get("name", "?") for r in results[:30]]
+            algo_str += f"Logical sequence ({len(results)} nodes): " + " → ".join(topo_names)
+            if len(results) > 30:
+                algo_str += f" ... and {len(results) - 30} more"
+        
         else:
             # Centrality / scoring algorithms
             lines = []
@@ -356,6 +421,10 @@ class AnalyticChatService:
         if not results:
             return "The algorithm was executed but returned no significant results for the current selection. Make sure you have a folder selected with data."
 
+        # Check for friendly error messages from GDS
+        if len(results) == 1 and results[0].get("error_message"):
+            return results[0]["error_message"]
+
         # Pre-summarize results into human-readable format
         summary = self._pre_summarize(algo, results)
 
@@ -373,7 +442,14 @@ class AnalyticChatService:
             "kcore": "K-Core found the tightly-knit core of the graph. Entities in the core are the most stable and interconnected. Explain what makes this core group special.",
             "triangle_count": "Triangle count measures local clustering. Nodes with many triangles are part of very tight, collaborative groups. Explain which entities form the tightest clusters.",
             "node_similarity": "Node Similarity found pairs that share similar neighborhoods. Explain which entities are most similar and WHY (what shared connections make them alike).",
+            "link_prediction_common": "Common Neighbors link prediction found pairs of currently unconnected entities that share many neighbors. Higher score = more shared connections. Explain which new connections are most likely and WHY.",
+            "link_prediction_adamic": "Adamic-Adar link prediction found missing connections weighted by rare shared neighbors. Entities sharing uncommon connections are highlighted. Explain which hidden relationships are most significant.",
+            "link_prediction_resource": "Resource Allocation link prediction simulated information flow to find hidden connections. Explain which potential new links are the strongest and what they would mean for the data.",
             "path": "Shortest path shows how two entities are connected through intermediaries. Walk through the chain step by step and explain each link.",
+            "bfs": "BFS (Breadth-First Search) explored entities layer by layer from the starting node. The order shows proximity — entities listed first are closest neighbors. Explain what the traversal reveals about the local neighborhood structure.",
+            "dfs": "DFS (Depth-First Search) followed paths as deep as possible before backtracking. This reveals long chains and hierarchies. Explain the deep connections and hierarchical structure found.",
+            "random_walk": "Random Walk simulated wandering through the graph from a starting point. The entities encountered represent associative, serendipitous connections. Explain what surprising or non-obvious associations were discovered.",
+            "topological_sort": "Topological Sort ordered entities in a logical dependency sequence. Earlier entities are prerequisites for later ones. Explain the logical flow, process order, or timeline revealed.",
         }
 
         specific_instruction = algo_instructions.get(algo, "Explain the results clearly.")

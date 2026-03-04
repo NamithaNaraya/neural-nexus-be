@@ -44,6 +44,7 @@ async def list_available_algorithms() -> Dict[str, Any]:
             {"name": "articlerank", "category": "centrality", "description": "Improved influence for diverse graphs (GDS)", "engine": "gds"},
             {"name": "betweenness", "category": "centrality", "description": "Find bridge nodes (GDS)", "engine": "gds"},
             {"name": "closeness", "category": "centrality", "description": "Find central nodes by distance (GDS)", "engine": "gds"},
+            {"name": "degree", "category": "centrality", "description": "Count direct connections per node (GDS)", "engine": "gds"},
             {"name": "hits", "category": "centrality", "description": "Hub and authority scores (GDS)", "engine": "gds"},
             {"name": "louvain", "category": "community", "description": "Community detection (GDS)", "engine": "gds"},
             {"name": "leiden", "category": "community", "description": "Improved community detection (GDS)", "engine": "gds"},
@@ -283,6 +284,49 @@ async def run_articlerank(
         raise HTTPException(status_code=500, detail=f"ArticleRank failed: {str(e)}")
 
 
+@router.get("/centrality/degree")
+async def run_degree_centrality(
+    folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
+    top_k: int = Query(default=10, le=100),
+    current_user: dict = Depends(get_current_user),
+    gds: GDSService = Depends(get_gds_service),
+) -> Dict[str, Any]:
+    """Run Degree Centrality to find the most directly connected nodes."""
+    driver = get_neo4j_driver()
+    graph_name = await gds.ensure_projection(folder_id, node_ids)
+    
+    try:
+        async with driver.session() as session:
+            result = await session.run("""
+                CALL gds.degree.stream($graph_name)
+                YIELD nodeId, score
+                WITH gds.util.asNode(nodeId) AS node, score
+                RETURN node.id AS id, node.name AS name, node.type AS type, score
+                ORDER BY score DESC
+                LIMIT $top_k
+            """, graph_name=graph_name, top_k=top_k)
+            
+            records = await result.data()
+            
+            if records:
+                top = records[0]
+                insight = f"'{top['name']}' has the most direct connections ({top['score']:.0f}) in this dataset, making it the most actively linked entity."
+            else:
+                insight = "No degree data found."
+            
+            return {
+                "algorithm": "degree",
+                "engine": "gds.degree.stream",
+                "folder_id": folder_id,
+                "parameters": {"top_k": top_k},
+                "results": records,
+                "insight": insight,
+            }
+    except Exception as e:
+        logger.error(f"GDS Degree error: {e}")
+        raise HTTPException(status_code=500, detail=f"Degree failed: {str(e)}")
+
 @router.get("/centrality/hits")
 async def run_hits_gds(
     folder_id: Optional[str] = None,
@@ -422,8 +466,7 @@ async def run_leiden(
         async with driver.session() as session:
             result = await session.run(f"""
                 CALL gds.leiden.stream($graph_name, {{
-                    gamma: $gamma,
-                    relationshipWeightProperty: 'weight'
+                    gamma: $gamma
                 }})
                 YIELD nodeId, communityId
                 WITH gds.util.asNode(nodeId) AS node, communityId
@@ -456,7 +499,18 @@ async def run_leiden(
                 "insight": insight,
             }
     except Exception as e:
+        error_msg = str(e).lower()
         logger.error(f"GDS Leiden error: {e}")
+        if "undirected" in error_msg or "orientation" in error_msg or "not found" in error_msg or "weight" in error_msg:
+            return {
+                "algorithm": "leiden",
+                "engine": "gds.leiden.stream",
+                "folder_id": folder_id,
+                "results": [],
+                "communities": {},
+                "community_count": 0,
+                "insight": "Leiden could not run on this dataset. The graph may not have enough relationships or the right structure for community detection. Try Louvain instead.",
+            }
         raise HTTPException(status_code=500, detail=f"Leiden failed: {str(e)}")
 
 
@@ -583,7 +637,16 @@ async def run_kcore_gds(
                 "insight": insight,
             }
     except Exception as e:
+        error_msg = str(e).lower()
         logger.error(f"GDS K-Core error: {e}")
+        if "undirected" in error_msg or "orientation" in error_msg:
+            return {
+                "algorithm": "kcore",
+                "engine": "gds.kcore.stream",
+                "folder_id": folder_id,
+                "results": [],
+                "insight": "K-Core requires undirected relationships. Your graph might be directed or have a structure that doesn't support core decomposition yet.",
+            }
         raise HTTPException(status_code=500, detail=f"K-Core failed: {str(e)}")
 
 
@@ -633,7 +696,16 @@ async def run_triangle_count_gds(
                 "insight": insight,
             }
     except Exception as e:
+        error_msg = str(e).lower()
         logger.error(f"GDS Triangle Count error: {e}")
+        if "undirected" in error_msg or "orientation" in error_msg:
+            return {
+                "algorithm": "triangle_count",
+                "engine": "gds.triangleCount.stream",
+                "folder_id": folder_id,
+                "results": [],
+                "insight": "Triangle Count requires undirected relationships. Your current data may not have the right structure for this algorithm. Try adding more interconnected entities.",
+            }
         raise HTTPException(status_code=500, detail=f"Triangle count failed: {str(e)}")
 
 
@@ -720,18 +792,25 @@ async def find_shortest_path(
     source_id: str,
     target_id: str,
     folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Find shortest path between two nodes using GDS Dijkstra."""
     driver = get_neo4j_driver()
-    graph_name = await gds.ensure_projection(folder_id)
+    # Ensure source and target are in the node_ids list for the projection
+    projection_ids = list(node_ids) if node_ids else None
+    if projection_ids is not None:
+        if source_id not in projection_ids: projection_ids.append(source_id)
+        if target_id not in projection_ids: projection_ids.append(target_id)
+
+    graph_name = await gds.ensure_projection(folder_id, projection_ids)
     
     try:
         async with driver.session() as session:
-            # Get internal node IDs first
+            # Get internal node IDs (allow any label as long as ID matches)
             id_result = await session.run("""
-                MATCH (source:Entity {id: $source_id}), (target:Entity {id: $target_id})
+                MATCH (source {id: $source_id}), (target {id: $target_id})
                 RETURN id(source) AS source_neo_id, id(target) AS target_neo_id
             """, source_id=source_id, target_id=target_id)
             
@@ -785,7 +864,15 @@ async def find_shortest_path(
     except HTTPException:
         raise
     except Exception as e:
+        error_msg = str(e).lower()
         logger.error(f"GDS Shortest Path error: {e}")
+        if "not found" in error_msg or "projection" in error_msg or "in-memory" in error_msg or "not exist" in error_msg:
+            return {
+                "algorithm": "shortest_path",
+                "engine": "gds.shortestPath.dijkstra.stream",
+                "results": [],
+                "insight": "Could not find a path. One or both nodes might not be present in the current view or folder."
+            }
         raise HTTPException(status_code=500, detail=f"Shortest path failed: {str(e)}")
 
 
@@ -794,12 +881,14 @@ async def run_traversal(
     source_id: str,
     method: str = Query(default="bfs", enum=["bfs", "dfs"]),
     folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Run BFS or DFS traversal from a source node."""
     driver = get_neo4j_driver()
-    graph_name = await gds.ensure_projection(folder_id)
+    # BFS/DFS often work best on undirected graphs to find all conceptual neighbors
+    graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
     
     try:
         async with driver.session() as session:
@@ -809,16 +898,11 @@ async def run_traversal(
             if not rec: raise HTTPException(status_code=404, detail="Start node not found")
             
             proc = "bfs" if method == "bfs" else "dfs"
-            result = await session.run(f"""
-                CALL gds.{proc}.stream($graph_name, {{
-                    sourceNode: $source
-                }})
-                YIELD nodeId
-                WITH gds.util.asNode(nodeId) AS n
-                RETURN n.id AS id, n.name AS name, n.type AS type
-            """, graph_name=graph_name, source=rec["neo_id"])
-            
-            records = await result.data()
+            if method == "bfs":
+                records = await gds.run_bfs(source_id, folder_id, node_ids)
+            else:
+                records = await gds.run_dfs(source_id, folder_id, node_ids)
+
             return {
                 "algorithm": method,
                 "engine": f"gds.{proc}.stream",
@@ -827,7 +911,16 @@ async def run_traversal(
                 "insight": f"{method.upper()} traversal explored {len(records)} nodes starting from '{source_id}'."
             }
     except Exception as e:
+        error_msg = str(e).lower()
         logger.error(f"GDS Traversal error: {e}")
+        if "not found" in error_msg or "projection" in error_msg:
+            return {
+                "algorithm": method,
+                "engine": f"gds.{method}.stream",
+                "source_id": source_id,
+                "results": [],
+                "insight": f"Could not start {method.upper()} traversal. The starting node might not be present in the current view or folder."
+            }
         raise HTTPException(status_code=500, detail=f"Traversal failed: {str(e)}")
 
 
@@ -837,32 +930,28 @@ async def run_random_walk(
     walk_length: int = Query(default=10, le=50),
     walk_count: int = Query(default=1),
     folder_id: Optional[str] = None,
+    node_ids: Optional[List[str]] = Query(default=None),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Simulate random walks from a source node."""
     driver = get_neo4j_driver()
-    graph_name = await gds.ensure_projection(folder_id)
+    # Ensure source node is in the node_ids list for the projection
+    projection_ids = list(node_ids) if node_ids else None
+    if projection_ids is not None and source_id not in projection_ids:
+        projection_ids.append(source_id)
+
+    graph_name = await gds.ensure_projection(folder_id, projection_ids)
     
     try:
         async with driver.session() as session:
-            id_res = await session.run("MATCH (n:Entity {id: $id}) RETURN id(n) AS neo_id", id=source_id)
+            # Allow any label for starting node
+            id_res = await session.run("MATCH (n {id: $id}) RETURN id(n) AS neo_id", id=source_id)
             rec = await id_res.single()
             if not rec: raise HTTPException(status_code=404, detail="Start node not found")
             
-            result = await session.run("""
-                CALL gds.randomWalk.stream($graph_name, {
-                    sourceNodes: [$source],
-                    walkLength: $length,
-                    walks: $count
-                })
-                YIELD nodeIds
-                UNWIND nodeIds AS nid
-                WITH gds.util.asNode(nid) AS n
-                RETURN n.id AS id, n.name AS name, n.type AS type
-            """, graph_name=graph_name, source=rec["neo_id"], length=walk_length, count=walk_count)
+            records = await gds.run_random_walk(source_id, folder_id, projection_ids, walk_length, walk_count)
             
-            records = await result.data()
             return {
                 "algorithm": "random_walk",
                 "engine": "gds.randomWalk.stream",
@@ -870,7 +959,15 @@ async def run_random_walk(
                 "insight": f"Completed {walk_count} random walks of length {walk_length}."
             }
     except Exception as e:
+        error_msg = str(e).lower()
         logger.error(f"GDS Random Walk error: {e}")
+        if "not found" in error_msg or "projection" in error_msg or "in-memory" in error_msg or "not exist" in error_msg:
+            return {
+                "algorithm": "random_walk",
+                "engine": "gds.randomWalk.stream",
+                "results": [],
+                "insight": "Could not start random walk. The starting node might not be present in the current view or folder."
+            }
         raise HTTPException(status_code=500, detail=f"Random walk failed: {str(e)}")
 
 
