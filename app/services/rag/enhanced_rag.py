@@ -300,10 +300,10 @@ class EnhancedRAGService:
         scope_filter = ""
         if scope:
             if scope.get("type") == "folder":
-                scope_filter = "AND (node.folder_id IS NULL OR node.folder_id = $scope_id)"
+                scope_filter = "AND node.folder_id = $scope_id"
                 params["scope_id"] = scope["id"]
             elif scope.get("type") == "file":
-                scope_filter = "AND (node.file_id IS NULL OR node.file_id = $scope_id)"
+                scope_filter = "AND node.file_id = $scope_id"
                 params["scope_id"] = scope["id"]
 
         all_results = []
@@ -371,6 +371,7 @@ class EnhancedRAGService:
                     res = await session.run(f"""
                         MATCH (node)-[r]-(connected)
                         WHERE node.name IS NOT NULL AND connected.name IS NOT NULL
+                        {scope_filter}
                         AND ANY(term IN $terms WHERE toLower(connected.name) CONTAINS term
                                 OR toLower(COALESCE(connected.description,'')) CONTAINS term)
                         WITH DISTINCT node, max(0.80) AS score
@@ -440,26 +441,25 @@ class EnhancedRAGService:
         seed_names = [r["name"] for r in state["vector_results"][:10]]
 
         scope = state.get("scope") or state.get("auto_scope")
-        scope_filter = ""
+        scope_filter_hop1 = ""
         scope_filter_2hop = ""
         params: Dict[str, Any] = {"node_ids": node_ids, "sid": None}
         if scope:
             params["sid"] = scope.get("id")
             if scope.get("type") == "folder":
-                # Lenient filter: include nodes WITHOUT folder_id (they're shared/global nodes
-                # like questions, exams, properties that are part of the graph but weren't
-                # tagged with a folder). Seed nodes are already scoped via vector search.
-                scope_filter = "AND (related.folder_id IS NULL OR related.folder_id = $sid)"
-                scope_filter_2hop = "AND (hop2.folder_id IS NULL OR hop2.folder_id = $sid)"
+                # Strict filter: only include nodes explicitly in this folder
+                scope_filter_hop1 = "AND hop1.folder_id = $sid"
+                scope_filter_2hop = "AND hop2.folder_id = $sid"
             elif scope.get("type") == "file":
-                scope_filter = "AND (related.file_id IS NULL OR $sid IN related.file_ids OR related.file_id = $sid)"
-                scope_filter_2hop = "AND (hop2.file_id IS NULL OR $sid IN hop2.file_ids OR hop2.file_id = $sid)"
+                scope_filter_hop1 = "AND (hop1.file_id = $sid OR $sid IN hop1.file_ids)"
+                scope_filter_2hop = "AND (hop2.file_id = $sid OR $sid IN hop2.file_ids)"
 
         # ─── Run entity profiles, ML enrichment, and prediction check CONCURRENTLY ───
         t0 = _time.time()
 
         async def _get_entity_profiles():
             """Deep 2-hop entity profiles."""
+            nonlocal scope_filter_hop1, scope_filter_2hop
             nodes = set()
             rels = []
             entity_profiles = []
@@ -469,7 +469,7 @@ class EnhancedRAGService:
                         UNWIND $node_ids AS nodeId
                         MATCH (n) WHERE n.id = nodeId OR elementId(n) = nodeId
                         OPTIONAL MATCH (n)-[r1]-(hop1)
-                        WHERE hop1 IS NOT NULL
+                        WHERE hop1 IS NOT NULL {scope_filter_hop1}
                         WITH n, nodeId, hop1, r1,
                              COALESCE(hop1.name, hop1.text, hop1.title, hop1.label, elementId(hop1)) as hop1_title
                         OPTIONAL MATCH (hop1)-[r2]-(hop2)
