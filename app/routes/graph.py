@@ -343,7 +343,8 @@ async def get_folder_graph(
         if node_type:
             type_filter = f"AND (n.type = '{node_type}' OR '{node_type}' IN labels(n))"
         
-        # Query nodes
+        # Query nodes — with smart limiting for large graphs
+        # If the dataset is large, prioritize high-degree nodes first
         nodes_query = f"""
         MATCH (n)
         WHERE n.folder_id = $folder_id OR n.folderId = $folder_id
@@ -352,6 +353,7 @@ async def get_folder_graph(
         WITH n, count(DISTINCT r) as degree
         WHERE degree >= $min_connections
         RETURN n, degree
+        ORDER BY degree DESC
         LIMIT $limit
         """
         

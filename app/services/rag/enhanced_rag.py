@@ -745,24 +745,40 @@ class EnhancedRAGService:
             # Feature 10: Compute grounding score
             answer = answer or ""
             answer_lower = answer.lower()
-            mentioned = sum(1 for name in entity_names if name in answer_lower)
-            grounding_score = min(mentioned / max(len(entity_names), 1), 1.0)
+            
+            # Use longer entity names first to match properly
+            sorted_names = sorted(set(entity_names), key=len, reverse=True)
+            mentioned = sum(1 for name in sorted_names if len(name) > 3 and name in answer_lower)
+            
+            if len(sorted_names) == 0:
+                grounding_score = 1.0  # No context needed, assume 100% grounded
+            else:
+                # If they mention at least 2 relevant entities from context, it's strongly grounded.
+                # Do NOT divide by the huge pool of candidates, as the LLM is explicitly instructed to be brief.
+                grounding_score = min(mentioned / 2.0, 1.0)
+                if mentioned == 1:
+                    grounding_score = max(grounding_score, 0.50)  # at least 50% for 1 mention
+            
             grounding_score = round(grounding_score, 2)
 
             # ── ANTI-HALLUCINATION GATE ──
-            # Only trigger when there's truly NO relevant data at all (<10%).
-            if grounding_score < 0.10 and entity_names:
+            # Only trigger if we provided data but the LLM mentioned literally 0 entities, 
+            # AND it didn't naturally admit that it couldn't find the answer.
+            not_found_phrases = ["not found", "no information", "cannot find", "don't have", "does not contain", "cannot answer"]
+            said_not_found = any(p in answer_lower for p in not_found_phrases)
+
+            if mentioned == 0 and len(sorted_names) > 0 and not said_not_found:
+                # The LLM hallucinated an answer without mentioning any of the concepts we provided
                 available_items = ", ".join(
-                    f"**{r['name']}**" for r in state["vector_results"][:8]
+                    f"**{r['name']}**" for r in state.get("vector_results", [])[:5]
                 )
                 answer = (
-                    f"I found some related entries in the knowledge graph, but couldn't build a "
-                    f"detailed answer for *\"{state['question']}\"*.\n\n"
-                    f"Here's what I found that might be relevant:\n"
+                    f"I couldn't build a highly detailed answer for *\"{state['question']}\"* "
+                    f"using the confirmed data. However, here's what I found related to your search:\n\n"
                     f"- {available_items}\n\n"
                     f"Would you like me to explore any of these in detail?"
                 )
-                grounding_score = 1.0
+                grounding_score = 0.25 # Low grounding because it couldn't connect the dots
 
             citations = [
                 {

@@ -124,16 +124,30 @@ class MLService:
             logger.info("RandomForest not available for LP, continuing with LogReg only")
 
         try:
+            rel_types_records = await self._run(
+                "CALL gds.graph.list($graph_name) YIELD schemaWithOrientation RETURN keys(schemaWithOrientation.relationships) AS types",
+                {"graph_name": graph_name}
+            )
+            rel_types = rel_types_records[0]["types"] if rel_types_records and "types" in rel_types_records[0] else []
+            
+            target_rel_type = "ALL_RELATIONSHIPS"
+            if "ALL_RELATIONSHIPS" in rel_types:
+                target_rel_type = "ALL_RELATIONSHIPS"
+            elif "_ALL_" in rel_types:
+                target_rel_type = "_ALL_"
+            elif rel_types:
+                target_rel_type = rel_types[0]
+
             records = await self._run("""
                 CALL gds.beta.pipeline.linkPrediction.train($graph_name, {
                     pipeline: $pipeline_name,
                     modelName: $model_name,
                     randomSeed: 42,
-                    targetRelationshipType: '_ALL_'
+                    targetRelationshipType: $target_rel_type
                 })
                 YIELD modelInfo, trainMillis
                 RETURN modelInfo, trainMillis
-            """, {"graph_name": graph_name, "pipeline_name": pipeline_name, "model_name": model_name})
+            """, {"graph_name": graph_name, "pipeline_name": pipeline_name, "model_name": model_name, "target_rel_type": target_rel_type})
         except Exception as e:
             await self._drop_pipeline_safe(pipeline_name)
             raise e

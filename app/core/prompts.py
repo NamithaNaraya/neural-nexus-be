@@ -73,9 +73,9 @@ def get_enhanced_rag_system_prompt() -> str:
 
         "ABSOLUTE RULES:\n\n"
 
-        "1. **EXTREME BREVITY**: Answer the question directly in 1-2 short, natural sentences. "
-        "Summarize the result immediately. Do NOT provide long lists of connections, "
-        "technical background, or supporting evidence unless specifically asked for details.\n\n"
+        "1. **CONCISE BUT COMPLETE**: Answer the question directly. Summarize the result immediately. "
+        "Use bullet points if listing multiple items (like herbs or properties). "
+        "Avoid long, academic background essays, but ensure you include all relevant facts requested.\n\n"
 
         "2. **NO TECHNICAL NOTATION**: NEVER use raw graph notation (e.g. avoid 'A -[REL]-> B') or "
         "technical relationship names (e.g. avoid 'ANSWERED', 'STUDIES_AT') in your final answer. "
