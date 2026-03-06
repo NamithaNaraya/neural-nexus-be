@@ -33,6 +33,19 @@ from app.services.gds_service import get_gds_service, GDSService
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+# ── Reusable COALESCE expressions for dynamic name/type resolution ──
+# These ensure every node type gets its best human-readable display name
+# regardless of which property stores the actual text.
+_NAME_COALESCE = "coalesce(node.name, node.title, node.question_text, node.text, node.content, node.label, node.code, node.questionId, node.studentId, node.examId, node.val, node.value, node.id)"
+_TYPE_COALESCE = "coalesce(node.type, labels(node)[0])"
+
+# Same for arbitrary aliases (n1, n2, a, b, n, etc.)
+def _name_col(alias: str) -> str:
+    return f"coalesce({alias}.name, {alias}.title, {alias}.question_text, {alias}.text, {alias}.content, {alias}.label, {alias}.code, {alias}.questionId, {alias}.studentId, {alias}.examId, {alias}.val, {alias}.value, {alias}.id)"
+
+def _type_col(alias: str) -> str:
+    return f"coalesce({alias}.type, labels({alias})[0])"
+
 
 # === Algorithm Availability ===
 @router.get("/available")
@@ -83,24 +96,27 @@ async def run_pagerank(
     top_k: int = Query(default=10, le=100),
     damping_factor: float = Query(default=0.85, ge=0.1, le=0.99),
     max_iterations: int = Query(default=20, le=100),
+    weight_formula: Optional[str] = Query(default=None, description="JSON weight formula"),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Run PageRank algorithm using Neo4j GDS for accurate centrality scores."""
     driver = get_neo4j_driver()
-    graph_name = await gds.ensure_projection(folder_id, node_ids)
+    wf = json.loads(weight_formula) if weight_formula else None
+    graph_name = await gds.ensure_projection(folder_id, node_ids, weight_formula=wf)
     
     try:
         async with driver.session() as session:
             # Run GDS PageRank stream
-            result = await session.run("""
-                CALL gds.pageRank.stream($graph_name, {
+            result = await session.run(f"""
+                CALL gds.pageRank.stream($graph_name, {{
                     dampingFactor: $damping,
-                    maxIterations: $max_iter
-                })
+                    maxIterations: $max_iter,
+                    relationshipWeightProperty: 'weight'
+                }})
                 YIELD nodeId, score
                 WITH gds.util.asNode(nodeId) AS node, score
-                RETURN node.id AS id, node.name AS name, node.type AS type, score
+                RETURN node.id AS id, {_NAME_COALESCE} AS name, {_TYPE_COALESCE} AS type, score
                 ORDER BY score DESC
                 LIMIT $top_k
             """, graph_name=graph_name, damping=damping_factor, max_iter=max_iterations, top_k=top_k)
@@ -133,34 +149,36 @@ async def run_betweenness(
     node_ids: Optional[List[str]] = Query(default=None),
     top_k: int = Query(default=10, le=100),
     sampling_size: int = Query(default=0, ge=0, description="0 = exact, >0 = sample size for approximation"),
+    weight_formula: Optional[str] = Query(default=None, description="JSON weight formula"),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Run Betweenness Centrality using Neo4j GDS to find critical bridge nodes."""
     driver = get_neo4j_driver()
-    graph_name = await gds.ensure_projection(folder_id, node_ids)
+    wf = json.loads(weight_formula) if weight_formula else None
+    graph_name = await gds.ensure_projection(folder_id, node_ids, weight_formula=wf)
     
     try:
         async with driver.session() as session:
             # Use sampled or exact betweenness
             if sampling_size > 0:
-                query = """
-                    CALL gds.betweenness.stream($graph_name, {
+                query = f"""
+                    CALL gds.betweenness.stream($graph_name, {{
                         samplingSize: $sampling
-                    })
+                    }})
                     YIELD nodeId, score
                     WITH gds.util.asNode(nodeId) AS node, score
-                    RETURN node.id AS id, node.name AS name, node.type AS type, score
+                    RETURN node.id AS id, {_NAME_COALESCE} AS name, {_TYPE_COALESCE} AS type, score
                     ORDER BY score DESC
                     LIMIT $top_k
                 """
                 result = await session.run(query, graph_name=graph_name, sampling=sampling_size, top_k=top_k)
             else:
-                query = """
+                query = f"""
                     CALL gds.betweenness.stream($graph_name)
                     YIELD nodeId, score
                     WITH gds.util.asNode(nodeId) AS node, score
-                    RETURN node.id AS id, node.name AS name, node.type AS type, score
+                    RETURN node.id AS id, {_NAME_COALESCE} AS name, {_TYPE_COALESCE} AS type, score
                     ORDER BY score DESC
                     LIMIT $top_k
                 """
@@ -198,23 +216,25 @@ async def run_closeness(
     node_ids: Optional[List[str]] = Query(default=None),
     top_k: int = Query(default=10, le=100),
     use_wasserman_faust: bool = Query(default=True, description="Normalize for disconnected graphs"),
+    weight_formula: Optional[str] = Query(default=None, description="JSON weight formula"),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Run Closeness Centrality using Neo4j GDS to find nodes closest to all others."""
     driver = get_neo4j_driver()
-    graph_name = await gds.ensure_projection(folder_id, node_ids)
+    wf = json.loads(weight_formula) if weight_formula else None
+    graph_name = await gds.ensure_projection(folder_id, node_ids, weight_formula=wf)
     
     try:
         async with driver.session() as session:
-            result = await session.run("""
-                CALL gds.closeness.stream($graph_name, {
+            result = await session.run(f"""
+                CALL gds.closeness.stream($graph_name, {{
                     useWassermanFaust: $wf
-                })
+                }})
                 YIELD nodeId, score
                 WITH gds.util.asNode(nodeId) AS node, score
                 WHERE score > 0
-                RETURN node.id AS id, node.name AS name, node.type AS type, score
+                RETURN node.id AS id, {_NAME_COALESCE} AS name, {_TYPE_COALESCE} AS type, score
                 ORDER BY score DESC
                 LIMIT $top_k
             """, graph_name=graph_name, wf=use_wasserman_faust, top_k=top_k)
@@ -247,23 +267,25 @@ async def run_articlerank(
     damping_factor: float = Query(default=0.85, ge=0.0, le=1.0),
     max_iterations: int = Query(default=20, le=100),
     top_k: int = Query(default=10, le=100),
+    weight_formula: Optional[str] = Query(default=None, description="JSON weight formula"),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Run ArticleRank (influence variant for diverse degree distributions)."""
     driver = get_neo4j_driver()
-    graph_name = await gds.ensure_projection(folder_id, node_ids)
+    wf = json.loads(weight_formula) if weight_formula else None
+    graph_name = await gds.ensure_projection(folder_id, node_ids, weight_formula=wf)
     
     try:
         async with driver.session() as session:
-            result = await session.run("""
-                CALL gds.articleRank.stream($graph_name, {
+            result = await session.run(f"""
+                CALL gds.articleRank.stream($graph_name, {{
                     dampingFactor: $damping,
                     maxIterations: $max_iter
-                })
+                }})
                 YIELD nodeId, score
                 WITH gds.util.asNode(nodeId) AS node, score
-                RETURN node.id AS id, node.name AS name, node.type AS type, score
+                RETURN node.id AS id, {_NAME_COALESCE} AS name, {_TYPE_COALESCE} AS type, score
                 ORDER BY score DESC
                 LIMIT $top_k
             """, graph_name=graph_name, damping=damping_factor, max_iter=max_iterations, top_k=top_k)
@@ -289,20 +311,22 @@ async def run_degree_centrality(
     folder_id: Optional[str] = None,
     node_ids: Optional[List[str]] = Query(default=None),
     top_k: int = Query(default=10, le=100),
+    weight_formula: Optional[str] = Query(default=None, description="JSON weight formula"),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Run Degree Centrality to find the most directly connected nodes."""
     driver = get_neo4j_driver()
-    graph_name = await gds.ensure_projection(folder_id, node_ids)
+    wf = json.loads(weight_formula) if weight_formula else None
+    graph_name = await gds.ensure_projection(folder_id, node_ids, weight_formula=wf)
     
     try:
         async with driver.session() as session:
-            result = await session.run("""
+            result = await session.run(f"""
                 CALL gds.degree.stream($graph_name)
                 YIELD nodeId, score
                 WITH gds.util.asNode(nodeId) AS node, score
-                RETURN node.id AS id, node.name AS name, node.type AS type, score
+                RETURN node.id AS id, {_NAME_COALESCE} AS name, {_TYPE_COALESCE} AS type, score
                 ORDER BY score DESC
                 LIMIT $top_k
             """, graph_name=graph_name, top_k=top_k)
@@ -333,20 +357,22 @@ async def run_hits_gds(
     node_ids: Optional[List[str]] = Query(default=None),
     max_iterations: int = Query(default=20, le=100),
     top_k: int = Query(default=10, le=100),
+    weight_formula: Optional[str] = Query(default=None, description="JSON weight formula"),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
 ) -> Dict[str, Any]:
     """Run HITS (Hubs and Authorities) algorithm using Neo4j GDS."""
     driver = get_neo4j_driver()
-    graph_name = await gds.ensure_projection(folder_id, node_ids)
+    wf = json.loads(weight_formula) if weight_formula else None
+    graph_name = await gds.ensure_projection(folder_id, node_ids, weight_formula=wf)
     
     try:
         async with driver.session() as session:
-            result = await session.run("""
-                CALL gds.hits.stream($graph_name, {})
+            result = await session.run(f"""
+                CALL gds.hits.stream($graph_name, {{}})
                 YIELD nodeId, values
                 WITH gds.util.asNode(nodeId) AS node, values.hub AS hubScore, values.auth AS authScore
-                RETURN node.id AS id, node.name AS name, node.type AS type, 
+                RETURN node.id AS id, {_NAME_COALESCE} AS name, {_TYPE_COALESCE} AS type, 
                        hubScore AS hub_score, authScore AS auth_score
                 ORDER BY authScore DESC
                 LIMIT $top_k
@@ -405,10 +431,10 @@ async def run_louvain(
                 YIELD nodeId, communityId, intermediateCommunityIds
                 WITH gds.util.asNode(nodeId) AS node, communityId, intermediateCommunityIds
                 {scope_filter}
-                RETURN node.id AS id, node.name AS name, node.type AS type, 
+                RETURN node.id AS id, {_NAME_COALESCE} AS name, {_TYPE_COALESCE} AS type, 
                        communityId AS community_id,
                        intermediateCommunityIds AS hierarchy
-                ORDER BY communityId, node.name
+                ORDER BY communityId, {_NAME_COALESCE}
             """, **params)
             
             records = await result.data()
@@ -471,9 +497,9 @@ async def run_leiden(
                 YIELD nodeId, communityId
                 WITH gds.util.asNode(nodeId) AS node, communityId
                 {scope_filter}
-                RETURN node.id AS id, node.name AS name, node.type AS type, 
+                RETURN node.id AS id, {_NAME_COALESCE} AS name, {_TYPE_COALESCE} AS type, 
                        communityId AS community_id
-                ORDER BY communityId, node.name
+                ORDER BY communityId, {_NAME_COALESCE}
             """, **params)
             
             records = await result.data()
@@ -541,7 +567,7 @@ async def run_wcc_gds(
                 YIELD nodeId, componentId
                 WITH gds.util.asNode(nodeId) AS node, componentId
                 {scope_filter}
-                RETURN node.id AS id, node.name AS name, node.type AS type, 
+                RETURN node.id AS id, {_NAME_COALESCE} AS name, {_TYPE_COALESCE} AS type, 
                        componentId AS community_id
                 ORDER BY componentId
             """, **params)
@@ -619,7 +645,7 @@ async def run_kcore_gds(
                 YIELD nodeId, coreValue
                 WITH gds.util.asNode(nodeId) AS node, coreValue
                 {scope_filter}
-                RETURN node.id AS id, node.name AS name, node.type AS type, 
+                RETURN node.id AS id, {_NAME_COALESCE} AS name, {_TYPE_COALESCE} AS type, 
                        coreValue AS score
                 ORDER BY coreValue DESC
             """, **params)
@@ -677,7 +703,7 @@ async def run_triangle_count_gds(
                 YIELD nodeId, triangleCount
                 WITH gds.util.asNode(nodeId) AS node, triangleCount
                 {scope_filter}
-                RETURN node.id AS id, node.name AS name, node.type AS type, 
+                RETURN node.id AS id, {_NAME_COALESCE} AS name, {_TYPE_COALESCE} AS type, 
                        triangleCount AS score
                 ORDER BY triangleCount DESC
                 LIMIT 50
@@ -742,8 +768,8 @@ async def run_node_similarity(
                 YIELD node1, node2, similarity
                 WITH gds.util.asNode(node1) AS n1, gds.util.asNode(node2) AS n2, similarity
                 {scope_filter}
-                RETURN n1.id AS source_id, n1.name AS source_name, n1.type AS source_type,
-                       n2.id AS target_id, n2.name AS target_name, n2.type AS target_type,
+                RETURN n1.id AS source_id, {_name_col('n1')} AS source_name, {_type_col('n1')} AS source_type,
+                       n2.id AS target_id, {_name_col('n2')} AS target_name, {_type_col('n2')} AS target_type,
                        similarity AS score
                 ORDER BY score DESC
                 LIMIT $top_k
@@ -832,7 +858,7 @@ async def find_shortest_path(
                 WITH nodeIds, totalCost
                 UNWIND nodeIds AS nodeId
                 WITH collect(gds.util.asNode(nodeId)) AS nodes, totalCost
-                RETURN [n IN nodes | {id: n.id, name: n.name, type: n.type}] AS path, 
+                RETURN [n IN nodes | {id: n.id, name: coalesce(n.name, n.title, n.question_text, n.text, n.content, n.label, n.code, n.questionId, n.studentId, n.examId, n.val, n.value, n.id), type: coalesce(n.type, labels(n)[0])}] AS path, 
                        totalCost AS total_cost,
                        size(nodes) AS path_length
             """, graph_name=graph_name, source=source_neo_id, target=target_neo_id)
@@ -999,7 +1025,7 @@ async def run_topological_sort(
                 YIELD nodeId
                 WITH gds.util.asNode(nodeId) AS n
                 {scope_filter}
-                RETURN n.id AS id, n.name AS name, n.type AS type
+                RETURN n.id AS id, {_name_col('n')} AS name, {_type_col('n')} AS type
             """, **params)
             
             records = await result.data()
@@ -1049,8 +1075,8 @@ async def run_link_prediction_gds(
                     OPTIONAL MATCH (a)--(neighbor)--(b)
                     WITH a, b, count(DISTINCT neighbor) AS score
                     WHERE score > 0
-                    RETURN a.id AS source_id, a.name AS source_name,
-                           b.id AS target_id, b.name AS target_name,
+                    RETURN a.id AS source_id, {_name_col('a')} AS source_name,
+                           b.id AS target_id, {_name_col('b')} AS target_name,
                            score
                     ORDER BY score DESC
                     LIMIT $top_k
@@ -1066,8 +1092,8 @@ async def run_link_prediction_gds(
                     WHERE degree > 1
                     WITH a, b, sum(1.0 / log(toFloat(degree))) AS score
                     WHERE score > 0
-                    RETURN a.id AS source_id, a.name AS source_name,
-                           b.id AS target_id, b.name AS target_name,
+                    RETURN a.id AS source_id, {_name_col('a')} AS source_name,
+                           b.id AS target_id, {_name_col('b')} AS target_name,
                            round(score * 1000) / 1000.0 AS score
                     ORDER BY score DESC
                     LIMIT $top_k
@@ -1079,8 +1105,8 @@ async def run_link_prediction_gds(
                     WHERE a <> b AND NOT (a)--(b) AND id(a) < id(b)
                     WITH a, b, COUNT {{ (a)--() }} * COUNT {{ (b)--() }} AS score
                     WHERE score > 0
-                    RETURN a.id AS source_id, a.name AS source_name,
-                           b.id AS target_id, b.name AS target_name,
+                    RETURN a.id AS source_id, {_name_col('a')} AS source_name,
+                           b.id AS target_id, {_name_col('b')} AS target_name,
                            score
                     ORDER BY score DESC
                     LIMIT $top_k
@@ -1096,8 +1122,8 @@ async def run_link_prediction_gds(
                     WHERE degree > 0
                     WITH a, b, sum(1.0 / degree) AS score
                     WHERE score > 0
-                    RETURN a.id AS source_id, a.name AS source_name,
-                           b.id AS target_id, b.name AS target_name,
+                    RETURN a.id AS source_id, {_name_col('a')} AS source_name,
+                           b.id AS target_id, {_name_col('b')} AS target_name,
                            round(score * 1000) / 1000.0 AS score
                     ORDER BY score DESC
                     LIMIT $top_k
@@ -1114,8 +1140,8 @@ async def run_link_prediction_gds(
                     WITH a, b, aNeighbors, collect(DISTINCT nb) AS bNeighbors
                     WITH a, b, size(apoc.coll.union(aNeighbors, bNeighbors)) AS score
                     WHERE score > 0
-                    RETURN a.id AS source_id, a.name AS source_name,
-                           b.id AS target_id, b.name AS target_name,
+                    RETURN a.id AS source_id, {_name_col('a')} AS source_name,
+                           b.id AS target_id, {_name_col('b')} AS target_name,
                            score
                     ORDER BY score DESC
                     LIMIT $top_k
@@ -1128,8 +1154,8 @@ async def run_link_prediction_gds(
                     WITH a, b, 
                          CASE WHEN a.type = b.type THEN 1.0 ELSE 0.0 END AS score
                     WHERE score > 0
-                    RETURN a.id AS source_id, a.name AS source_name,
-                           b.id AS target_id, b.name AS target_name,
+                    RETURN a.id AS source_id, {_name_col('a')} AS source_name,
+                           b.id AS target_id, {_name_col('b')} AS target_name,
                            score
                     ORDER BY score DESC
                     LIMIT $top_k

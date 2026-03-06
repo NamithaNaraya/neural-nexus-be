@@ -435,6 +435,71 @@ class EntityStaging(Base):
     )
 
 
+class WeightConfig(Base):
+    """
+    Dynamic weight configuration model.
+    
+    Stores user-defined weight formulas per folder.
+    Formulas are stored as JSONB to support any structure:
+      - {"type": "property", "property": "marks"}
+      - {"type": "ratio", "numerator": "marks", "denominator": "time", "label": "accuracy"}
+      - {"type": "weighted_sum", "terms": [{"property": "marks", "coefficient": 0.6}, ...]}
+      - {"type": "expression", "expr": "(marks * attempts) / time", "properties": ["marks", ...]}
+    
+    Only one config can be active per folder at a time.
+    """
+    __tablename__ = "weight_configs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    folder_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("folders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+    )
+    formula: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+    )
+    description: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    is_active: Mapped[bool] = mapped_column(
+        default=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    # Relationships
+    folder: Mapped["Folder"] = relationship("Folder", foreign_keys=[folder_id])
+    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
+
+    __table_args__ = (
+        Index("idx_wc_folder", "folder_id"),
+        Index("idx_wc_user", "user_id"),
+    )
+
+
 class Encounter(Base):
     """
     Reasoning Encounter model.

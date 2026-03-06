@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.routes import health, auth, folders, files, upload, graph, query, analytics, sse, websocket, deletion, dashboard, reasoning, browse, analytics_chat, herb
+from app.routes import weights as weight_routes
 from app.routes.ml import ml_routes
 from app.db.connections import (
     init_neo4j, 
@@ -158,6 +159,7 @@ app.include_router(browse.router, prefix="/api/v1/browse", tags=["Browse"])
 app.include_router(ml_routes.router, prefix="/api/v1/ml", tags=["Machine Learning"])
 app.include_router(analytics_chat.router, prefix="/api/v1/analytics-chat", tags=["Analytic Chat"])
 app.include_router(herb.router, prefix="/api/v1/graph", tags=["Herb Domain"])
+app.include_router(weight_routes.router, prefix="/api/v1/weights", tags=["Weight Config"])
 
 
 @app.get("/")

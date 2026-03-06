@@ -7,7 +7,9 @@ Handles graph projection creation, reuse, and invalidation.
 from typing import List, Optional, Dict, Any
 import logging
 import hashlib
+import json
 from app.db.connections import get_neo4j_driver
+from app.services.weight_service import WeightService
 
 logger = logging.getLogger(__name__)
 
@@ -18,15 +20,22 @@ class GDSService:
         self._needs_refresh = True  # Force refresh on first run to clear stale Entity-only projections
 
     def _filter_unnamed(self, data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Remove results where the node name is null (internal/system nodes)."""
+        """
+        Filters out nodes that have no identifier.
+        Previously forced 'name', now allows fallback identifiers.
+        """
         return [
             r for r in data
-            if r.get("name") or (r.get("source_name") and r.get("target_name"))
+            if r.get("name") or r.get("id") or (r.get("source_name") and r.get("target_name"))
         ]
 
-    def _get_graph_name(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, undirected: bool = False) -> str:
+    def _get_graph_name(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, undirected: bool = False, weight_formula: Optional[Dict[str, Any]] = None) -> str:
         """Generate a consistent graph name for a given scope."""
         suffix = "_undirected" if undirected else ""
+        # Include weight formula hash so weighted projections don't conflict with unweighted
+        if weight_formula:
+            wh = hashlib.md5(json.dumps(weight_formula, sort_keys=True).encode()).hexdigest()[:6]
+            suffix += f"_w{wh}"
         if node_ids:
             # Sort and hash node IDs for a unique identifier
             node_hash = hashlib.md5(",".join(sorted(node_ids)).encode()).hexdigest()[:8]
@@ -71,7 +80,8 @@ class GDSService:
         folder_id: Optional[str] = None, 
         node_ids: Optional[List[str]] = None,
         force_recreate: bool = False,
-        undirected: bool = False
+        undirected: bool = False,
+        weight_formula: Optional[Dict[str, Any]] = None
     ) -> str:
         """
         Ensures a GDS graph projection exists for the given scope.
@@ -86,7 +96,14 @@ class GDSService:
             await self.invalidate_all()
             self._needs_refresh = False
         
-        graph_name = self._get_graph_name(folder_id, node_ids, undirected)
+        graph_name = self._get_graph_name(folder_id, node_ids, undirected, weight_formula)
+        
+        # Compute the weight Cypher expression from formula (or use default)
+        if weight_formula:
+            weight_expr = WeightService.formula_to_cypher(weight_formula, rel_var="r")
+            logger.info(f"[GDS] Using custom weight expression: {weight_expr}")
+        else:
+            weight_expr = "coalesce(r.strength, 1.0)"
         
         async with self.driver.session() as session:
             # Check if projection exists
@@ -121,31 +138,29 @@ class GDSService:
                 elif node_ids:
                     # Directed Cypher projection for specific nodes (highest priority)
                     logger.info(f"Creating Cypher projection for {len(node_ids)} specific nodes")
-                    await session.run("""
+                    await session.run(f"""
                         CALL gds.graph.project.cypher(
                             $name,
-                            'MATCH (n) WHERE n.id IN $node_ids AND n.name IS NOT NULL RETURN id(n) AS id, labels(n) AS labels',
+                            'MATCH (n) WHERE n.id IN $node_ids RETURN id(n) AS id, labels(n) AS labels',
                             'MATCH (a)-[r]->(b) 
                              WHERE a.id IN $node_ids AND b.id IN $node_ids
-                             AND a.name IS NOT NULL AND b.name IS NOT NULL
                              RETURN id(a) AS source, id(b) AS target, type(r) AS type, 
-                                    coalesce(r.strength, 1.0) AS weight',
-                            {parameters: {node_ids: $node_ids}}
+                                    {weight_expr} AS weight',
+                            {{parameters: {{node_ids: $node_ids}}}}
                         )
                     """, name=graph_name, node_ids=node_ids)
                 elif folder_id:
                     # Directed Cypher projection for folder scope
                     logger.info(f"Creating Cypher projection for folder: {folder_id}")
-                    await session.run("""
+                    await session.run(f"""
                         CALL gds.graph.project.cypher(
                             $name,
-                            'MATCH (n) WHERE n.folder_id = $folder_id AND n.name IS NOT NULL RETURN id(n) AS id, labels(n) AS labels',
+                            'MATCH (n) WHERE n.folder_id = $folder_id RETURN id(n) AS id, labels(n) AS labels',
                             'MATCH (a)-[r]->(b) 
                              WHERE a.folder_id = $folder_id AND b.folder_id = $folder_id
-                             AND a.name IS NOT NULL AND b.name IS NOT NULL
                              RETURN id(a) AS source, id(b) AS target, type(r) AS type, 
-                                    coalesce(r.strength, 1.0) AS weight',
-                            {parameters: {folder_id: $folder_id}}
+                                    {weight_expr} AS weight',
+                            {{parameters: {{folder_id: $folder_id}}}}
                         )
                     """, name=graph_name, folder_id=folder_id)
                 else:
@@ -155,11 +170,10 @@ class GDSService:
                     await session.run(f"""
                         CALL gds.graph.project.cypher(
                             $name,
-                            'MATCH (n) WHERE n.name IS NOT NULL RETURN id(n) AS id, labels(n) AS labels',
+                            'MATCH (n) RETURN id(n) AS id, labels(n) AS labels',
                             '{rel_pattern}
-                             WHERE a.name IS NOT NULL AND b.name IS NOT NULL
                              RETURN id(a) AS source, id(b) AS target, type(r) AS type,
-                                    coalesce(r.strength, 1.0) AS weight'
+                                    {weight_expr} AS weight'
                         )
                     """, name=graph_name)
                 
@@ -200,17 +214,19 @@ class GDSService:
 
     # === GDS Algorithm Implementations ===
 
-    async def run_pagerank(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def run_pagerank(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None, weight_formula: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         logger.info(f"[GDS] run_pagerank: folder_id={folder_id}, node_ids={node_ids}, top_k={top_k}, target_type={target_type}")
-        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False, weight_formula=weight_formula)
         logger.info(f"[GDS] Using projection: {graph_name}")
         query = """
-            CALL gds.pageRank.stream($graph_name)
+            CALL gds.pageRank.stream($graph_name, {
+                relationshipWeightProperty: 'weight'
+            })
             YIELD nodeId, score
             WITH gds.util.asNode(nodeId) AS node, score
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
             AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
-            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
+            RETURN node.id AS id, coalesce(node.name, node.title, node.questionId, node.question_text, node.studentId, node.examId, node.code, node.text, node.content, node.label, node.val, node.value, node.id) AS name, coalesce(node.type, labels(node)[0]) AS type, score
             ORDER BY score DESC
             LIMIT $top_k
         """
@@ -220,9 +236,9 @@ class GDSService:
             logger.info(f"[GDS] PageRank returned {len(data)} results")
             return self._filter_unnamed(data)
 
-    async def run_betweenness(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def run_betweenness(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None, weight_formula: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         logger.info(f"[GDS] run_betweenness: folder_id={folder_id}, node_ids={node_ids}, top_k={top_k}, target_type={target_type}")
-        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False, weight_formula=weight_formula)
         logger.info(f"[GDS] Using projection: {graph_name}")
         query = """
             CALL gds.betweenness.stream($graph_name)
@@ -230,7 +246,7 @@ class GDSService:
             WITH gds.util.asNode(nodeId) AS node, score
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
             AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
-            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
+            RETURN node.id AS id, coalesce(node.name, node.title, node.questionId, node.question_text, node.studentId, node.examId, node.code, node.text, node.content, node.label, node.val, node.value, node.id) AS name, coalesce(node.type, labels(node)[0]) AS type, score
             ORDER BY score DESC
             LIMIT $top_k
         """
@@ -240,9 +256,9 @@ class GDSService:
             logger.info(f"[GDS] Betweenness returned {len(data)} results")
             return self._filter_unnamed(data)
 
-    async def run_closeness(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def run_closeness(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None, weight_formula: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         logger.info(f"[GDS] run_closeness: folder_id={folder_id}, top_k={top_k}, target_type={target_type}")
-        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False, weight_formula=weight_formula)
         query = """
             CALL gds.closeness.stream($graph_name)
             YIELD nodeId, score
@@ -250,7 +266,7 @@ class GDSService:
             WHERE score > 0
             AND ($folder_id IS NULL OR node.folder_id = $folder_id)
             AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
-            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
+            RETURN node.id AS id, coalesce(node.name, node.title, node.questionId, node.question_text, node.studentId, node.examId, node.code, node.text, node.content, node.label, node.val, node.value, node.id) AS name, coalesce(node.type, labels(node)[0]) AS type, score
             ORDER BY score DESC
             LIMIT $top_k
         """
@@ -269,7 +285,7 @@ class GDSService:
             WITH gds.util.asNode(nodeId) AS node, communityId
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
             AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
-            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, communityId AS community_id
+            RETURN node.id AS id, coalesce(node.name, node.title, node.questionId, node.question_text, node.studentId, node.examId, node.code, node.text, node.content, node.label, node.val, node.value, node.id) AS name, coalesce(node.type, labels(node)[0]) AS type, communityId AS community_id
             ORDER BY community_id ASC
         """
         async with self.driver.session() as session:
@@ -287,7 +303,7 @@ class GDSService:
             WITH gds.util.asNode(nodeId) AS node, componentId
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
             AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
-            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, componentId AS community_id
+            RETURN node.id AS id, coalesce(node.name, node.title, node.questionId, node.question_text, node.studentId, node.examId, node.code, node.text, node.content, node.label, node.val, node.value, node.id) AS name, coalesce(node.type, labels(node)[0]) AS type, componentId AS community_id
             ORDER BY community_id ASC
         """
         async with self.driver.session() as session:
@@ -296,17 +312,19 @@ class GDSService:
             logger.info(f"[GDS] WCC returned {len(data)} results")
             return self._filter_unnamed(data)
 
-    async def run_articlerank(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def run_articlerank(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None, weight_formula: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """ArticleRank — improved PageRank for graphs with diverse degree distributions."""
         logger.info(f"[GDS] run_articlerank: folder_id={folder_id}, top_k={top_k}, target_type={target_type}")
-        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False, weight_formula=weight_formula)
         query = """
-            CALL gds.articleRank.stream($graph_name)
+            CALL gds.articleRank.stream($graph_name, {
+                relationshipWeightProperty: 'weight'
+            })
             YIELD nodeId, score
             WITH gds.util.asNode(nodeId) AS node, score
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
             AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
-            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
+            RETURN node.id AS id, coalesce(node.name, node.title, node.questionId, node.question_text, node.studentId, node.examId, node.code, node.text, node.content, node.label, node.val, node.value, node.id) AS name, coalesce(node.type, labels(node)[0]) AS type, score
             ORDER BY score DESC
             LIMIT $top_k
         """
@@ -316,17 +334,19 @@ class GDSService:
             logger.info(f"[GDS] ArticleRank returned {len(data)} results")
             return self._filter_unnamed(data)
 
-    async def run_hits(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def run_hits(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None, weight_formula: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """HITS — identifies hub nodes (link to many) and authority nodes (linked by many)."""
         logger.info(f"[GDS] run_hits: folder_id={folder_id}, top_k={top_k}, target_type={target_type}")
-        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False, weight_formula=weight_formula)
         query = """
-            CALL gds.hits.stream($graph_name, {})
+            CALL gds.hits.stream($graph_name, {
+                relationshipWeightProperty: 'weight'
+            })
             YIELD nodeId, values
             WITH gds.util.asNode(nodeId) AS node, values.hub AS hubScore, values.auth AS authScore
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
             AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
-            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type,
+            RETURN node.id AS id, coalesce(node.name, node.title, node.questionId, node.question_text, node.studentId, node.examId, node.code, node.text, node.content, node.label, node.val, node.value, node.id) AS name, coalesce(node.type, labels(node)[0]) AS type,
                    hubScore AS hub_score, authScore AS auth_score, (hubScore + authScore) AS score
             ORDER BY authScore DESC
             LIMIT $top_k
@@ -349,7 +369,7 @@ class GDSService:
             WITH gds.util.asNode(nodeId) AS node, communityId
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
             AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
-            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, communityId AS community_id
+            RETURN node.id AS id, coalesce(node.name, node.title, node.questionId, node.question_text, node.studentId, node.examId, node.code, node.text, node.content, node.label, node.val, node.value, node.id) AS name, coalesce(node.type, labels(node)[0]) AS type, communityId AS community_id
             ORDER BY community_id ASC
         """
         try:
@@ -376,7 +396,7 @@ class GDSService:
             WHERE coreValue >= 2
             AND ($folder_id IS NULL OR node.folder_id = $folder_id)
             AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
-            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, coreValue AS score
+            RETURN node.id AS id, coalesce(node.name, node.title, node.questionId, node.question_text, node.studentId, node.examId, node.code, node.text, node.content, node.label, node.val, node.value, node.id) AS name, coalesce(node.type, labels(node)[0]) AS type, coreValue AS score
             ORDER BY coreValue DESC
             LIMIT $top_k
         """
@@ -397,7 +417,7 @@ class GDSService:
             WHERE triangleCount > 0
             AND ($folder_id IS NULL OR node.folder_id = $folder_id)
             AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
-            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, triangleCount AS score
+            RETURN node.id AS id, coalesce(node.name, node.title, node.questionId, node.question_text, node.studentId, node.examId, node.code, node.text, node.content, node.label, node.val, node.value, node.id) AS name, coalesce(node.type, labels(node)[0]) AS type, triangleCount AS score
             ORDER BY triangleCount DESC
             LIMIT $top_k
         """
@@ -428,8 +448,8 @@ class GDSService:
             YIELD node1, node2, similarity
             WITH gds.util.asNode(node1) AS n1, gds.util.asNode(node2) AS n2, similarity
             WHERE ($folder_id IS NULL OR n1.folder_id = $folder_id)
-            RETURN n1.id AS source_id, n1.name AS source_name, coalesce(n1.type, labels(n1)[0]) AS source_type,
-                   n2.id AS target_id, n2.name AS target_name, coalesce(n2.type, labels(n2)[0]) AS target_type,
+            RETURN n1.id AS source_id, coalesce(n1.name, n1.title, n1.questionId, n1.question_text, n1.studentId, n1.examId, n1.code, n1.text, n1.content, n1.label, n1.val, n1.value, n1.id) AS source_name, coalesce(n1.type, labels(n1)[0]) AS source_type,
+                   n2.id AS target_id, coalesce(n2.name, n2.title, n2.questionId, n2.question_text, n2.studentId, n2.examId, n2.code, n2.text, n2.content, n2.label, n2.val, n2.value, n2.id) AS target_name, coalesce(n2.type, labels(n2)[0]) AS target_type,
                    similarity AS score
             ORDER BY similarity DESC
             LIMIT $top_k
@@ -440,17 +460,17 @@ class GDSService:
             logger.info(f"[GDS] Node Similarity returned {len(data)} results")
             return self._filter_unnamed(data)
 
-    async def run_degree(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def run_degree(self, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None, top_k: int = 10, target_type: Optional[str] = None, weight_formula: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Degree Centrality — counts direct connections per node."""
         logger.info(f"[GDS] run_degree: folder_id={folder_id}, top_k={top_k}, target_type={target_type}")
-        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False)
+        graph_name = await self.ensure_projection(folder_id, node_ids, undirected=False, weight_formula=weight_formula)
         query = """
             CALL gds.degree.stream($graph_name)
             YIELD nodeId, score
             WITH gds.util.asNode(nodeId) AS node, score
             WHERE ($folder_id IS NULL OR node.folder_id = $folder_id)
             AND ($target_type IS NULL OR toLower(coalesce(node.type, labels(node)[0])) STARTS WITH toLower($target_type))
-            RETURN node.id AS id, node.name AS name, coalesce(node.type, labels(node)[0]) AS type, score
+            RETURN node.id AS id, coalesce(node.name, node.title, node.questionId, node.question_text, node.studentId, node.examId, node.code, node.text, node.content, node.label, node.val, node.value, node.id) AS name, coalesce(node.type, labels(node)[0]) AS type, score
             ORDER BY score DESC
             LIMIT $top_k
         """
@@ -478,8 +498,8 @@ class GDSService:
                 WHERE degree > 1
                 WITH a, b, sum(1.0 / log(toFloat(degree))) AS score
                 WHERE score > 0
-                RETURN a.id AS source_id, a.name AS source_name,
-                       b.id AS target_id, b.name AS target_name,
+                RETURN a.id AS source_id, coalesce(a.name, a.title, a.question_text, a.text, a.content, a.label, a.code, a.questionId, a.studentId, a.examId, a.val, a.value, a.id) AS source_name,
+                       b.id AS target_id, coalesce(b.name, b.title, b.question_text, b.text, b.content, b.label, b.code, b.questionId, b.studentId, b.examId, b.val, b.value, b.id) AS target_name,
                        round(score * 1000) / 1000.0 AS score
                 ORDER BY score DESC
                 LIMIT $top_k
@@ -494,8 +514,8 @@ class GDSService:
                 WHERE degree > 0
                 WITH a, b, sum(1.0 / degree) AS score
                 WHERE score > 0
-                RETURN a.id AS source_id, a.name AS source_name,
-                       b.id AS target_id, b.name AS target_name,
+                RETURN a.id AS source_id, coalesce(a.name, a.title, a.question_text, a.text, a.content, a.label, a.code, a.questionId, a.studentId, a.examId, a.val, a.value, a.id) AS source_name,
+                       b.id AS target_id, coalesce(b.name, b.title, b.question_text, b.text, b.content, b.label, b.code, b.questionId, b.studentId, b.examId, b.val, b.value, b.id) AS target_name,
                        round(score * 1000) / 1000.0 AS score
                 ORDER BY score DESC
                 LIMIT $top_k
@@ -508,8 +528,8 @@ class GDSService:
                 OPTIONAL MATCH (a)--(neighbor)--(b)
                 WITH a, b, count(DISTINCT neighbor) AS score
                 WHERE score > 0
-                RETURN a.id AS source_id, a.name AS source_name,
-                       b.id AS target_id, b.name AS target_name,
+                RETURN a.id AS source_id, coalesce(a.name, a.title, a.question_text, a.text, a.content, a.label, a.code, a.questionId, a.studentId, a.examId, a.val, a.value, a.id) AS source_name,
+                       b.id AS target_id, coalesce(b.name, b.title, b.question_text, b.text, b.content, b.label, b.code, b.questionId, b.studentId, b.examId, b.val, b.value, b.id) AS target_name,
                        score
                 ORDER BY score DESC
                 LIMIT $top_k
@@ -540,13 +560,13 @@ class GDSService:
                 return []
             
             # Build scope filter
-            scope_filter = "WHERE n.name IS NOT NULL"
+            scope_filter = ""
             params = {"graph_name": graph_name, "source": rec["neo_id"]}
             if node_ids:
-                scope_filter += " AND n.id IN $node_ids"
+                scope_filter = "WHERE n.id IN $node_ids"
                 params["node_ids"] = node_ids
             elif folder_id:
-                scope_filter += " AND n.folder_id = $folder_id"
+                scope_filter = "WHERE n.folder_id = $folder_id"
                 params["folder_id"] = folder_id
 
             result = await session.run(f"""
@@ -557,7 +577,7 @@ class GDSService:
                 UNWIND nodeIds AS nid
                 WITH gds.util.asNode(nid) AS n
                 {scope_filter}
-                RETURN n.id AS id, n.name AS name, coalesce(n.type, labels(n)[0]) AS type
+                RETURN n.id AS id, coalesce(n.name, n.title, n.question_text, n.text, n.content, n.label, n.code, n.questionId, n.studentId, n.examId, n.val, n.value, n.id) AS name, coalesce(n.type, labels(n)[0]) AS type
             """, **params)
             
             data = await result.data()
@@ -577,13 +597,13 @@ class GDSService:
                 return []
             
             # Build scope filter
-            scope_filter = "WHERE n.name IS NOT NULL"
+            scope_filter = ""
             params = {"graph_name": graph_name, "source": rec["neo_id"]}
             if node_ids:
-                scope_filter += " AND n.id IN $node_id_list"
+                scope_filter = "WHERE n.id IN $node_id_list"
                 params["node_id_list"] = node_ids
             elif folder_id:
-                scope_filter += " AND n.folder_id = $folder_id"
+                scope_filter = "WHERE n.folder_id = $folder_id"
                 params["folder_id"] = folder_id
 
             result = await session.run(f"""
@@ -594,7 +614,7 @@ class GDSService:
                 UNWIND nodeIds AS nid
                 WITH gds.util.asNode(nid) AS n
                 {scope_filter}
-                RETURN n.id AS id, n.name AS name, coalesce(n.type, labels(n)[0]) AS type
+                RETURN n.id AS id, coalesce(n.name, n.title, n.question_text, n.text, n.content, n.label, n.code, n.questionId, n.studentId, n.examId, n.val, n.value, n.id) AS name, coalesce(n.type, labels(n)[0]) AS type
             """, **params)
             
             data = await result.data()
@@ -614,13 +634,13 @@ class GDSService:
                 return []
             
             # Build scope filter
-            scope_filter = "WHERE n.name IS NOT NULL"
+            scope_filter = ""
             params = {"graph_name": graph_name, "source": rec["neo_id"], "length": walk_length, "count": walk_count}
             if node_ids:
-                scope_filter += " AND n.id IN $node_id_list"
+                scope_filter = "WHERE n.id IN $node_id_list"
                 params["node_id_list"] = node_ids
             elif folder_id:
-                scope_filter += " AND n.folder_id = $folder_id"
+                scope_filter = "WHERE n.folder_id = $folder_id"
                 params["folder_id"] = folder_id
 
             result = await session.run(f"""
@@ -633,7 +653,7 @@ class GDSService:
                 UNWIND nodeIds AS nid
                 WITH DISTINCT gds.util.asNode(nid) AS n
                 {scope_filter}
-                RETURN n.id AS id, n.name AS name, coalesce(n.type, labels(n)[0]) AS type
+                RETURN n.id AS id, coalesce(n.name, n.title, n.question_text, n.text, n.content, n.label, n.code, n.questionId, n.studentId, n.examId, n.val, n.value, n.id) AS name, coalesce(n.type, labels(n)[0]) AS type
             """, **params)
             
             data = await result.data()
@@ -650,9 +670,8 @@ class GDSService:
                 CALL gds.dag.topologicalSort.stream($graph_name)
                 YIELD nodeId
                 WITH gds.util.asNode(nodeId) AS n
-                WHERE n.name IS NOT NULL
-                AND ($folder_id IS NULL OR n.folder_id = $folder_id)
-                RETURN n.id AS id, n.name AS name, coalesce(n.type, labels(n)[0]) AS type
+                WHERE ($folder_id IS NULL OR n.folder_id = $folder_id)
+                RETURN n.id AS id, coalesce(n.name, n.title, n.question_text, n.text, n.content, n.label, n.code, n.questionId, n.studentId, n.examId, n.val, n.value, n.id) AS name, coalesce(n.type, labels(n)[0]) AS type
             """, graph_name=graph_name, folder_id=folder_id)
             
             data = await result.data()

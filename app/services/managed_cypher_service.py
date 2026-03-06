@@ -34,8 +34,67 @@ class ManagedCypherService:
         self.embedding_agent = EmbeddingAgent()
 
     # ──────────────────────────────────────────────────────────────────────
+    #  Statement Splitter — quote-aware semicolon splitting
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _split_statements(query: str) -> List[str]:
+        """
+        Split a Cypher query into individual statements by semicolons,
+        but ONLY split on semicolons that are outside of quotes.
+        
+        This prevents breaking data like:
+            {n:"Acetic acid;1,7,7-trimethylbicyclo[2.2.1]heptan-2-ol"}
+        """
+        statements: List[str] = []
+        current: List[str] = []
+        in_single_quote = False
+        in_double_quote = False
+        i = 0
+        
+        while i < len(query):
+            ch = query[i]
+            
+            # Handle escape sequences
+            if ch == '\\' and i + 1 < len(query):
+                current.append(ch)
+                current.append(query[i + 1])
+                i += 2
+                continue
+            
+            # Toggle quote state
+            if ch == "'" and not in_double_quote:
+                in_single_quote = not in_single_quote
+            elif ch == '"' and not in_single_quote:
+                in_double_quote = not in_double_quote
+            
+            # Split on semicolons only when outside all quotes
+            if ch == ';' and not in_single_quote and not in_double_quote:
+                statements.append(''.join(current))
+                current = []
+            else:
+                current.append(ch)
+            
+            i += 1
+        
+        # Don't forget the last statement (no trailing semicolon)
+        if current:
+            statements.append(''.join(current))
+        
+        return statements
+
+    # ──────────────────────────────────────────────────────────────────────
     #  Cypher Rewriter — folder-level isolation via label injection
     # ──────────────────────────────────────────────────────────────────────
+
+    def _is_pre_formatted(self, query: str, folder_id: str) -> bool:
+        """
+        Detect if a query was already pre-formatted for the platform.
+        Signs: contains both 'folder_id' property AND ':Entity' label.
+        """
+        has_folder_id_prop = f"folder_id: '{folder_id}'" in query or f'folder_id: "{folder_id}"' in query
+        has_entity_label = ':Entity' in query
+        return has_folder_id_prop and has_entity_label
 
     def _rewrite_query_for_folder(self, query: str, folder_id: str) -> List[str]:
         """
@@ -43,8 +102,9 @@ class ManagedCypherService:
         folder-specific label (e.g. :F_abc123) into all node patterns.
 
         Handles:
-        - Schema commands (CREATE/DROP CONSTRAINT/INDEX with IF NOT EXISTS)
+        - Schema commands: SKIPPED (platform manages its own constraints)
         - Data commands  (MERGE/CREATE/MATCH with node patterns)
+        - Pre-formatted queries: detected and passed through without double-rewriting
         - Comments       (// line comments and /* block comments */)
         - Multi-statement queries (semicolon-delimited)
 
@@ -52,6 +112,11 @@ class ManagedCypherService:
         """
         folder_label = f"F_{folder_id.replace('-', '_')}"
         folder_suffix = f"_{folder_label}"
+
+        # ── Detect pre-formatted queries (already have folder_id + :Entity) ──
+        is_pre_formatted = self._is_pre_formatted(query, folder_id)
+        if is_pre_formatted:
+            logger.info("Query detected as pre-formatted (contains folder_id + :Entity). Skipping label rewriting.")
 
         # ── Helper: prefix user labels with folder suffix ──
         def _prefix_labels(label_str: str) -> str:
@@ -70,9 +135,12 @@ class ManagedCypherService:
                     prefixed.append(f"{p}{folder_suffix}")
             return ":" + ":".join(prefixed) if prefixed else ""
 
-        # ── Split into individual statements ──
-        raw_parts = query.split(';')
+        # ── Split into individual statements (quote-aware) ──
+        # Naive split(';') breaks when data contains semicolons inside strings
+        # e.g. {n:"Acetic acid;1,7,7-trimethyl...", i:"IMPHY017672"}
+        raw_parts = self._split_statements(query)
         rewritten_statements: List[str] = []
+        skipped_schema_count = 0
 
         for part in raw_parts:
             # Strip the part for analysis but preserve original whitespace for output
@@ -99,15 +167,113 @@ class ManagedCypherService:
             ])
 
             if is_schema:
+                # SKIP schema statements — the platform manages its own constraints.
+                # User-provided constraints often conflict with existing data in other folders.
+                skipped_schema_count += 1
+                logger.info(f"Skipping user schema statement: {stripped[:100]}...")
+                continue
+            elif is_pre_formatted:
+                # Pre-formatted query: pass through without label rewriting
+                # but still inject the folder label for graph isolation
                 rewritten_statements.append(
-                    self._rewrite_schema_statement(stripped, folder_label, folder_suffix)
+                    self._inject_folder_label_only(stripped, folder_label)
                 )
             else:
                 rewritten_statements.append(
                     self._rewrite_data_statement(stripped, folder_label, folder_suffix, _prefix_labels)
                 )
 
+        if skipped_schema_count > 0:
+            logger.info(f"Skipped {skipped_schema_count} schema statement(s). Platform manages constraints internally.")
+
         return rewritten_statements
+
+    def _inject_folder_label_only(self, stmt: str, folder_label: str) -> str:
+        """
+        For pre-formatted queries that already have :Entity and folder_id,
+        only inject the folder-specific label (:F_xxx) for graph isolation.
+        Does NOT rename any existing labels.
+        """
+        seen_vars: set = set()
+
+        # Negative lookbehind prevents matching function calls like uuid(), datetime(), apoc.create.uuid()
+        node_pattern = re.compile(
+            r'(?<![a-zA-Z0-9_.])'
+            r'(\(\s*)'
+            r'([a-zA-Z_][a-zA-Z0-9_]*)?'
+            r'(\s*(?::[a-zA-Z_][a-zA-Z0-9_:]*))?'
+            r'(\s*\{.*?\})?'
+            r'(\s*\))',
+            re.DOTALL
+        )
+
+        def _inject(match: re.Match) -> str:
+            prefix = match.group(1)
+            var = match.group(2) or ""
+            labels = match.group(3) or ""
+            props = match.group(4) or ""
+            suffix = match.group(5)
+
+            if var and var in seen_vars:
+                return match.group(0)
+            if var:
+                seen_vars.add(var)
+
+            # Only add the folder label if not already present
+            if labels and folder_label not in labels:
+                labels = f"{labels}:{folder_label}"
+            elif not labels:
+                labels = f":{folder_label}"
+
+            return f"{prefix}{var}{labels}{props}{suffix}"
+
+        clean_stmt = re.sub(r'//.*', '', stmt)
+        return node_pattern.sub(_inject, clean_stmt)
+
+    def preview_query(self, query: str, folder_id: str) -> Dict[str, Any]:
+        """
+        Preview what the rewriter will do WITHOUT executing anything.
+        Returns the rewritten statements and metadata for user review.
+        """
+        try:
+            is_pre_formatted = self._is_pre_formatted(query, folder_id)
+            rewritten = self._rewrite_query_for_folder(query, folder_id)
+            
+            # Count statement types
+            schema_count = 0
+            data_count = 0
+            raw_parts = self._split_statements(query)
+            for part in raw_parts:
+                stripped = part.strip()
+                if not stripped:
+                    continue
+                no_comments = re.sub(r'//.*', '', stripped)
+                no_comments = re.sub(r'/\*.*?\*/', '', no_comments, flags=re.DOTALL).strip()
+                if not no_comments:
+                    continue
+                upper = no_comments.upper()
+                if any(upper.startswith(kw) for kw in ['CREATE CONSTRAINT', 'DROP CONSTRAINT', 'CREATE INDEX', 'DROP INDEX']):
+                    schema_count += 1
+                else:
+                    data_count += 1
+
+            return {
+                "is_pre_formatted": is_pre_formatted,
+                "total_statements": len(rewritten),
+                "schema_skipped": schema_count,
+                "data_statements": data_count,
+                "preview": [stmt[:300] + ("..." if len(stmt) > 300 else "") for stmt in rewritten[:10]],
+                "message": (
+                    f"Detected {data_count} data statement(s) and {schema_count} schema statement(s). "
+                    f"Schema statements will be skipped (platform manages constraints). "
+                    f"{'Query is pre-formatted — labels will NOT be renamed.' if is_pre_formatted else 'Labels will be folder-scoped automatically.'}"
+                )
+            }
+        except Exception as e:
+            return {
+                "error": str(e),
+                "message": f"Preview failed: {str(e)}"
+            }
 
     def _rewrite_schema_statement(
         self, stmt: str, folder_label: str, folder_suffix: str
@@ -169,7 +335,9 @@ class ManagedCypherService:
         # ── Node pattern regex ──
         # Matches: (var:Label {props})
         # re.DOTALL allows matching across newlines within the parens
+        # Negative lookbehind prevents matching function calls like uuid(), datetime(), apoc.create.uuid()
         node_pattern = re.compile(
+            r'(?<![a-zA-Z0-9_.])'
             r'(\(\s*)'                          # Group 1: opening paren + optional whitespace
             r'([a-zA-Z_][a-zA-Z0-9_]*)?'        # Group 2: optional variable name
             r'(\s*(?::[a-zA-Z_][a-zA-Z0-9_:]*))?' # Group 3: optional labels
@@ -249,14 +417,22 @@ class ManagedCypherService:
         async with self.driver.session() as session:
             # ── Step 1: Execute the rewritten statements ──
             try:
-                logger.info(f"Executing managed Cypher query for file {file_id}")
+                total_stmts = len(rewritten_statements)
+                logger.info(f"Executing {total_stmts} Cypher statement(s) for file {file_id}")
                 for idx, stmt in enumerate(rewritten_statements):
                     clean_stmt = stmt.strip()
                     if not clean_stmt:
                         continue
-                    logger.debug(f"Running statement [{idx}]: {clean_stmt[:150]}")
+                    
+                    # Detect if this is a schema statement (constraint/index)
+                    is_schema = any(clean_stmt.upper().startswith(kw) for kw in [
+                        'CREATE CONSTRAINT', 'DROP CONSTRAINT', 'CREATE INDEX', 'DROP INDEX'
+                    ])
+                    
+                    progress_pct = int((idx + 1) / total_stmts * 100)
+                    logger.info(f"[{idx+1}/{total_stmts}] ({progress_pct}%) Running: {clean_stmt[:120]}...")
                     try:
-                        await session.run(
+                        result = await session.run(
                             clean_stmt,
                             {
                                 "file_id": file_id,
@@ -264,20 +440,34 @@ class ManagedCypherService:
                                 "user_id": user_id,
                             }
                         )
-                    except Exception as stmt_err:
-                        logger.error(
-                            f"Statement [{idx}] failed: {stmt_err}\n"
-                            f"Query was: {clean_stmt}"
+                        summary = await result.consume()
+                        counters = summary.counters
+                        logger.info(
+                            f"[{idx+1}/{total_stmts}] Done — "
+                            f"nodes_created={counters.nodes_created}, "
+                            f"rels_created={counters.relationships_created}, "
+                            f"props_set={counters.properties_set}"
                         )
-                        raise
+                    except Exception as stmt_err:
+                        if is_schema:
+                            # Schema statements often fail if data already exists or duplicates occur
+                            # Let's log it as a warning but NOT crash the entire ingestion
+                            logger.warning(f"Schema statement [{idx}] failed, but continuing: {stmt_err}")
+                        else:
+                            # Data statements should still failing loudly
+                            logger.error(
+                                f"Statement [{idx}] failed: {stmt_err}\n"
+                                f"Query was: {clean_stmt}"
+                            )
+                            raise
             except Exception as e:
                 logger.error(f"User Cypher execution failed: {e}")
                 raise
 
             # ── Step 2: Adopt nodes — tag with :Entity, file_id, folder_id ──
             # Improved adoption: catch any node that has the folder-specific label
+            logger.info(f"[Step 2/7] Adopting nodes for file {file_id}...")
             try:
-                # Normalization: Promote common name-like fields (text, title, label, code) 
                 # to 'name' so RAG and Search can find them.
                 adoption_result = await session.run(f"""
                     MATCH (n:{folder_label})
@@ -308,6 +498,7 @@ class ManagedCypherService:
                 # Non-fatal — continue with the rest
 
             # ── Step 2.5: Adopt Relationships ──
+            logger.info(f"[Step 2.5/7] Adopting relationships for file {file_id}...")
             try:
                 await session.run("""
                     MATCH (a:Entity)-[r]->(b:Entity)
@@ -323,6 +514,7 @@ class ManagedCypherService:
                 logger.warning(f"Relationship adoption failed: {e}")
 
             # ── Step 3: UUID Generation ──
+            logger.info(f"[Step 3/7] Generating UUIDs for file {file_id}...")
             try:
                 await session.run("""
                     MATCH (n:Entity)
@@ -348,6 +540,7 @@ class ManagedCypherService:
                     logger.error(f"Python UUID fallback also failed: {fallback_err}")
 
             # ── Step 4: Generate missing embeddings ──
+            logger.info(f"[Step 4/7] Generating embeddings for file {file_id}...")
             try:
                 result = await session.run("""
                     MATCH (n:Entity)
@@ -367,6 +560,7 @@ class ManagedCypherService:
                         })
 
                 if new_nodes:
+                    logger.info(f"[Step 4/7] Found {len(new_nodes)} nodes needing embeddings...")
                     try:
                         embedded_nodes = await self.embedding_agent.embed_entities(new_nodes)
                         for node in embedded_nodes:
@@ -382,6 +576,7 @@ class ManagedCypherService:
                 logger.error(f"Embedding query failed: {e}")
 
             # ── Step 5: Sync to PostgreSQL entity_staging ──
+            logger.info(f"[Step 5/7] Syncing to PostgreSQL for file {file_id}...")
             try:
                 entities_result = await session.run("""
                     MATCH (n:Entity)

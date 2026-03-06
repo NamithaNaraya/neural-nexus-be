@@ -266,7 +266,7 @@ async def upload_file(
     Files are processed through the 7-phase agentic pipeline.
     """
     # Validate file type
-    allowed_extensions = {".pdf", ".csv", ".tsv", ".txt", ".docx", ".xlsx", ".md"}
+    allowed_extensions = {".pdf", ".csv", ".tsv", ".txt", ".docx", ".xlsx", ".md", ".cypher"}
     file_ext = "." + file.filename.split(".")[-1].lower() if "." in file.filename else ""
     
     if file_ext not in allowed_extensions:
@@ -285,7 +285,67 @@ async def upload_file(
     user_id = current_user['id']
     
     try:
-        # Extract text content
+        # Special handling for Cypher files - bypass extraction pipeline
+        if file_type == 'cypher':
+            content = file_bytes.decode('utf-8')
+            
+            # Create file record
+            await _create_file_record(
+                file_id=file_id,
+                filename=file.filename,
+                folder_id=folder_id,
+                user_id=user_id,
+                file_type="cypher",
+                file_size=file_size,
+            )
+            
+            from app.services.managed_cypher_service import get_managed_cypher_service
+            managed_service = get_managed_cypher_service()
+            
+            # Run in background to avoid timeout
+            async def run_managed_cypher():
+                try:
+                    result = await managed_service.execute_managed_query(
+                        query=content,
+                        file_id=file_id,
+                        folder_id=folder_id,
+                        user_id=user_id
+                    )
+                    
+                    from app.agents.storage_agent import StorageAgent
+                    storage = StorageAgent()
+                    await storage.update_file_status(
+                        file_id=file_id,
+                        status="completed",
+                        node_count=result["node_count"],
+                        relationship_count=result.get("relationship_count", 0),
+                    )
+                    
+                    # Run FastRP Embeddings
+                    try:
+                        from app.services.graph_service import get_graph_service
+                        graph_service = get_graph_service()
+                        await graph_service.run_fastrp_node_embeddings(folder_id)
+                    except Exception as e:
+                        logger.warning(f"FastRP failed: {e}")
+                        
+                except Exception as e:
+                    logger.error(f"Background Cypher ingestion failed: {e}")
+                    from app.agents.storage_agent import StorageAgent
+                    storage = StorageAgent()
+                    await storage.update_file_status(file_id, "failed", error_message=str(e))
+
+            background_tasks.add_task(run_managed_cypher)
+            
+            return UploadResponse(
+                file_id=file_id,
+                filename=file.filename,
+                folder_id=folder_id,
+                status="pending",
+                message="Cypher file uploaded. Ingestion started in background.",
+            )
+
+        # Extract text content for other files
         content = _extract_file_content(file_bytes, file_type)
         
         if not content.strip():
@@ -304,7 +364,7 @@ async def upload_file(
             file_size=file_size,
         )
         
-        # Start background processing
+        # Start background processing for AI pipeline
         background_tasks.add_task(
             _process_file_async,
             content,
@@ -397,6 +457,29 @@ async def upload_text(
             status_code=500,
             detail=f"Failed to process text ingestion: {str(e)}",
         )
+
+
+class CypherPreviewRequest(BaseModel):
+    """Request to preview a Cypher query transformation."""
+    query: str
+    folder_id: str
+
+
+@router.post("/upload/cypher/preview")
+async def preview_cypher(
+    request: CypherPreviewRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Preview what the platform will do with a Cypher query BEFORE running it.
+    Shows: how many statements, which are skipped, what labels will change.
+    No data is modified.
+    """
+    from app.services.managed_cypher_service import get_managed_cypher_service
+    
+    managed_service = get_managed_cypher_service()
+    preview = managed_service.preview_query(request.query, request.folder_id)
+    return preview
 
 
 @router.post("/upload/cypher", response_model=UploadResponse)

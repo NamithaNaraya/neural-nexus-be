@@ -3,14 +3,22 @@ import logging
 import json
 from app.services.ai_service import get_ai_service
 from app.services.gds_service import get_gds_service
-from app.db.connections import get_neo4j_driver
+from app.services.weight_service import WeightService
+from app.db.connections import get_neo4j_driver, get_postgres_session
+from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
+
+# Algorithms that actually use the weight_formula for scoring
+WEIGHT_AWARE_ALGOS = frozenset({
+    "pagerank", "articlerank", "betweenness", "closeness", "degree", "hits"
+})
 
 class AnalyticChatService:
     def __init__(self):
         self.ai = get_ai_service()
         self.gds = get_gds_service()
+        self.weights = WeightService()
         self.driver = get_neo4j_driver()
 
     async def process_query(self, query: str, folder_id: Optional[str] = None, node_ids: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -20,10 +28,30 @@ class AnalyticChatService:
         """
         logger.info(f"[AnalyticChat] process_query: query='{query}', folder_id={folder_id}, node_ids={node_ids}")
         
-        # 0. Gather scope context for the LLM
+        # 0. Check for active weight configurations
+        weight_formula = None
+        weight_desc = ""
+        if folder_id:
+            try:
+                async with get_postgres_session() as session:
+                    result = await session.execute(
+                        text("SELECT formula, name FROM neural_nexus.weight_configs WHERE folder_id = :fid AND is_active = true LIMIT 1"),
+                        {"fid": folder_id}
+                    )
+                    row = result.fetchone()
+                    if row:
+                        weight_formula = row.formula
+                        weight_desc = f"Analyzing using custom weights: {row.name} ({self.weights.get_formula_description(weight_formula)})"
+                        logger.info(f"[AnalyticChat] Found active weight: {row.name}")
+            except Exception as e:
+                logger.warning(f"[AnalyticChat] Could not fetch weight config: {e}")
+
+        # 0.5 Gather scope context for the LLM
         scope_info, available_types = await self._get_scope_context(folder_id, node_ids)
+        if weight_desc:
+            scope_info += f"\nActive Weighting: {weight_desc}"
+        
         logger.info(f"[AnalyticChat] Scope context: {scope_info}")
-        logger.info(f"[AnalyticChat] Available types: {available_types}")
 
         # 1. Decide which algorithm to use (with scope awareness)
         decision = await self._decide_algorithm(query, scope_info, available_types)
@@ -84,7 +112,7 @@ class AnalyticChatService:
             # Fallback to UI selection
             algo_node_ids = node_ids
         
-        results = await self._run_algorithm(algo_name, folder_id, algo_node_ids, params, target_type, resolved_node_ids=resolved_node_ids)
+        results = await self._run_algorithm(algo_name, folder_id, algo_node_ids, params, target_type, resolved_node_ids=resolved_node_ids, weight_formula=weight_formula)
         
         # 4. Hybrid Logic: If they asked about specific entities but DIDN'T get a path, 
         # try to find a direct connection path to augment the algorithmic results.
@@ -96,8 +124,22 @@ class AnalyticChatService:
                 # The interpretation logic will see these in the pre-summary
                 results = path_results + results 
 
-        # 5. Generate response (scope-aware)
-        answer = await self._interpret_results(query, algo_name, results, scope_info)
+        # 5. Generate response (scope-aware, weight-aware)
+        weight_name = None
+        if weight_formula and folder_id:
+            try:
+                async with get_postgres_session() as session:
+                    result = await session.execute(
+                        text("SELECT name FROM neural_nexus.weight_configs WHERE folder_id = :fid AND is_active = true LIMIT 1"),
+                        {"fid": folder_id}
+                    )
+                    wrow = result.fetchone()
+                    if wrow:
+                        weight_name = wrow.name
+            except Exception:
+                pass
+
+        answer = await self._interpret_results(query, algo_name, results, scope_info, weight_formula=weight_formula, weight_name=weight_name)
         
         return {
             "answer": answer,
@@ -233,24 +275,24 @@ class AnalyticChatService:
             logger.error(f"Failed to decide algorithm: {e}")
             return {"algorithm": "none"}
 
-    async def _run_algorithm(self, algo: str, folder_id: Optional[str], node_ids: Optional[List[str]], params: Dict[str, Any], target_type: Optional[str] = None, resolved_node_ids: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    async def _run_algorithm(self, algo: str, folder_id: Optional[str], node_ids: Optional[List[str]], params: Dict[str, Any], target_type: Optional[str] = None, resolved_node_ids: Optional[List[str]] = None, weight_formula: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Executes the selected algorithm via GDSService."""
         top_k = params.get("top_k", 10)
         logger.info(f"[AnalyticChat] Running algorithm '{algo}' | folder_id={folder_id} | node_ids={node_ids} | top_k={top_k} | target_type={target_type}")
         
         try:
             if algo == "pagerank":
-                results = await self.gds.run_pagerank(folder_id, node_ids, top_k=top_k, target_type=target_type)
+                results = await self.gds.run_pagerank(folder_id, node_ids, top_k=top_k, target_type=target_type, weight_formula=weight_formula)
             elif algo == "articlerank":
-                results = await self.gds.run_articlerank(folder_id, node_ids, top_k=top_k, target_type=target_type)
+                results = await self.gds.run_articlerank(folder_id, node_ids, top_k=top_k, target_type=target_type, weight_formula=weight_formula)
             elif algo == "betweenness":
-                results = await self.gds.run_betweenness(folder_id, node_ids, top_k=top_k, target_type=target_type)
+                results = await self.gds.run_betweenness(folder_id, node_ids, top_k=top_k, target_type=target_type, weight_formula=weight_formula)
             elif algo == "closeness":
-                results = await self.gds.run_closeness(folder_id, node_ids, top_k=top_k, target_type=target_type)
+                results = await self.gds.run_closeness(folder_id, node_ids, top_k=top_k, target_type=target_type, weight_formula=weight_formula)
             elif algo == "degree":
-                results = await self.gds.run_degree(folder_id, node_ids, top_k=top_k, target_type=target_type)
+                results = await self.gds.run_degree(folder_id, node_ids, top_k=top_k, target_type=target_type, weight_formula=weight_formula)
             elif algo == "hits":
-                results = await self.gds.run_hits(folder_id, node_ids, top_k=top_k, target_type=target_type)
+                results = await self.gds.run_hits(folder_id, node_ids, top_k=top_k, target_type=target_type, weight_formula=weight_formula)
             elif algo == "louvain":
                 results = await self.gds.run_louvain(folder_id, node_ids, target_type=target_type)
             elif algo == "leiden":
@@ -323,7 +365,7 @@ class AnalyticChatService:
         query = """
         MATCH (start:Entity {id: $start_id}), (end:Entity {id: $end_id})
         MATCH p = shortestPath((start)-[*..15]-(end))
-        RETURN [n IN nodes(p) | {id: n.id, name: n.name, type: coalesce(n.type, labels(n)[0])}] AS path_nodes
+        RETURN [n IN nodes(p) | {id: n.id, name: coalesce(n.name, n.title, n.question_text, n.text, n.content, n.label, n.code, n.questionId, n.studentId, n.examId, n.val, n.value, n.id), type: coalesce(n.type, labels(n)[0])}] AS path_nodes
         """
         async with self.driver.session() as session:
             result = await session.run(query, start_id=start_id, end_id=end_id)
@@ -357,7 +399,7 @@ class AnalyticChatService:
             communities = {}
             for r in [node for node in results if node.get("community_id")]:
                 cid = r.get("community_id", "unknown")
-                name = r.get("name", r.get("id", "?"))
+                name = r.get("name") or r.get("questionId") or r.get("studentId") or r.get("examId") or r.get("code") or r.get("text") or r.get("id") or "?"
                 node_type = r.get("type", "")
                 if cid not in communities:
                     communities[cid] = []
@@ -407,7 +449,7 @@ class AnalyticChatService:
             lines = []
             centrality_results = [r for r in results if r.get("score") and not r.get("source_name")]
             for i, r in enumerate(centrality_results[:15], 1):
-                name = r.get("name", r.get("id", "?"))
+                name = r.get("name") or r.get("questionId") or r.get("studentId") or r.get("examId") or r.get("code") or r.get("text") or r.get("id") or "?"
                 score = r.get("score", 0)
                 node_type = r.get("type", "")
                 type_label = f" ({node_type})" if node_type else ""
@@ -416,7 +458,7 @@ class AnalyticChatService:
 
         return path_str + algo_str
 
-    async def _interpret_results(self, query: str, algo: str, results: List[Dict[str, Any]], scope_info: str = "") -> str:
+    async def _interpret_results(self, query: str, algo: str, results: List[Dict[str, Any]], scope_info: str = "", weight_formula: Optional[Dict[str, Any]] = None, weight_name: Optional[str] = None) -> str:
         """Uses LLM to explain the algorithm results in natural language."""
         if not results:
             return "The algorithm was executed but returned no significant results for the current selection. Make sure you have a folder selected with data."
@@ -427,6 +469,31 @@ class AnalyticChatService:
 
         # Pre-summarize results into human-readable format
         summary = self._pre_summarize(algo, results)
+
+        # ── Weight context for the LLM ──
+        algo_uses_weights = algo in WEIGHT_AWARE_ALGOS
+        if algo_uses_weights and weight_formula and weight_name:
+            weight_context = (
+                f"\nWEIGHT INFO: This algorithm was run WITH quantitative weights active. "
+                f"Weight config: \"{weight_name}\". "
+                f"This means that connection strengths are derived from numeric properties in the data, "
+                f"so the scores reflect both the structural position AND the quantitative values (e.g., marks, scores, amounts). "
+                f"Mention this in your explanation — tell the user that the results INCLUDE the quantitative weights and what that means for the ranking."
+            )
+        elif algo_uses_weights and not weight_formula:
+            weight_context = (
+                f"\nWEIGHT INFO: This algorithm CAN use quantitative weights to factor in numeric properties (like marks, scores), "
+                f"but the weight toggle is currently OFF. The results reflect only the structural graph pattern (who is connected to whom), "
+                f"not any numeric property values. Briefly mention that enabling weights could give more data-driven results."
+            )
+        elif not algo_uses_weights and weight_formula:
+            weight_context = (
+                f"\nWEIGHT INFO: The user has weights enabled (\"{weight_name or 'custom'}\"), but this specific algorithm ({algo}) "
+                f"does NOT use quantitative weights. It analyzes purely structural/connection patterns. "
+                f"Briefly clarify that the weight toggle does not affect this particular analysis."
+            )
+        else:
+            weight_context = ""
 
         # Algorithm-specific explanation instructions
         algo_instructions = {
@@ -459,6 +526,7 @@ class AnalyticChatService:
 ALGORITHM: {algo}
 SCOPE: This ran ONLY on: {scope_info}
 USER QUESTION: {query}
+{weight_context}
 
 PRE-SUMMARIZED RESULTS:
 {summary}
@@ -473,7 +541,8 @@ RULES:
 4. **Name the groups**: For community algorithms, give each group a descriptive theme name based on its members.
 5. **Actionable insights**: Tell the user what they can DO with this information.
 6. **Be brief**: 3-5 short paragraphs max.
-7. **Bold key names**: Use **bold** for important entity names."""
+7. **Bold key names**: Use **bold** for important entity names.
+8. **Weight transparency**: If WEIGHT INFO is provided above, include a brief note about whether the quantitative weights influenced these results. If weights were used, explain that the ranking considers both structural connections AND the numeric property values. If weights are off but supported, briefly mention this option."""
 
         messages = [
             {"role": "system", "content": system_prompt},
