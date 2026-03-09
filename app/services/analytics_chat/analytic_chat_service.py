@@ -139,7 +139,7 @@ class AnalyticChatService:
             except Exception:
                 pass
 
-        answer = await self._interpret_results(query, algo_name, results, scope_info, weight_formula=weight_formula, weight_name=weight_name)
+        answer = await self._interpret_results(query, algo_name, results, scope_info, weight_formula=weight_formula, weight_name=weight_name, resolved_node_ids=resolved_node_ids)
         
         return {
             "answer": answer,
@@ -361,199 +361,234 @@ class AnalyticChatService:
             return [{"error_message": f"The algorithm could not run on your current data. This usually means the dataset is too small or doesn't have the right structure for this analysis."}]
 
     async def _run_shortest_path(self, start_id: str, end_id: str) -> List[Dict[str, Any]]:
-        """Finds shortest path between two specific nodes."""
+        """Finds shortest path between two specific nodes, including relationship types."""
         query = """
-        MATCH (start:Entity {id: $start_id}), (end:Entity {id: $end_id})
+        MATCH (start {id: $start_id}), (end {id: $end_id})
         MATCH p = shortestPath((start)-[*..15]-(end))
-        RETURN [n IN nodes(p) | {id: n.id, name: coalesce(n.name, n.title, n.question_text, n.text, n.content, n.label, n.code, n.questionId, n.studentId, n.examId, n.val, n.value, n.id), type: coalesce(n.type, labels(n)[0])}] AS path_nodes
+        WITH nodes(p) AS ns, relationships(p) AS rs
+        RETURN [i IN range(0, size(ns)-1) | {
+            id: ns[i].id, 
+            name: coalesce(ns[i].name, ns[i].title, ns[i].question_text, ns[i].text, ns[i].content, ns[i].label, ns[i].code, ns[i].id), 
+            type: coalesce(ns[i].type, labels(ns[i])[0]),
+            rel_to_next: CASE WHEN i < size(rs) THEN type(rs[i]) ELSE null END
+        }] AS path_data
         """
         async with self.driver.session() as session:
             result = await session.run(query, start_id=start_id, end_id=end_id)
             record = await result.single()
-            if record:
-                return record["path_nodes"]
+            if record and record["path_data"]:
+                return record["path_data"]
         return []
 
-    def _pre_summarize(self, algo: str, results: List[Dict[str, Any]]) -> str:
+    async def _get_discovery_evidence(self, results: List[Dict[str, Any]], resolved_node_ids: List[str]) -> List[List[Dict[str, Any]]]:
+        """
+        For discovery queries (BFS, DFS, Random Walk, PageRank, ArticleRank),
+        this method finds the paths from the resolved_node_ids to the top results.
+        This helps the LLM understand the "why" behind the discovery.
+        """
+        if not resolved_node_ids or not results:
+            return []
+
+        # Limit to a reasonable number of paths to avoid overwhelming the LLM
+        max_paths = 5
+        evidence_paths = []
+
+        # For each resolved node (potential starting point)
+        for start_node_id in resolved_node_ids:
+            # For each top result, try to find a path to it from the start_node_id
+            for result_node in results[:max_paths]: # Limit results to check paths for
+                end_node_id = result_node.get("id")
+                if not end_node_id or start_node_id == end_node_id:
+                    continue
+
+                # Find a path between the start node and the result node
+                query = """
+                MATCH (start {id: $start_id}), (end {id: $end_id})
+                MATCH p = shortestPath((start)-[*..5]-(end))
+                WITH nodes(p) AS ns, relationships(p) AS rs
+                RETURN [i IN range(0, size(ns)-1) | {
+                    id: ns[i].id, 
+                    name: coalesce(ns[i].name, ns[i].title, ns[i].question_text, ns[i].text, ns[i].content, ns[i].label, ns[i].code, ns[i].id), 
+                    type: coalesce(ns[i].type, labels(ns[i])[0]),
+                    rel: CASE WHEN i < size(rs) THEN type(rs[i]) ELSE null END
+                }] AS path_data
+                """
+                async with self.driver.session() as session:
+                    path_result = await session.run(query, start_id=start_node_id, end_id=end_node_id)
+                    record = await path_result.single()
+                    if record and record["path_data"]:
+                        evidence_paths.append(record["path_data"])
+                        if len(evidence_paths) >= max_paths:
+                            return evidence_paths # Stop if we have enough paths
+
+        return evidence_paths
+
+    def _pre_summarize(self, algo: str, results: List[Dict[str, Any]], evidence: List[List[Dict[str, Any]]] = None) -> str:
         """Pre-process raw algorithm results into a human-readable summary for the LLM."""
         if not results:
             return "No results."
 
-        # Separate path nodes from algorithm-specific results
-        path_nodes = [r for r in results if not r.get("source_name") and r.get("name") and r.get("id") in [node.get("id") for node in results if not node.get("source_name")]]
-        # Check if the list actually contains a path (sequence of nodes) or just centrality scores
-        is_actual_path = algo == "path" or (len(path_nodes) >= 2 and any(" → " in str(r) for r in results)) # Rough check
-        
-        # If we have a path, format it separately
-        path_str = ""
-        if algo == "path" or (len(path_nodes) >= 2):
-            path_names = [r.get("name", "?") for r in path_nodes]
-            path_str = "DIRECT CONNECTION FOUND: " + " → ".join(path_names) + "\n\n"
+        # 1. Format Evidence/Mapping if available (This is what the user wants: What is connected to what)
+        evidence_str = ""
+        if evidence:
+            segments = []
+            for path in evidence:
+                chain = []
+                for step in path:
+                    name = f"**{step['name']}**"
+                    rel = f" --[{step['rel']}]--> " if step['rel'] else ""
+                    chain.append(f"{name}{rel}")
+                segments.append("".join(chain))
+            evidence_str = "RELATIONSHIP MAPPINGS FOUND (Evidence):\n" + "\n".join(segments[:10]) + "\n\n"
 
-        # Filter out path nodes for the algorithmic section (except for 'path' algo itself)
-        effective_results = [r for r in results if r not in path_nodes] if algo != "path" else []
+        # 2. Detect if we have path data (nodes with rel_to_next)
+        path_segments = [r for r in results if "rel_to_next" in r]
+        path_str = ""
+        if path_segments:
+            segments = []
+            for r in path_segments:
+                name = rf"**{r.get('name')}** ({r.get('type')})"
+                rel = f" --[{r.get('rel_to_next')}]--> " if r.get('rel_to_next') else ""
+                segments.append(f"{name}{rel}")
+            path_str = "PRIMARY CONNECTION PATHWAY:\n" + "".join(segments) + "\n\n"
+
+        # Filter out path segments from the main results list to avoid redundancy
+        effective_results = [r for r in results if r not in path_segments]
         
         algo_str = f"ALGORITHM '{algo.upper()}' RESULTS:\n"
         
         if algo in ("louvain", "leiden", "wcc"):
             communities = {}
-            for r in [node for node in results if node.get("community_id")]:
-                cid = r.get("community_id", "unknown")
-                name = r.get("name") or r.get("questionId") or r.get("studentId") or r.get("examId") or r.get("code") or r.get("text") or r.get("id") or "?"
-                node_type = r.get("type", "")
+            for r in [node for node in effective_results if node.get("community_id") is not None]:
+                cid = r.get("community_id")
+                name = r.get("name") or "?"
+                node_type = r.get("type", "Unknown")
                 if cid not in communities:
-                    communities[cid] = []
-                communities[cid].append(f"{name} ({node_type})" if node_type else name)
+                    communities[cid] = {"members": [], "types": {}}
+                
+                communities[cid]["members"].append(name)
+                communities[cid]["types"][node_type] = communities[cid]["types"].get(node_type, 0) + 1
             
             lines = []
-            for i, (cid, members) in enumerate(sorted(communities.items(), key=lambda x: -len(x[1])), 1):
-                member_str = ", ".join(members[:15])
-                if len(members) > 15:
-                    member_str += f" ... and {len(members) - 15} more"
-                lines.append(f"Group {i} ({len(members)} members): {member_str}")
-            algo_str += "\n".join(lines[:20])
+            sorted_communities = sorted(communities.items(), key=lambda x: -len(x[1]["members"]))
+            for i, (cid, data) in enumerate(sorted_communities, 1):
+                members, type_counts = data["members"], data["types"]
+                type_summary = ", ".join([f"{count} {t}" for t, count in type_counts.items()])
+                lines.append(f"GROUP {i} ({type_summary}): {', '.join(members[:8])}")
+            algo_str += "\n".join(lines[:10])
         
+        elif algo in ("bfs", "dfs", "random_walk", "pagerank", "articlerank"):
+            # For discovery or importance, show what types were found
+            type_groups = {}
+            for r in effective_results:
+                t = r.get("type", "Unknown")
+                if t not in type_groups: type_groups[t] = []
+                type_groups[t].append(r.get("name", "?"))
+            
+            lines = []
+            for t, members in type_groups.items():
+                lines.append(f"- {t}s: {', '.join(members[:10])}")
+            algo_str += "SCAN DISCOVERY:\n" + "\n".join(lines)
+            
         elif algo == "node_similarity" or algo.startswith("link_prediction"):
             lines = []
-            # Look specifically for source/target style results
-            sim_results = [r for r in results if r.get("source_name")]
-            label = "Predicted link" if algo.startswith("link_prediction") else "Similarity"
+            sim_results = [r for r in effective_results if r.get("source_name")]
             for r in sim_results[:15]:
-                source = r.get('source_name','?')
-                target = r.get('target_name','?')
-                score = r.get('score', 0)
-                if algo.startswith("link_prediction"):
-                    lines.append(f"{source} ↔ {target} (Score: {score})")
-                else:
-                    lines.append(f"{source} ↔ {target} (Similarity: {score:.0%})")
-            algo_str += "\n".join(lines) if lines else f"No {label.lower()} pairs found above threshold."
+                source, target, score = r.get('source_name','?'), r.get('target_name','?'), r.get('score', 0)
+                lines.append(f"Match: {source} ↔ {target} (Value: {score})")
+            algo_str += "\n".join(lines) if lines else "No pairs found."
 
-        elif algo == "path":
-            # Already handled in path_str
-            algo_str = ""
-        
-        elif algo in ("bfs", "dfs", "random_walk"):
-            traversal_names = [r.get("name", "?") for r in results[:30]]
-            algo_str += f"Traversed {len(results)} nodes: " + " → ".join(traversal_names)
-            if len(results) > 30:
-                algo_str += f" ... and {len(results) - 30} more"
-        
-        elif algo == "topological_sort":
-            topo_names = [r.get("name", "?") for r in results[:30]]
-            algo_str += f"Logical sequence ({len(results)} nodes): " + " → ".join(topo_names)
-            if len(results) > 30:
-                algo_str += f" ... and {len(results) - 30} more"
-        
         else:
             # Centrality / scoring algorithms
             lines = []
-            centrality_results = [r for r in results if r.get("score") and not r.get("source_name")]
+            centrality_results = [r for r in effective_results if r.get("score") is not None and not r.get("source_name")]
             for i, r in enumerate(centrality_results[:15], 1):
-                name = r.get("name") or r.get("questionId") or r.get("studentId") or r.get("examId") or r.get("code") or r.get("text") or r.get("id") or "?"
-                score = r.get("score", 0)
-                node_type = r.get("type", "")
-                type_label = f" ({node_type})" if node_type else ""
-                lines.append(f"{i}. {name}{type_label} — Score: {score:.4f}")
-            algo_str += "\n".join(lines) if lines else "No significant scores found."
+                name, score, node_type = r.get("name") or "?", r.get("score", 0), r.get("type", "")
+                lines.append(f"{i}. {name} ({node_type}) - Value: {score:.4f}")
+            algo_str += "\n".join(lines) if lines else "No rankings found."
 
-        return path_str + algo_str
+        return evidence_str + path_str + algo_str
 
-    async def _interpret_results(self, query: str, algo: str, results: List[Dict[str, Any]], scope_info: str = "", weight_formula: Optional[Dict[str, Any]] = None, weight_name: Optional[str] = None) -> str:
+    async def _interpret_results(self, query: str, algo: str, results: List[Dict[str, Any]], scope_info: str = "", weight_formula: Optional[Dict[str, Any]] = None, weight_name: Optional[str] = None, resolved_node_ids: List[str] = None) -> str:
         """Uses LLM to explain the algorithm results in natural language."""
         if not results:
-            return "The algorithm was executed but returned no significant results for the current selection. Make sure you have a folder selected with data."
+            return "The analysis was completed but no significant patterns were found in the current selection. This can happen if the data isn't interconnected enough for this type of calculation."
+
+        # Fetch evidence mappings if this is a discovery query or if we have specific targets
+        evidence = None
+        if algo in ("bfs", "dfs", "random_walk", "pagerank", "articlerank") and resolved_node_ids:
+            evidence = await self._get_discovery_evidence(results, resolved_node_ids)
 
         # Check for friendly error messages from GDS
         if len(results) == 1 and results[0].get("error_message"):
             return results[0]["error_message"]
 
         # Pre-summarize results into human-readable format
-        summary = self._pre_summarize(algo, results)
+        summary = self._pre_summarize(algo, results, evidence=evidence)
 
         # ── Weight context for the LLM ──
         algo_uses_weights = algo in WEIGHT_AWARE_ALGOS
-        if algo_uses_weights and weight_formula and weight_name:
-            weight_context = (
-                f"\nWEIGHT INFO: This algorithm was run WITH quantitative weights active. "
-                f"Weight config: \"{weight_name}\". "
-                f"This means that connection strengths are derived from numeric properties in the data, "
-                f"so the scores reflect both the structural position AND the quantitative values (e.g., marks, scores, amounts). "
-                f"Mention this in your explanation — tell the user that the results INCLUDE the quantitative weights and what that means for the ranking."
-            )
-        elif algo_uses_weights and not weight_formula:
-            weight_context = (
-                f"\nWEIGHT INFO: This algorithm CAN use quantitative weights to factor in numeric properties (like marks, scores), "
-                f"but the weight toggle is currently OFF. The results reflect only the structural graph pattern (who is connected to whom), "
-                f"not any numeric property values. Briefly mention that enabling weights could give more data-driven results."
-            )
-        elif not algo_uses_weights and weight_formula:
-            weight_context = (
-                f"\nWEIGHT INFO: The user has weights enabled (\"{weight_name or 'custom'}\"), but this specific algorithm ({algo}) "
-                f"does NOT use quantitative weights. It analyzes purely structural/connection patterns. "
-                f"Briefly clarify that the weight toggle does not affect this particular analysis."
-            )
-        else:
-            weight_context = ""
+        weight_text = ""
+        if algo_uses_weights and weight_formula:
+            weight_text = f"NOTE: This analysis USED custom weights ('{weight_name}'). The results factor in structural connections AND numeric property values."
+        elif algo_uses_weights:
+            weight_text = "NOTE: This analysis did NOT use weights (only connection structure). Enabling weights could factor in numeric scores/marks."
 
-        # Algorithm-specific explanation instructions
-        algo_instructions = {
-            "pagerank": "PageRank measures influence/importance. Higher scores = more influential. Explain which entities are most influential and WHY (what makes them central hubs in this dataset).",
-            "articlerank": "ArticleRank is like PageRank but better for diverse graphs. Explain which entities are most authoritative and what role they play.",
-            "betweenness": "Betweenness finds bridge nodes that connect different groups. High scores = critical connectors. Explain which entities act as bridges and what groups they connect.",
-            "closeness": "Closeness measures how quickly a node can reach all others. High scores = central access points. Explain which entities are most centrally positioned.",
-            "degree": "Degree counts direct connections. High scores = most directly connected. Explain which entities have the most relationships and what that implies.",
-            "hits": "HITS separates Hubs (nodes that LINK to many others) from Authorities (nodes that ARE LINKED by many). Explain both roles clearly.",
-            "louvain": "Louvain found groups/communities of tightly connected entities. Explain what each group represents thematically — name each group based on its members (e.g., 'Health Benefits Group', 'Properties Group'). Don't use technical IDs like 'Community 44'.",
-            "leiden": "Leiden found higher-quality communities than Louvain. Explain what each group represents thematically, name each group based on its members.",
-            "wcc": "WCC found disconnected islands. Explain which groups are isolated from each other and what that means for the data completeness.",
-            "kcore": "K-Core found the tightly-knit core of the graph. Entities in the core are the most stable and interconnected. Explain what makes this core group special.",
-            "triangle_count": "Triangle count measures local clustering. Nodes with many triangles are part of very tight, collaborative groups. Explain which entities form the tightest clusters.",
-            "node_similarity": "Node Similarity found pairs that share similar neighborhoods. Explain which entities are most similar and WHY (what shared connections make them alike).",
-            "link_prediction_common": "Common Neighbors link prediction found pairs of currently unconnected entities that share many neighbors. Higher score = more shared connections. Explain which new connections are most likely and WHY.",
-            "link_prediction_adamic": "Adamic-Adar link prediction found missing connections weighted by rare shared neighbors. Entities sharing uncommon connections are highlighted. Explain which hidden relationships are most significant.",
-            "link_prediction_resource": "Resource Allocation link prediction simulated information flow to find hidden connections. Explain which potential new links are the strongest and what they would mean for the data.",
-            "path": "Shortest path shows how two entities are connected through intermediaries. Walk through the chain step by step and explain each link.",
-            "bfs": "BFS (Breadth-First Search) explored entities layer by layer from the starting node. The order shows proximity — entities listed first are closest neighbors. Explain what the traversal reveals about the local neighborhood structure.",
-            "dfs": "DFS (Depth-First Search) followed paths as deep as possible before backtracking. This reveals long chains and hierarchies. Explain the deep connections and hierarchical structure found.",
-            "random_walk": "Random Walk simulated wandering through the graph from a starting point. The entities encountered represent associative, serendipitous connections. Explain what surprising or non-obvious associations were discovered.",
-            "topological_sort": "Topological Sort ordered entities in a logical dependency sequence. Earlier entities are prerequisites for later ones. Explain the logical flow, process order, or timeline revealed.",
+        # Algorithm-specific explanation goals
+        algo_goals = {
+            "pagerank": "Identify the most influential or 'popular' entities in this specific context.",
+            "articlerank": "Identify the most authoritative entities considering diverse connections.",
+            "betweenness": "Find the key 'bridges' or bottlenecks that connect different parts of the data.",
+            "closeness": "Find entities that are 'closest' to everything else (central access points).",
+            "degree": "Simply count who has the most connections in the system.",
+            "hits": "Distinguish between 'Hubs' (links to many) and 'Authorities' (referenced by many).",
+            "louvain": "Find natural 'groups' or clusters. Give each group a name based on the members provided.",
+            "leiden": "Find high-quality groups. Give each group a name based on the members provided.",
+            "wcc": "Find isolated 'islands' or disconnected sub-groups.",
+            "kcore": "Identify the 'inner circle' or most stable, tight-knit core of the data.",
+            "triangle_count": "Identify areas of very high collaborative density.",
+            "node_similarity": "Explain which entities are most similar to each other and why.",
+            "link_prediction_common": "Predict which connections should exist but don't yet.",
+            "path": "Trace the exact connection between two items.",
+            "topological_sort": "Show the logical sequence or order of operations.",
         }
 
-        specific_instruction = algo_instructions.get(algo, "Explain the results clearly.")
+        goal = algo_goals.get(algo, "Explain the results clearly.")
 
-        system_prompt = f"""You are a friendly data analyst explaining graph algorithm results to a non-technical user.
+        system_prompt = f"""You are a plain-English data analyst. Your job is to interpret graph analysis results and answer a user question.
 
-ALGORITHM: {algo}
-SCOPE: This ran ONLY on: {scope_info}
-USER QUESTION: {query}
-{weight_context}
+USER QUESTION: "{query}"
+ANALYSIS TYPE: {algo} ({goal})
+DATA SCOPE: {scope_info}
+{weight_text}
 
-PRE-SUMMARIZED RESULTS:
+RAW RESULTS SUMMARY:
 {summary}
 
-INSTRUCTIONS:
-{specific_instruction}
+CRITICAL RULES:
+1. **Answer the Question FIRST**: Don't start by saying "The algorithm PageRank found...". Start by answering the user's question directly using the data.
+2. **Dynamic Relationship Mapping**: For discovery questions, you MUST provide a table or clear list showing the UNIQUE relationship chain for each result found in the data.
+   - DO NOT follow a fixed template. Use the exact sequence and names from the 'RELATIONSHIP MAPPINGS' summary.
+   - Format: **[Entity 1]** --[RELATIONSHIP]--> **[Entity 2]** --[RELATIONSHIP]--> **[Entity 3]**
+3. **RELATIONSHIP NAMES**: Use the exact relationship names (e.g., 'TREATS', 'CONNECTED_TO', 'CONTAINS') provided in the raw mappings.
+4. **Plain English Only**: Use extremely simple, professional, and clear English. No "Nodes", "Edges", or "Centrality".
+5. **Include Technical Scores**: Show relevant scores (score: 0.123) alongside descriptions for precision.
+6. **Name the Groups**: If there are groups, give them a descriptive name based on the members.
+7. **Be Brief & To The Point**: Use 2-4 short paragraphs maximum. Use bullet points for lists.
+8. **Entity Formatting**: Bold all **Entity Names**.
 
-RULES:
-1. **Explain the Direct Connection FIRST**: If a "DIRECT CONNECTION FOUND" is provided in the results summary, walk through that path immediately. Explain how the entities are linked (e.g., "They both share the quality X").
-2. **Context over Scores**: Don't say "Similarity is 5%". Instead say "They share a subtle connection through quality X, but are otherwise unique in their broad connections."
-3. **Simple language**: No technical jargon. Don't say "Community ID 44" — instead say "Group 1: The Health Benefits cluster".
-4. **Name the groups**: For community algorithms, give each group a descriptive theme name based on its members.
-5. **Actionable insights**: Tell the user what they can DO with this information.
-6. **Be brief**: 3-5 short paragraphs max.
-7. **Bold key names**: Use **bold** for important entity names.
-8. **Weight transparency**: If WEIGHT INFO is provided above, include a brief note about whether the quantitative weights influenced these results. If weights were used, explain that the ranking considers both structural connections AND the numeric property values. If weights are off but supported, briefly mention this option."""
+Explain the connections clearly as a sequence so the user knows exactly HOW each result is relevant to their question."""
 
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": "Explain these results simply."}
+            {"role": "user", "content": "Explain these results in plain English, show the mapping for each herb."}
         ]
 
         try:
             return await self.ai.chat(messages)
         except Exception as e:
             logger.error(f"Failed to interpret results: {e}")
-            return f"Algorithm {algo} finished. Top results: " + ", ".join([str(r.get('name', r.get('id'))) for r in results[:5]])
+            return f"Analysis complete. Most significant items: " + ", ".join([str(r.get('name', r.get('id'))) for r in results[:5]])
 
 def get_analytic_chat_service() -> AnalyticChatService:
     return AnalyticChatService()
