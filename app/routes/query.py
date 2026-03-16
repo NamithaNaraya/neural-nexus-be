@@ -25,6 +25,15 @@ class QueryRequest(BaseModel):
     session_id: Optional[str] = None
     clear_history: bool = False
 
+def _to_uuid(sid: str) -> str:
+    """Safely convert a string into a UUID string, deterministically hashing non-UUIDs."""
+    try:
+        # If it's already a valid UUID, this succeeds
+        return str(uuid.UUID(sid))
+    except (ValueError, TypeError):
+        # Otherwise, generate a deterministic UUID
+        return str(uuid.uuid5(uuid.NAMESPACE_OID, sid))
+
 
 class Citation(BaseModel):
     """Source citation for an answer."""
@@ -65,8 +74,9 @@ async def run_query(
     from app.services.ai_service import AIService
     from app.services.rag import get_enhanced_rag_service
     
-    # Create session if not provided
-    session_id = request.session_id or str(uuid.uuid4())
+    # Create session if not provided, and ensure UUID format
+    session_id_raw = request.session_id or str(uuid.uuid4())
+    session_id = _to_uuid(session_id_raw)
     
     try:
         # Get services
@@ -131,7 +141,7 @@ async def run_query(
                 )
                 for c in result.get("citations", [])
             ],
-            session_id=session_id,
+            session_id=session_id_raw,
             related_nodes=result.get("related_nodes", []),
             grounding_score=result.get("grounding_score", 0.0),
             needs_clarification=result.get("needs_clarification", False),
@@ -155,7 +165,8 @@ async def get_chat_history(
     limit: int = 10,  # 5 Q&A pairs
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """Get chat history for a session (Sliding Window: last 5 for context)."""
+    db_session_id = _to_uuid(session_id)
+    
     async with get_postgres_session() as session:
         result = await session.execute(
             text("""
@@ -165,7 +176,7 @@ async def get_chat_history(
                 ORDER BY timestamp DESC
                 LIMIT :limit
             """),
-            {"session_id": session_id, "user_id": current_user['id'], "limit": limit}
+            {"session_id": db_session_id, "user_id": current_user['id'], "limit": limit}
         )
         messages = [dict(r) for r in reversed(result.mappings().all())]
         
@@ -202,11 +213,11 @@ async def delete_chat_session(
     session_id: str,
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, str]:
-    """Delete a chat session and its history."""
+    db_session_id = _to_uuid(session_id)
     async with get_postgres_session() as session:
         await session.execute(
             text("DELETE FROM neural_nexus.chat_history WHERE session_id = :session_id AND user_id = :user_id"),
-            {"session_id": session_id, "user_id": current_user['id']}
+            {"session_id": db_session_id, "user_id": current_user['id']}
         )
         await session.commit()
         
