@@ -484,7 +484,7 @@ class ManagedCypherService:
                             ELSE n.type 
                         END,
                         n.name = CASE
-                            WHEN n.name IS NULL THEN COALESCE(n.text, n.title, n.label, n.code, n.type, 'Unnamed Entity')
+                            WHEN n.name IS NULL THEN COALESCE(n.text, n.title, n.label, n.code, n.type, [lbl IN labels(n) WHERE lbl <> $folder_label AND lbl <> 'Entity'][0], 'Unnamed Entity')
                             ELSE n.name
                         END,
                         n:Entity
