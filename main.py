@@ -5,6 +5,7 @@ Knowledge Graph Platform - FastAPI Backend
 Version: 2.1.0
 """
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Dict, Any
 
@@ -13,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.routes import health, auth, folders, files, upload, graph, query, analytics, sse, websocket, deletion, dashboard, reasoning, browse, analytics_chat, herb
+from app.combined_chat import router as combined_chat_router
 from app.routes import weights as weight_routes
 from app.routes.ml import ml_routes
 from app.db.connections import (
@@ -93,11 +95,19 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Cleanup on shutdown
+    # Cleanup on shutdown with timeout protection
     logger.info("🛑 Shutting down Neural Nexus Backend...")
-    await close_neo4j()
-    await close_postgres()
-    await close_redis()
+    try:
+        async with asyncio.timeout(10.0): # 10s shutdown budget
+            await close_neo4j()
+            await close_postgres()
+            await close_redis()
+            logger.info("✅ Database connections closed gracefully")
+    except asyncio.TimeoutError:
+        logger.warning("⚠️ Shutdown timed out - some connections might be forced closed")
+    except Exception as e:
+        logger.error(f"❌ Error during shutdown: {e}")
+        
     logger.info("👋 Neural Nexus Backend shutdown complete")
 
 
@@ -158,6 +168,7 @@ app.include_router(reasoning.router, prefix="/api/v1", tags=["Reasoning"])
 app.include_router(browse.router, prefix="/api/v1/browse", tags=["Browse"])
 app.include_router(ml_routes.router, prefix="/api/v1/ml", tags=["Machine Learning"])
 app.include_router(analytics_chat.router, prefix="/api/v1/analytics-chat", tags=["Analytic Chat"])
+app.include_router(combined_chat_router.router, prefix="/api/v1/combined-chat", tags=["Combined Chat"])
 app.include_router(herb.router, prefix="/api/v1/graph", tags=["Herb Domain"])
 app.include_router(weight_routes.router, prefix="/api/v1/weights", tags=["Weight Config"])
 
