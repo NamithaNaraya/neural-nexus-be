@@ -18,6 +18,8 @@ class ChatRequest(BaseModel):
     folder_id: Optional[str] = None
     history: Optional[List[Dict[str, str]]] = []
 
+from fastapi.responses import StreamingResponse
+
 @router.post("/answer")
 async def get_combined_answer(
     request: ChatRequest,
@@ -30,4 +32,21 @@ async def get_combined_answer(
         folder_id=request.folder_id,
         history=request.history,
         user_id=user_id
+    )
+
+@router.post("/stream-answer")
+async def stream_combined_answer(
+    request: ChatRequest,
+    current_user: dict = Depends(get_current_user),
+    service: CombinedRAGService = Depends(get_rag_service)
+):
+    user_id = current_user.get("id") or current_user.get("sub")
+    return StreamingResponse(
+        service.stream_answer(
+            question=request.question,
+            folder_id=request.folder_id,
+            history=request.history,
+            user_id=user_id
+        ),
+        media_type="text/event-stream"
     )

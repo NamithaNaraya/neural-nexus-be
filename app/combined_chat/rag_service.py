@@ -21,10 +21,11 @@ class CombinedRAGService:
         self._schema_expiry: float = 0
         self._greetings = {"hi", "hello", "hey", "hola", "greetings", "good morning", "good afternoon", "good evening"}
 
-    async def answer(self, question: str, folder_id: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None, user_id: str = "anonymous") -> Dict[str, Any]:
-        """🚀 The 5-Stage Pipeline Orchestrator."""
+    async def stream_answer(self, question: str, folder_id: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None, user_id: str = "anonymous"):
+        """🚀 Streaming Orchestrator with Status Updates."""
         
-        # Redis-based isolation: Load history for this specific User-Folder pair
+        # 1. Load History
+        yield json.dumps({"type": "step", "id": 1, "status": "Reading history..."}) + "\n"
         history_key = f"chat:history:{user_id}:{folder_id or 'global'}"
         stored_history = []
         try:
@@ -33,67 +34,116 @@ class CombinedRAGService:
         except Exception as e:
             logger.warning(f"Failed to load history from Redis: {e}")
 
-        # Combine provided history with stored history
         combined_history = (stored_history + history) if history else stored_history
         
         # Fast Path: Greeting Detector
         clean_q = question.lower().strip().strip('?!.')
         if clean_q in self._greetings:
-            return {
-                "answer": "Hello! I am your Neural Nexus research assistant. How can I help you explore your knowledge graph today?",
-                "intent": {"use_cypher": False, "use_gds": False, "use_vector": False},
-                "context_summary": "Greeting detected. Short-circuiting pipeline for speed."
-            }
-        
-        # Stage 1: Dynamic Schema Introspection
+            full_ans = "Hello! I am your Neural Nexus research assistant. How can I help you explore your knowledge graph today?"
+            yield json.dumps({"type": "content", "data": full_ans}) + "\n"
+            yield json.dumps({"type": "step", "id": 13, "status": "Done"}) + "\n"
+            return
+
+        # 2. Schema Introspection
+        yield json.dumps({"type": "step", "id": 4, "status": "Introspecting graph schema..."}) + "\n"
         schema = await self._get_schema()
         
-        # Stage 2: Concurrent Master Orchestration & Vector Search
+        # 3. Dynamic Orchestration
+        yield json.dumps({"type": "step", "id": 5, "status": "Analyzing request intent..."}) + "\n"
         orchestration_task = asyncio.create_task(self._orchestrate_retrieval(question, schema, folder_id or "global"))
         vector_task = asyncio.create_task(self.vector_engine.vector_search(question, folder_id))
         
-        # Wait for the "Brain" to decide the plan
         intent = await orchestration_task
-        logger.info(f"Execution Plan: {intent}")
+        yield json.dumps({"type": "intent", "data": intent}) + "\n"
 
+        # 4. Data Retrieval
+        yield json.dumps({"type": "step", "id": 9, "status": "Extracting graph & semantic data..."}) + "\n"
         retrieval_tasks = [vector_task]
         
-        # Stage 3: Dynamic Data Retrieval
+        # 1. Cypher Execution
         if intent.get("use_cypher") and intent.get("cypher_query"):
             retrieval_tasks.append(self._execute_cypher(intent["cypher_query"]))
         
+        # 2. GDS Algorithm Execution
         if intent.get("use_gds"):
             algo = intent.get("gds_algo", "centrality")
-            if algo == "similarity":
-                retrieval_tasks.append(self._format_gds_res("Node Similarity/PageRank", self.gds_suite.get_similarity_context(folder_id)))
-            elif algo == "community":
-                retrieval_tasks.append(self._format_gds_res("Louvain Community Detection", self.gds_suite.get_community_context(folder_id)))
-            elif algo == "paths":
-                retrieval_tasks.append(self.gds_suite.get_path_context("", "", folder_id))
-            else:
-                retrieval_tasks.append(self._format_gds_res("ArticleRank Centrality", self.gds_suite.get_centrality_context(folder_id)))
+            gds_res = []
+            try:
+                if algo == "similarity":
+                    gds_res = await self.gds_suite.get_similarity_context(folder_id)
+                elif algo == "community":
+                    gds_res = await self.gds_suite.get_community_context(folder_id)
+                elif algo == "paths":
+                    path_str = await self.gds_suite.get_path_context("", "", folder_id)
+                    retrieval_tasks.append(asyncio.create_task(asyncio.to_thread(lambda: path_str)))
+                else:
+                    gds_res = await self.gds_suite.get_centrality_context(folder_id)
+                
+                if gds_res:
+                    yield json.dumps({"type": "gds_results", "data": {"algorithm": algo, "results": gds_res}}) + "\n"
+                    # Add to Gemini context
+                    gds_context = f"[Graph Algorithm Results: {algo}]:\n{json.dumps(gds_res[:10], indent=2, default=str)}"
+                    retrieval_tasks.append(asyncio.create_task(asyncio.to_thread(lambda: gds_context)))
+            except Exception as e:
+                logger.error(f"GDS Execution Failed: {e}")
 
-        raw_results = await asyncio.gather(*retrieval_tasks)
+        # Wait for all Retrieval outputs
+        raw_retrieval_outputs = await asyncio.gather(*retrieval_tasks)
+        context = self._fuse_context(list(raw_retrieval_outputs))
         
-        # Stage 4: Context Fusion
-        context = self._fuse_context(raw_results)
+        # 5. Synthesis (Streaming)
+        yield json.dumps({"type": "step", "id": 11, "status": "Synthesizing research..."}) + "\n"
         
-        # Stage 5: Research Synthesis
-        answer = await self._synthesize_answer(question, context, combined_history, folder_id or "global")
+        full_answer = ""
+        prompt = f"""
+        You are the **Neural Nexus Research Assistant**, a professional expert in Knowledge Graph synthesis.
         
-        # Save to Redis for isolation
+        CONTEXT FROM DATA RETRIEVAL:
+        {context}
+        
+        USER QUESTION: 
+        {question}
+        
+        INSTRUCTIONS:
+        1. CHARACTER: Be informative and professional. Use **simple, natural English**.
+        2. DOMAIN NEUTRAL: Do not assume the data topic. Adapt terminology.
+        3. NO TECHNICAL CODES: NO IDs, Folder IDs, or internal labels.
+        4. NATURAL LANGUAGE: Translate technical relationship names into simple verbs.
+        5. RESPONSE STRUCTURE:
+           - **Executive Summary**: 4-5 sentences.
+           - **Evidence Table**: Markdown Table.
+        6. PROACTIVE SYNTHESIS: Focus on what **is** in the data. Avoid negative statements like "not possible to identify" or "cannot be generated". If direct evidence is thin, synthesize based on related entities or general graph patterns found in the context.
+        """
+        
+        async for chunk in self.gemini.astream_response(prompt, combined_history):
+            full_answer += chunk
+            yield json.dumps({"type": "content", "data": chunk}) + "\n"
+        
+        # 6. Post-processing & Redis Save
+        yield json.dumps({"type": "step", "id": 13, "status": "Finalizing..."}) + "\n"
         try:
             await self.redis.rpush(history_key, json.dumps({"role": "user", "content": question}))
-            await self.redis.rpush(history_key, json.dumps({"role": "assistant", "content": answer}))
+            await self.redis.rpush(history_key, json.dumps({"role": "assistant", "content": full_answer}))
             await self.redis.ltrim(history_key, -20, -1) 
             await self.redis.expire(history_key, 86400) 
         except Exception as e:
-            logger.warning(f"Failed to save history to Redis: {e}")
+            logger.warning(f"Failed to save history: {e}")
 
+    async def answer(self, question: str, folder_id: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None, user_id: str = "anonymous") -> Dict[str, Any]:
+        """Non-streaming wrapper for backward compatibility."""
+        full_answer = ""
+        intent = {}
+        async for chunk_raw in self.stream_answer(question, folder_id, history, user_id):
+            chunk = json.loads(chunk_raw.strip())
+            if chunk["type"] == "content":
+                full_answer += chunk["data"]
+            elif chunk["type"] == "intent":
+                intent = chunk["data"]
+        
         return {
-            "answer": answer,
+            "answer": full_answer,
             "intent": intent,
-            "context_summary": f"Retrieved context from {len(retrieval_tasks)} parallel streams within folder {folder_id or 'global'}."
+            "context_summary": f"Retrieved from folder {folder_id or 'global'}."
         }
 
     async def _get_schema(self) -> str:
@@ -104,7 +154,9 @@ class CombinedRAGService:
             try:
                 # 1. Get ALL Labels
                 labels_res = await session.run("CALL db.labels()")
-                labels = [r[0] for r in await labels_res.records()]
+                labels_data = await labels_res.data()
+                # CALL db.labels() returns rows like {'label': '...'}
+                labels = [list(r.values())[0] for r in labels_data]
                 
                 # 2. Get connecting patterns
                 patterns_res = await session.run("""
@@ -135,8 +187,9 @@ class CombinedRAGService:
         STRICT RULES:
         1. Only use Node Labels exactly as they appear in the 'Available Labels' list above.
         2. Filter every node by 'folder_id' or 'folderId' using the value: "{folder_id}".
-        3. SYNONYM MAPPING: Map user terms like "benefits", "properties", "effects", or "uses" to the most relevant labels in the schema (e.g. TherapeuticUse, Phytoconstituent).
-        4. Use CONTAINS and toLower() for robust property matching.
+        3. ALGORITHM BIAS: If user asks about "similarity", "centrality", "connections", "groups", or "important items", set "use_gds" to true.
+        4. SYNONYM MAPPING: Map user terms like "benefits", "properties", "effects", or "uses" to the most relevant labels in the schema.
+        5. Use CONTAINS and toLower() for robust property matching.
 
         Question: {question}
         
