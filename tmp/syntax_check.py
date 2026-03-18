@@ -1,18 +1,23 @@
 import py_compile
 import sys
 
-try:
-    py_compile.compile('app/combined_chat/embedding_service.py', doraise=True)
-    print('embedding_service.py: SYNTAX OK')
-except py_compile.PyCompileError as e:
-    print(f'embedding_service.py: SYNTAX ERROR - {e}')
-    sys.exit(1)
+files = [
+    'app/combined_chat/fastrp_service.py',
+    'app/combined_chat/embedding_service.py',
+    'app/combined_chat/rag_service.py',
+]
 
-try:
-    py_compile.compile('app/combined_chat/rag_service.py', doraise=True)
-    print('rag_service.py: SYNTAX OK')
-except py_compile.PyCompileError as e:
-    print(f'rag_service.py: SYNTAX ERROR - {e}')
-    sys.exit(1)
+all_ok = True
+for f in files:
+    try:
+        py_compile.compile(f, doraise=True)
+        print(f'  ✅ {f}: SYNTAX OK')
+    except py_compile.PyCompileError as e:
+        print(f'  ❌ {f}: SYNTAX ERROR - {e}')
+        all_ok = False
 
-print('\nAll files passed syntax check!')
+if all_ok:
+    print('\n✅ All files passed syntax check!')
+else:
+    print('\n❌ Some files have syntax errors')
+    sys.exit(1)

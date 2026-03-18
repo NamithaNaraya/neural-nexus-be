@@ -1,17 +1,23 @@
 """
-Combined Chat — RAG Orchestrator (v2)
+Combined Chat — RAG Orchestrator (v3)
 
-Key improvements over v1:
-  1. Cypher execution with timeout + auto-recovery query
-  2. Empty-context safety net (folder neighbor scan)
-  3. Polished, user-friendly answer prompt
-  4. Better parallelism for speed
+Hybrid RAG with 3 parallel retrieval branches (matching architecture blueprint):
+  1. Semantic Text Search    — Ollama embeddings → Neo4j vector index
+  2. Graph Structure Search  — FastRP topology embeddings → cosine similarity
+  3. Cypher Query Generation — LLM-generated Cypher from schema
+
+Key improvements:
+  - Cypher execution with timeout + auto-recovery query
+  - Empty-context safety net (folder neighbor scan)
+  - Polished, user-friendly answer prompt
+  - Full parallelism across all 3 retrieval branches
 """
 import logging
 import asyncio
 from typing import List, Dict, Any, Optional
 from app.combined_chat.gemini_service import GeminiService
 from app.combined_chat.embedding_service import EmbeddingService
+from app.combined_chat.fastrp_service import FastRPService
 from app.combined_chat.gds_service import GDSCombinedService
 from app.db.connections import get_neo4j_driver, get_redis_client
 import json
@@ -27,6 +33,7 @@ class CombinedRAGService:
     def __init__(self):
         self.gemini = GeminiService()
         self.vector_engine = EmbeddingService()
+        self.fastrp_engine = FastRPService()
         self.gds_suite = GDSCombinedService()
         self.neo4j = get_neo4j_driver()
         self.redis = get_redis_client()
@@ -74,10 +81,11 @@ class CombinedRAGService:
             yield json.dumps({"type": "step", "id": 4, "status": "Done"}) + "\n"
             return
 
-        # ── Step 1: Schema + Intent + Vector (all in parallel) ─
+        # ── Step 1: Schema + Intent + Vector + FastRP (all in parallel) ─
         schema_task  = asyncio.create_task(self._get_schema())
         vector_task  = asyncio.create_task(self.vector_engine.vector_search(question, folder_id))
-        
+        fastrp_task  = asyncio.create_task(self.fastrp_engine.structural_search(question, folder_id))
+
         schema = await schema_task
 
         orchestration_task = asyncio.create_task(
@@ -91,11 +99,14 @@ class CombinedRAGService:
 
         yield json.dumps({"type": "intent", "data": intent}) + "\n"
 
-        # ── Step 2: Retrieval ──────────────────────────────────
-        logger.info(f"🔍 Retrieval Phase | Vector=True, Graph={intent.get('use_cypher')}, GDS={intent.get('use_gds')}")
+        # ── Step 2: Retrieval (3 parallel branches) ────────────
+        logger.info(f"🔍 Retrieval Phase | Vector=True, FastRP=True, Cypher={intent.get('use_cypher')}, GDS={intent.get('use_gds')}")
         yield json.dumps({"type": "step", "id": 2, "status": "Searching the knowledge graph..."}) + "\n"
 
-        named_tasks: List[tuple] = [("Semantic Search", vector_task)]
+        named_tasks: List[tuple] = [
+            ("Semantic Search", vector_task),
+            ("Structural Search (FastRP)", fastrp_task),
+        ]
 
         # Cypher
         if intent.get("use_cypher") and intent.get("cypher_query"):
