@@ -359,44 +359,7 @@ class ManagedCypherService:
             if var:
                 seen_vars.add(var)
 
-            # Prefix existing labels (School -> School_F_xxx)
-            new_labels = prefix_fn(labels) or ""
-
-            # STRICT CHECK: Ensure the base folder label is present as a standalone label
-            existing_parts = [p for p in new_labels.split(':') if p]
-            if folder_label not in existing_parts:
-                new_labels = f"{new_labels}:{folder_label}" if new_labels else f":{folder_label}"
-
-            return f"{prefix}{var}{new_labels}{props}{suffix}"
-
-        # We remove comments first so we don't accidentally rewrite inside them
-        # (Already partially handled by the caller, but let's be safe)
-        clean_stmt = re.sub(r'//.*', '', stmt)
-        
-        # Apply replacement on the whole statement
-        return node_pattern.sub(_inject_folder, clean_stmt)
-
-    # ──────────────────────────────────────────────────────────────────────
-    #  Main Execution Entry Point
-    # ──────────────────────────────────────────────────────────────────────
-
-    async def execute_managed_query(
-        self,
-        query: str,
-        file_id: str,
-        folder_id: str,
-        user_id: str
-    ) -> Dict[str, Any]:
-        """
-        Executes a Cypher query and then normalizes all nodes touched by the operation.
-        Steps:
-          1. Rewrite & execute user's Cypher statements (with folder isolation)
-          2. Adopt orphan nodes (add :Entity label, file_id metadata)
-          3. Generate UUIDs for nodes missing them
-          4. Generate embeddings for nodes missing them
-          5. Sync entities & relationships to PostgreSQL entity_staging
-          6. Invalidate caches
-          7. Return final counts
+           7. Return final counts
         """
         folder_label = f"F_{folder_id.replace('-', '_')}"
 

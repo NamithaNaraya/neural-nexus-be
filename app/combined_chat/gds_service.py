@@ -9,9 +9,9 @@ class GDSCombinedService:
         self.gds = get_gds_service()
 
     async def get_similarity_context(self, folder_id: str) -> List[Dict[str, Any]]:
-        """Finds entities with similar connectivity patterns using PageRank."""
-        # Using PageRank as a proxy for 'centrality similarity' in current folder
-        return await self.gds.run_pagerank(folder_id=folder_id, top_k=8)
+        """Finds entities with similar connectivity patterns using Jaccard Similarity."""
+        # Using Node Similarity to find entities that share many of the same neighbors
+        return await self.gds.run_node_similarity(folder_id=folder_id, top_k=8)
 
     async def get_centrality_context(self, folder_id: str) -> List[Dict[str, Any]]:
         """Identifies Hub nodes using ArticleRank."""

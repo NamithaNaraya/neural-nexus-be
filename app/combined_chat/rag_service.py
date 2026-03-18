@@ -1,3 +1,12 @@
+"""
+Combined Chat — RAG Orchestrator (v2)
+
+Key improvements over v1:
+  1. Cypher execution with timeout + auto-recovery query
+  2. Empty-context safety net (folder neighbor scan)
+  3. Polished, user-friendly answer prompt
+  4. Better parallelism for speed
+"""
 import logging
 import asyncio
 from typing import List, Dict, Any, Optional
@@ -10,6 +19,10 @@ import time
 
 logger = logging.getLogger(__name__)
 
+# Cypher execution hard timeout (seconds)
+_CYPHER_TIMEOUT = 12
+
+
 class CombinedRAGService:
     def __init__(self):
         self.gemini = GeminiService()
@@ -21,11 +34,24 @@ class CombinedRAGService:
         self._schema_expiry: float = 0
         self._greetings = {"hi", "hello", "hey", "hola", "greetings", "good morning", "good afternoon", "good evening"}
 
-    async def stream_answer(self, question: str, folder_id: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None, user_id: str = "anonymous"):
-        """🚀 Streaming Orchestrator with Status Updates."""
-        
-        # 1. Load History
-        yield json.dumps({"type": "step", "id": 1, "status": "Reading history..."}) + "\n"
+    # ────────────────────────────────────────────────────────────
+    #  Public API
+    # ────────────────────────────────────────────────────────────
+
+    async def stream_answer(
+        self,
+        question: str,
+        folder_id: Optional[str] = None,
+        file_id: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+        user_id: str = "anonymous",
+    ):
+        """Streaming Orchestrator with strict folder isolation."""
+
+        logger.info(f"🚀 Research starting for folder {folder_id or 'global'} | Question: {question}")
+        yield json.dumps({"type": "step", "id": 1, "status": "Analyzing research intent..."}) + "\n"
+
+        # ── History ────────────────────────────────────────────
         history_key = f"chat:history:{user_id}:{folder_id or 'global'}"
         stored_history = []
         try:
@@ -35,231 +61,396 @@ class CombinedRAGService:
             logger.warning(f"Failed to load history from Redis: {e}")
 
         combined_history = (stored_history + history) if history else stored_history
-        
-        # Fast Path: Greeting Detector
-        clean_q = question.lower().strip().strip('?!.')
+
+        # ── Fast-path: Greeting ────────────────────────────────
+        clean_q = question.lower().strip().strip("?!.")
         if clean_q in self._greetings:
-            full_ans = "Hello! I am your Neural Nexus research assistant. How can I help you explore your knowledge graph today?"
-            yield json.dumps({"type": "content", "data": full_ans}) + "\n"
-            yield json.dumps({"type": "step", "id": 13, "status": "Done"}) + "\n"
+            ans = (
+                "Hello! 👋 I'm your Neural Nexus research assistant. "
+                "I'm ready to explore the data in your active folder. "
+                "What would you like to know?"
+            )
+            yield json.dumps({"type": "content", "data": ans}) + "\n"
+            yield json.dumps({"type": "step", "id": 4, "status": "Done"}) + "\n"
             return
 
-        # 2. Schema Introspection
-        yield json.dumps({"type": "step", "id": 4, "status": "Introspecting graph schema..."}) + "\n"
-        schema = await self._get_schema()
+        # ── Step 1: Schema + Intent + Vector (all in parallel) ─
+        schema_task  = asyncio.create_task(self._get_schema())
+        vector_task  = asyncio.create_task(self.vector_engine.vector_search(question, folder_id))
         
-        # 3. Dynamic Orchestration
-        yield json.dumps({"type": "step", "id": 5, "status": "Analyzing request intent..."}) + "\n"
-        orchestration_task = asyncio.create_task(self._orchestrate_retrieval(question, schema, folder_id or "global"))
-        vector_task = asyncio.create_task(self.vector_engine.vector_search(question, folder_id))
-        
+        schema = await schema_task
+
+        orchestration_task = asyncio.create_task(
+            self._orchestrate_retrieval(question, schema, folder_id or "global")
+        )
+
         intent = await orchestration_task
+        logger.info(f"🧠 Research Intent: {intent.get('research_strategy', 'Standard')}")
+        if intent.get("cypher_query"):
+            logger.info(f"🔗 Generated Cypher: {intent['cypher_query']}")
+
         yield json.dumps({"type": "intent", "data": intent}) + "\n"
 
-        # 4. Data Retrieval
-        yield json.dumps({"type": "step", "id": 9, "status": "Extracting graph & semantic data..."}) + "\n"
-        retrieval_tasks = [vector_task]
-        
-        # 1. Cypher Execution
+        # ── Step 2: Retrieval ──────────────────────────────────
+        logger.info(f"🔍 Retrieval Phase | Vector=True, Graph={intent.get('use_cypher')}, GDS={intent.get('use_gds')}")
+        yield json.dumps({"type": "step", "id": 2, "status": "Searching the knowledge graph..."}) + "\n"
+
+        named_tasks: List[tuple] = [("Semantic Search", vector_task)]
+
+        # Cypher
         if intent.get("use_cypher") and intent.get("cypher_query"):
-            retrieval_tasks.append(self._execute_cypher(intent["cypher_query"]))
-        
-        # 2. GDS Algorithm Execution
+            named_tasks.append(("Graph Traversal", self._execute_cypher_safe(intent["cypher_query"], folder_id, file_id)))
+
+        # GDS
         if intent.get("use_gds"):
             algo = intent.get("gds_algo", "centrality")
-            gds_res = []
-            try:
-                if algo == "similarity":
-                    gds_res = await self.gds_suite.get_similarity_context(folder_id)
-                elif algo == "community":
-                    gds_res = await self.gds_suite.get_community_context(folder_id)
-                elif algo == "paths":
-                    path_str = await self.gds_suite.get_path_context("", "", folder_id)
-                    retrieval_tasks.append(asyncio.create_task(asyncio.to_thread(lambda: path_str)))
-                else:
-                    gds_res = await self.gds_suite.get_centrality_context(folder_id)
-                
-                if gds_res:
-                    yield json.dumps({"type": "gds_results", "data": {"algorithm": algo, "results": gds_res}}) + "\n"
-                    # Add to Gemini context
-                    gds_context = f"[Graph Algorithm Results: {algo}]:\n{json.dumps(gds_res[:10], indent=2, default=str)}"
-                    retrieval_tasks.append(asyncio.create_task(asyncio.to_thread(lambda: gds_context)))
-            except Exception as e:
-                logger.error(f"GDS Execution Failed: {e}")
+            gds_task = self._dispatch_gds(algo, folder_id)
+            if gds_task:
+                named_tasks.append((f"Graph Algorithm ({algo})", gds_task))
 
-        # Wait for all Retrieval outputs
-        raw_retrieval_outputs = await asyncio.gather(*retrieval_tasks)
-        context = self._fuse_context(list(raw_retrieval_outputs))
-        
-        # 5. Synthesis (Streaming)
-        yield json.dumps({"type": "step", "id": 11, "status": "Synthesizing research..."}) + "\n"
-        
+        # Gather all retrieval outputs
+        names  = [t[0] for t in named_tasks]
+        tasks  = [t[1] for t in named_tasks]
+        raw_outputs = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # ── Fuse with labels ───────────────────────────────────
+        fused = []
+        for name, result in zip(names, raw_outputs):
+            if isinstance(result, Exception):
+                logger.warning(f"Retrieval source '{name}' raised: {result}")
+                continue
+            if not result:
+                continue
+            if isinstance(result, list):
+                res_str = json.dumps(result[:20], indent=2, default=str)
+                if name.startswith("Graph Algorithm"):
+                    current_algo = algo if "algo" in dir() else "analytics"
+                    yield json.dumps({"type": "gds_results", "data": {"algorithm": current_algo, "results": result}}) + "\n"
+            else:
+                res_str = str(result)
+            fused.append(f"=== {name} ===\n{res_str}")
+
+        context = "\n\n".join(fused)
+
+        # ── Safety net: if context is empty, try a direct neighbor query ─
+        if not context.strip() and folder_id:
+            logger.warning("All retrieval layers returned empty – running folder neighbor safety net")
+            safety_ctx = await self._folder_neighbor_context(folder_id)
+            if safety_ctx:
+                fused.append(f"=== Folder Overview ===\n{safety_ctx}")
+                context = "\n\n".join(fused)
+
+        logger.info(f"🧪 Context Fusion | Sources: {len(fused)} | Size: {len(context)} chars")
+
+        # ── Step 3: Synthesize ─────────────────────────────────
+        yield json.dumps({"type": "step", "id": 3, "status": "Synthesizing research results..."}) + "\n"
+
         full_answer = ""
-        prompt = f"""
-        You are the **Neural Nexus Research Assistant**, a professional expert in Knowledge Graph synthesis.
-        
-        CONTEXT FROM DATA RETRIEVAL:
-        {context}
-        
-        USER QUESTION: 
-        {question}
-        
-        INSTRUCTIONS:
-        1. CHARACTER: Be informative and professional. Use **simple, natural English**.
-        2. DOMAIN NEUTRAL: Do not assume the data topic. Adapt terminology.
-        3. NO TECHNICAL CODES: NO IDs, Folder IDs, or internal labels.
-        4. NATURAL LANGUAGE: Translate technical relationship names into simple verbs.
-        5. RESPONSE STRUCTURE:
-           - **Executive Summary**: 4-5 sentences.
-           - **Evidence Table**: Markdown Table.
-        6. PROACTIVE SYNTHESIS: Focus on what **is** in the data. Avoid negative statements like "not possible to identify" or "cannot be generated". If direct evidence is thin, synthesize based on related entities or general graph patterns found in the context.
-        """
-        
+        prompt = self._build_answer_prompt(question, context, folder_id)
+
         async for chunk in self.gemini.astream_response(prompt, combined_history):
             full_answer += chunk
             yield json.dumps({"type": "content", "data": chunk}) + "\n"
-        
-        # 6. Post-processing & Redis Save
-        yield json.dumps({"type": "step", "id": 13, "status": "Finalizing..."}) + "\n"
+
+        # ── Step 4: Finalize ───────────────────────────────────
+        logger.info(f"✅ Research completed for user {user_id}")
+        yield json.dumps({"type": "step", "id": 4, "status": "Research completed."}) + "\n"
+
         try:
             await self.redis.rpush(history_key, json.dumps({"role": "user", "content": question}))
             await self.redis.rpush(history_key, json.dumps({"role": "assistant", "content": full_answer}))
-            await self.redis.ltrim(history_key, -20, -1) 
-            await self.redis.expire(history_key, 86400) 
+            await self.redis.ltrim(history_key, -20, -1)
+            await self.redis.expire(history_key, 86400)
         except Exception as e:
             logger.warning(f"Failed to save history: {e}")
 
-    async def answer(self, question: str, folder_id: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None, user_id: str = "anonymous") -> Dict[str, Any]:
+    async def answer(
+        self,
+        question: str,
+        folder_id: Optional[str] = None,
+        file_id: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+        user_id: str = "anonymous",
+    ) -> Dict[str, Any]:
         """Non-streaming wrapper for backward compatibility."""
         full_answer = ""
         intent = {}
-        async for chunk_raw in self.stream_answer(question, folder_id, history, user_id):
+        async for chunk_raw in self.stream_answer(question, folder_id, file_id, history, user_id):
             chunk = json.loads(chunk_raw.strip())
             if chunk["type"] == "content":
                 full_answer += chunk["data"]
             elif chunk["type"] == "intent":
                 intent = chunk["data"]
-        
+
         return {
             "answer": full_answer,
             "intent": intent,
-            "context_summary": f"Retrieved from folder {folder_id or 'global'}."
+            "context_summary": f"Retrieved from folder {folder_id or 'global'}.",
         }
+
+    # ────────────────────────────────────────────────────────────
+    #  Answer Prompt (polished, user-friendly)
+    # ────────────────────────────────────────────────────────────
+
+    def _build_answer_prompt(self, question: str, context: str, folder_id: Optional[str]) -> str:
+        has_context = bool(context.strip())
+        
+        if not has_context:
+            return f"""You are the **Neural Nexus Research Assistant** — a friendly, knowledgeable expert.
+
+The user asked: "{question}"
+
+Unfortunately, no matching data was found in the active folder{f' ({folder_id})' if folder_id else ''}.
+
+Please respond politely:
+1. Acknowledge that you searched but found no matching results for this specific query.
+2. Suggest possible reasons (e.g., the data might be in a different folder, or the question might need rephrasing).
+3. Offer helpful follow-up suggestions based on the question topic.
+
+Keep your tone warm, professional, and encouraging. Do NOT fabricate data."""
+
+        return f"""You are the **Neural Nexus Research Assistant** — a friendly, knowledgeable expert who provides clear, well-organized answers.
+
+─── GROUND RULES ───
+• Base your answer **strictly** on the CONTEXT below. This data comes from the user's active folder.
+• Do NOT use any prior knowledge or data from other folders/projects.
+• If the context only partially answers the question, say so honestly.
+
+─── CONTEXT FROM ACTIVE FOLDER ───
+{context}
+
+─── USER QUESTION ───
+{question}
+
+─── RESPONSE GUIDELINES ───
+1. **Tone**: Professional yet friendly. Address the user directly ("Based on your data…").
+2. **Structure**:
+   • Start with a concise **Executive Summary** (2-3 sentences answering the core question).
+   • Follow with detailed findings, organized with headers/bullets.
+   • If Graph Algorithm data is present, include an **⚡ Algorithmic Insights** section highlighting hidden patterns, rankings or communities.
+   • End with a **Key Takeaways** bullet list if the answer is complex.
+3. **Tables**: Use markdown tables when comparing multiple items.
+4. **Honesty**: If the context is insufficient, say "Based on the available data…" rather than guessing.
+5. **Clean output**: Do NOT mention data source methods (e.g., "From Semantic Search"). Present facts naturally.
+6. **Conciseness**: Prefer quality over quantity. Every sentence should add value."""
+
+    # ────────────────────────────────────────────────────────────
+    #  Schema Discovery (cached 5 min)
+    # ────────────────────────────────────────────────────────────
 
     async def _get_schema(self) -> str:
         if self._schema_cache and time.time() < self._schema_expiry:
             return str(self._schema_cache)
-            
+
         async with self.neo4j.session() as session:
             try:
-                # 1. Get ALL Labels
-                labels_res = await session.run("CALL db.labels()")
-                labels_data = await labels_res.data()
-                # CALL db.labels() returns rows like {'label': '...'}
-                labels = [list(r.values())[0] for r in labels_data]
-                
-                # 2. Get connecting patterns
+                # 1. Node Labels & Properties
+                node_props_res = await session.run("""
+                    CALL db.labels() YIELD label 
+                    MATCH (n) WHERE label IN labels(n) 
+                    WITH label, keys(n) AS keys LIMIT 100
+                    RETURN label, collect(DISTINCT keys) AS property_samples
+                """)
+                node_data = await node_props_res.data()
+                label_info = [f"Node Label: {r['label']} (Props: {r['property_samples']})" for r in node_data]
+
+                # 2. Relationship Types
+                rel_res = await session.run("CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType")
+                rel_data = await rel_res.data()
+                rel_types = [r["relationshipType"] for r in rel_data]
+                rel_prop_info = [f"Available Rel Type: {t}" for t in rel_types]
+
+                # 3. Relationship Property Samples
+                rel_props_res = await session.run("""
+                    MATCH ()-[r]->() 
+                    WITH type(r) AS type, keys(r) AS keys LIMIT 100
+                    RETURN type, collect(DISTINCT keys) AS property_samples
+                """)
+                rel_prop_data = await rel_props_res.data()
+                rel_prop_info += [f"Rel Type {r['type']} Props: {r['property_samples']}" for r in rel_prop_data]
+
+                # 4. Active Patterns
                 patterns_res = await session.run("""
                     CALL db.schema.visualization() YIELD relationships
                     UNWIND relationships AS rel
                     WITH startNode(rel) AS s, type(rel) AS t, endNode(rel) AS e
-                    RETURN labels(s)[0] AS source, t AS type, labels(e)[0] AS target
+                    RETURN DISTINCT labels(s)[0] AS source, t AS type, labels(e)[0] AS target
                 """)
-                data = await patterns_res.data()
-                patterns = [f"({r['source']})-[:{r['type']}]->({r['target']})" for r in data]
-                
-                res_str = f"Available Labels (CRITICAL): {labels}\nKey Patterns: " + ", ".join(patterns[:12])
-                if not patterns:
-                    res_str = f"Available Labels: {labels}\nSchema: Generic Graph Nodes"
-                    
+                pattern_data = await patterns_res.data()
+                patterns = [f"({r['source']})-[:{r['type']}]->({r['target']})" for r in pattern_data]
+
+                res_str = "KNOWLEDGE GRAPH SCHEMA (GROUND TRUTH):\n"
+                res_str += "\n".join(label_info) + "\n"
+                res_str += "\n".join(rel_prop_info) + "\n"
+                res_str += "\nValidated connection Patterns:\n" + "\n".join(patterns)
+
+                logger.info(f"📊 Schema Discovery: {len(label_info)} labels, {len(rel_types)} relationship types.")
+
                 self._schema_cache = res_str
-                self._schema_expiry = time.time() + 600
+                self._schema_expiry = time.time() + 300
                 return res_str
             except Exception as e:
-                logger.error(f"Schema introspection failed: {e}")
-                return "Common Labels: [Item, Concept, Category], Relationships: [RELATED_TO, PART_OF, CONTAINS]"
+                logger.error(f"Schema discovery failed: {e}")
+                return "Labels: [Unknown], Patterns: [Unknown]"
+
+    # ────────────────────────────────────────────────────────────
+    #  Intent Orchestration
+    # ────────────────────────────────────────────────────────────
 
     async def _orchestrate_retrieval(self, question: str, schema: str, folder_id: str) -> Dict[str, Any]:
         prompt = f"""
-        Analyze user question against this Knowledge Graph Schema:
+        TASK: Orchestrate data retrieval for a Knowledge Graph Research Agent.
+        FOLDER_ID: {folder_id}
+        SCHEMA:
         {schema}
         
-        STRICT RULES:
-        1. Only use Node Labels exactly as they appear in the 'Available Labels' list above.
-        2. Filter every node by 'folder_id' or 'folderId' using the value: "{folder_id}".
-        3. ALGORITHM BIAS: If user asks about "similarity", "centrality", "connections", "groups", or "important items", set "use_gds" to true.
-        4. SYNONYM MAPPING: Map user terms like "benefits", "properties", "effects", or "uses" to the most relevant labels in the schema.
-        5. Use CONTAINS and toLower() for robust property matching.
+        SOP FOR COMPLEX GRAPH RESEARCH:
+        1. PATH DISCOVERY: For "X treats Y" or "X connected to Y", use 2-3 hop Cypher: (n)-[*1..3]->(m).
+        2. IMPORTANCE/RANKING (*GDS MANDATORY*): For "most important", "widest range", or "top entities", you MUST set `use_gds` to true and select `centrality`.
+        3. GROUPS/CLUSTERS (*GDS MANDATORY*): For "groups of diseases" or "clusters", you MUST set `use_gds` to true and select `community`.
+        4. DEGREE FALLBACK: Use Neo4j 5 syntax if sorting in Cypher: MATCH (n) WHERE n.folder_id = '{folder_id}' RETURN n.name, COUNT {{ (n)--() }} as deg ORDER BY deg DESC.
+        5. DIVERSITY: count(DISTINCT neighbor) of a target label.
+        6. SIMILARITY: Find nodes sharing neighbors (hubs). (a)-[:REL]->(hub)<-[:REL]-(b).
+        7. STRUCTURE SIMILARITY: Use [SIMILAR_TO] relationships and the 'basis' property if present.
+        8. PLANT PARTS: Use the 'part_of_plant' property on Relationships if filtering by plant organ.
+
+        STRICT CYPHER RULES:
+        - FOLDER ISOLATION: EVERY node variable in your MATCH must be filtered by folder_id. 
+          Example: MATCH (h:Herb), (p:Phytochemical) WHERE h.folder_id = '{folder_id}' AND p.folder_id = '{folder_id}' ...
+        - NO HALLUCINATIONS: You MUST ONLY use Relationship Types listed in the SCHEMA above. 
+          (e.g., if SCHEMA has HAS_USE, do NOT use HAS_THERAPEUTIC_USE).
+        - MULTI-HOP PATHS: If the question requires connecting A to C, and A is connected to B and B to C, use (a)-[*1..3]->(c) or explicit hops.
+        - NEO4J 5 SYNTAX: Do NOT use `size((n)--())`. You MUST use the `COUNT {{ (n)--() }}` subquery pattern instead.
+        - No Hardcoding: Use labels and property comparisons.
 
         Question: {question}
         
-        RETURN ONLY JSON:
+        JSON OUTPUT:
         {{
-          "is_social": bool,
-          "is_out_of_scope": bool,
           "use_cypher": bool,
-          "cypher_query": "string | null",
+          "cypher_query": "CYPHER",
           "use_gds": bool,
-          "gds_algo": "centrality|community|similarity|null"
+          "gds_algo": "centrality|community|similarity|null",
+          "research_strategy": "..."
         }}
         """
         try:
             return await self.gemini.generate_json(prompt)
         except Exception as e:
             logger.error(f"Orchestration failed: {e}")
-            return {"is_social": False, "is_out_of_scope": False, "use_cypher": False, "cypher_query": None, "use_gds": False, "gds_algo": None}
+            return {
+                "use_cypher": False,
+                "cypher_query": None,
+                "use_gds": False,
+                "gds_algo": None,
+                "research_strategy": "Fallback",
+            }
 
-    async def _format_gds_res(self, algo_name: str, task: Any) -> str:
+    # ────────────────────────────────────────────────────────────
+    #  Cypher Execution (with timeout + recovery)
+    # ────────────────────────────────────────────────────────────
+
+    async def _execute_cypher_safe(self, cypher: str, folder_id: str, file_id: Optional[str] = None) -> str:
+        """Execute Cypher with a hard timeout. On failure, run a safe fallback query."""
         try:
-            results = await task
-            if isinstance(results, list):
-                formatted_data = json.dumps(results, indent=2, default=str)
-                return f"[Graph Algorithm Results: {algo_name}]:\n{formatted_data}"
-            return str(results)
+            return await asyncio.wait_for(
+                self._execute_cypher(cypher, folder_id, file_id),
+                timeout=_CYPHER_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Cypher timed out after {_CYPHER_TIMEOUT}s — running fallback")
+            return await self._cypher_fallback(folder_id)
         except Exception as e:
-            return f"[Algorithm Error ({algo_name})]: {str(e)}"
+            logger.error(f"Cypher wrapper error: {e}")
+            return await self._cypher_fallback(folder_id)
 
-    async def _execute_cypher(self, cypher: str) -> str:
-        if not cypher: return ""
-        cypher = cypher.replace('```cypher', '').replace('```', '').strip()
-        if any(keyword in cypher.upper() for keyword in ["CREATE", "DELETE", "SET", "MERGE", "REMOVE"]):
-             return "[Security Error]: Write operations blocked."
+    async def _execute_cypher(self, cypher: str, folder_id: str, file_id: Optional[str] = None) -> str:
+        if not cypher:
+            return ""
+        cypher = cypher.replace("```cypher", "").replace("```", "").strip()
+
+        # Security: Block write operations
+        if any(keyword in cypher.upper() for keyword in ["CREATE", "DELETE", "SET ", "MERGE", "REMOVE"]):
+            return "[Security Error]: Write operations blocked."
 
         try:
             async with self.neo4j.session() as session:
                 res = await session.run(cypher)
                 data = await res.data()
-                return f"[Graph Results]:\n{json.dumps(data, indent=2, default=str)[:3000]}"
+                logger.info(f"📊 Cypher Success | {len(data)} results found.")
+                if not data:
+                    return ""
+                return f"[Graph Results (Scoped to Folder {folder_id})]:\n{json.dumps(data, indent=2, default=str)[:4000]}"
         except Exception as e:
-            return f"[Graph Error]: {str(e)}"
+            logger.error(f"❌ Cypher Execution Failed: {str(e)}")
+            # Instead of returning an error to the LLM context, try a safe fallback
+            return await self._cypher_fallback(folder_id)
 
-    def _fuse_context(self, results: List[Any]) -> str:
-        stream_names = ["Semantic Search", "Graph Traversal", "Graph Algorithms"]
-        fused = []
-        for i, r in enumerate(results):
-            name = stream_names[i] if i < len(stream_names) else "Extra Intel"
-            if not r: continue
-            fused.append(f"=== {name} ===\n{str(r)}")
-        return "\n\n".join(fused)
+    async def _cypher_fallback(self, folder_id: str) -> str:
+        """Safe fallback: get top connected nodes in this folder."""
+        if not folder_id:
+            return ""
+        try:
+            async with self.neo4j.session() as session:
+                res = await session.run("""
+                    MATCH (n:Entity {folder_id: $folder_id})-[r]-(m:Entity {folder_id: $folder_id})
+                    WITH n.name AS entity, n.type AS type, 
+                         collect(DISTINCT type(r) + ' → ' + m.name)[..5] AS connections,
+                         count(r) AS degree
+                    ORDER BY degree DESC
+                    LIMIT 10
+                    RETURN entity, type, connections, degree
+                """, folder_id=folder_id)
+                data = await res.data()
+                if data:
+                    return f"[Graph Overview (Folder {folder_id})]:\n{json.dumps(data, indent=2, default=str)}"
+                return ""
+        except Exception as e:
+            logger.warning(f"Cypher fallback also failed: {e}")
+            return ""
 
-    async def _synthesize_answer(self, question: str, context: str, history: List[Dict[str, str]], folder_id: str) -> str:
-        prompt = f"""
-        You are the **Neural Nexus Research Assistant**, a professional expert in Knowledge Graph synthesis.
-        
-        CONTEXT FROM DATA RETRIEVAL:
-        {context}
-        
-        USER QUESTION: 
-        {question}
-        
-        INSTRUCTIONS:
-        1. CHARACTER: Be informative, professional, and clear. Use **simple, natural English**.
-        2. DOMAIN NEUTRAL: Do not assume the data is about any specific topic. Adapt your terminology to context.
-        3. NO TECHNICAL CODES: You must NOT mention technical IDs, Folder IDs (like '{folder_id}'), or internal labels.
-        4. NATURAL LANGUAGE: Translate technical relationship names into simple verbs like "contained in", "associated with", "linked to", etc.
-        5. RESPONSE STRUCTURE:
-           - **Executive Summary**: A clear 4-5 sentence story explaining what was found in the current folder.
-           - **Evidence Table**: Use a **Markdown Table** to organize the key data found.
-        6. RELIABILITY: Only answer based on context. If data is missing for this folder, explain that clearly.
-        """
-        return await self.gemini.generate_response(prompt, history)
+    # ────────────────────────────────────────────────────────────
+    #  Folder Neighbor Context (safety net)
+    # ────────────────────────────────────────────────────────────
+
+    async def _folder_neighbor_context(self, folder_id: str) -> str:
+        """Last-resort: grab entity names + relationships from the folder."""
+        try:
+            async with self.neo4j.session() as session:
+                res = await session.run("""
+                    MATCH (n:Entity {folder_id: $folder_id})
+                    OPTIONAL MATCH (n)-[r]-(m:Entity {folder_id: $folder_id})
+                    WITH n.name AS entity, n.type AS type,
+                         coalesce(n.description, '') AS description,
+                         collect(DISTINCT type(r) + ' → ' + m.name)[..3] AS sample_connections
+                    ORDER BY size(sample_connections) DESC
+                    LIMIT 20
+                    RETURN entity, type, description, sample_connections
+                """, folder_id=folder_id)
+                data = await res.data()
+                if data:
+                    return json.dumps(data, indent=2, default=str)
+                return ""
+        except Exception as e:
+            logger.warning(f"Folder neighbor context failed: {e}")
+            return ""
+
+    # ────────────────────────────────────────────────────────────
+    #  GDS Dispatch
+    # ────────────────────────────────────────────────────────────
+
+    def _dispatch_gds(self, algo: str, folder_id: Optional[str]):
+        """Create the correct GDS task based on algorithm name."""
+        fid = folder_id or "global"
+        try:
+            if algo == "similarity":
+                return self.gds_suite.get_similarity_context(fid)
+            elif algo == "community":
+                return self.gds_suite.get_community_context(fid)
+            elif algo == "paths":
+                return self.gds_suite.get_path_context("", "", fid)
+            else:
+                return self.gds_suite.get_centrality_context(fid)
+        except Exception as e:
+            logger.error(f"GDS dispatch failed: {e}")
+            return None
