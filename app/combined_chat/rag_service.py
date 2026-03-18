@@ -26,7 +26,13 @@ import time
 logger = logging.getLogger(__name__)
 
 # Cypher execution hard timeout (seconds)
-_CYPHER_TIMEOUT = 12
+_CYPHER_TIMEOUT = 10
+# FastRP structural search timeout (seconds)
+_FASTRP_TIMEOUT = 6
+# Orchestration (LLM intent) timeout (seconds)
+_ORCH_TIMEOUT = 8
+# Overall retrieval phase timeout
+_RETRIEVAL_TIMEOUT = 15
 
 
 class CombinedRAGService:
@@ -81,18 +87,30 @@ class CombinedRAGService:
             yield json.dumps({"type": "step", "id": 4, "status": "Done"}) + "\n"
             return
 
-        # ── Step 1: Schema + Intent + Vector + FastRP (all in parallel) ─
+        # ── Step 1: Schema + Intent + Vector + FastRP (all fully parallel) ─
         schema_task  = asyncio.create_task(self._get_schema())
         vector_task  = asyncio.create_task(self.vector_engine.vector_search(question, folder_id))
-        fastrp_task  = asyncio.create_task(self.fastrp_engine.structural_search(question, folder_id))
+        fastrp_task  = asyncio.create_task(
+            asyncio.wait_for(self.fastrp_engine.structural_search(question, folder_id), timeout=_FASTRP_TIMEOUT)
+        )
 
         schema = await schema_task
 
         orchestration_task = asyncio.create_task(
-            self._orchestrate_retrieval(question, schema, folder_id or "global")
+            asyncio.wait_for(
+                self._orchestrate_retrieval(question, schema, folder_id or "global"),
+                timeout=_ORCH_TIMEOUT
+            )
         )
 
-        intent = await orchestration_task
+        try:
+            intent = await orchestration_task
+        except asyncio.TimeoutError:
+            logger.warning("⏱️ Orchestration timed out — using vector-only fallback")
+            intent = {"use_cypher": False, "cypher_query": None, "use_gds": False, "gds_algo": None, "research_strategy": "Timeout Fallback"}
+        except Exception as e:
+            logger.error(f"Orchestration error: {e}")
+            intent = {"use_cypher": False, "cypher_query": None, "use_gds": False, "gds_algo": None, "research_strategy": "Fallback"}
         logger.info(f"🧠 Research Intent: {intent.get('research_strategy', 'Standard')}")
         if intent.get("cypher_query"):
             logger.info(f"🔗 Generated Cypher: {intent['cypher_query']}")
@@ -119,21 +137,30 @@ class CombinedRAGService:
             if gds_task:
                 named_tasks.append((f"Graph Algorithm ({algo})", gds_task))
 
-        # Gather all retrieval outputs
+        # Gather all retrieval outputs with global timeout
         names  = [t[0] for t in named_tasks]
         tasks  = [t[1] for t in named_tasks]
-        raw_outputs = await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            raw_outputs = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=_RETRIEVAL_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱️ Global retrieval timeout ({_RETRIEVAL_TIMEOUT}s) — using partial results")
+            raw_outputs = [asyncio.TimeoutError()] * len(tasks)
 
-        # ── Fuse with labels ───────────────────────────────────
+        # ── Fuse with labels (compact serialization) ──────────
         fused = []
         for name, result in zip(names, raw_outputs):
-            if isinstance(result, Exception):
-                logger.warning(f"Retrieval source '{name}' raised: {result}")
+            if isinstance(result, (Exception, type(None))):
+                if isinstance(result, Exception):
+                    logger.warning(f"Retrieval source '{name}' raised: {result}")
                 continue
             if not result:
                 continue
             if isinstance(result, list):
-                res_str = json.dumps(result[:20], indent=2, default=str)
+                # Compact serialization — no indent, limit items
+                res_str = json.dumps(result[:15], default=str)
                 if name.startswith("Graph Algorithm"):
                     current_algo = algo if "algo" in dir() else "analytics"
                     yield json.dumps({"type": "gds_results", "data": {"algorithm": current_algo, "results": result}}) + "\n"
@@ -255,50 +282,42 @@ Keep your tone warm, professional, and encouraging. Do NOT fabricate data."""
 
         async with self.neo4j.session() as session:
             try:
-                # 1. Node Labels & Properties
-                node_props_res = await session.run("""
-                    CALL db.labels() YIELD label 
-                    MATCH (n) WHERE label IN labels(n) 
-                    WITH label, keys(n) AS keys LIMIT 100
-                    RETURN label, collect(DISTINCT keys) AS property_samples
+                # Single optimized batch query for schema
+                schema_res = await session.run("""
+                    CALL {
+                        CALL db.labels() YIELD label RETURN collect(label) AS labels
+                    }
+                    CALL {
+                        CALL db.relationshipTypes() YIELD relationshipType RETURN collect(relationshipType) AS relTypes
+                    }
+                    CALL {
+                        CALL db.schema.visualization() YIELD relationships
+                        UNWIND relationships AS rel
+                        WITH startNode(rel) AS s, type(rel) AS t, endNode(rel) AS e
+                        RETURN collect(DISTINCT [labels(s)[0], t, labels(e)[0]]) AS patterns
+                    }
+                    RETURN labels, relTypes, patterns
                 """)
-                node_data = await node_props_res.data()
-                label_info = [f"Node Label: {r['label']} (Props: {r['property_samples']})" for r in node_data]
+                schema_data = await schema_res.single()
+                
+                if not schema_data:
+                    return "Schema: [unavailable]"
 
-                # 2. Relationship Types
-                rel_res = await session.run("CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType")
-                rel_data = await rel_res.data()
-                rel_types = [r["relationshipType"] for r in rel_data]
-                rel_prop_info = [f"Available Rel Type: {t}" for t in rel_types]
+                labels = schema_data["labels"]
+                rel_types = schema_data["relTypes"]
+                patterns = schema_data["patterns"]
 
-                # 3. Relationship Property Samples
-                rel_props_res = await session.run("""
-                    MATCH ()-[r]->() 
-                    WITH type(r) AS type, keys(r) AS keys LIMIT 100
-                    RETURN type, collect(DISTINCT keys) AS property_samples
-                """)
-                rel_prop_data = await rel_props_res.data()
-                rel_prop_info += [f"Rel Type {r['type']} Props: {r['property_samples']}" for r in rel_prop_data]
+                res_str = "KNOWLEDGE GRAPH SCHEMA:\n"
+                res_str += "Node Labels: " + ", ".join(labels) + "\n"
+                res_str += "Relationship Types: " + ", ".join(rel_types) + "\n"
+                res_str += "Patterns:\n" + "\n".join(
+                    f"  ({p[0]})-[:{p[1]}]->({p[2]})" for p in patterns if len(p) == 3
+                )
 
-                # 4. Active Patterns
-                patterns_res = await session.run("""
-                    CALL db.schema.visualization() YIELD relationships
-                    UNWIND relationships AS rel
-                    WITH startNode(rel) AS s, type(rel) AS t, endNode(rel) AS e
-                    RETURN DISTINCT labels(s)[0] AS source, t AS type, labels(e)[0] AS target
-                """)
-                pattern_data = await patterns_res.data()
-                patterns = [f"({r['source']})-[:{r['type']}]->({r['target']})" for r in pattern_data]
-
-                res_str = "KNOWLEDGE GRAPH SCHEMA (GROUND TRUTH):\n"
-                res_str += "\n".join(label_info) + "\n"
-                res_str += "\n".join(rel_prop_info) + "\n"
-                res_str += "\nValidated connection Patterns:\n" + "\n".join(patterns)
-
-                logger.info(f"📊 Schema Discovery: {len(label_info)} labels, {len(rel_types)} relationship types.")
+                logger.info(f"📊 Schema: {len(labels)} labels, {len(rel_types)} rel types (batched)")
 
                 self._schema_cache = res_str
-                self._schema_expiry = time.time() + 300
+                self._schema_expiry = time.time() + 600  # 10 min cache
                 return res_str
             except Exception as e:
                 logger.error(f"Schema discovery failed: {e}")
