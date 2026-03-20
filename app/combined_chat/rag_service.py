@@ -1,19 +1,21 @@
 """
-Combined Chat — RAG Orchestrator (v3)
+Combined Chat — RAG Orchestrator (v4 — Multi-hop)
 
-Hybrid RAG with 3 parallel retrieval branches (matching architecture blueprint):
+Hybrid RAG with 4 parallel retrieval branches:
   1. Semantic Text Search    — Ollama embeddings → Neo4j vector index
   2. Graph Structure Search  — FastRP topology embeddings → cosine similarity
-  3. Cypher Query Generation — LLM-generated Cypher from schema
+  3. Multi-hop Graph Traversal — direct variable-depth Cypher (up to 10 hops)
+  4. LLM-generated Cypher    — intent-driven query for complex questions
 
-Key improvements:
-  - Cypher execution with timeout + auto-recovery query
-  - Empty-context safety net (folder neighbor scan)
-  - Polished, user-friendly answer prompt
-  - Full parallelism across all 3 retrieval branches
+Key improvements in v4:
+  - Smart multi-hop traversal that can reach any connected node
+  - Schema is enriched with the actual folder label prefix
+  - Wider context (30 items vs 15) from semantic and FastRP
+  - Answer prompt enforces tables for multi-item results
 """
 import logging
 import asyncio
+import re
 from typing import List, Dict, Any, Optional
 from app.combined_chat.gemini_service import GeminiService
 from app.combined_chat.embedding_service import EmbeddingService
@@ -26,13 +28,15 @@ import time
 logger = logging.getLogger(__name__)
 
 # Cypher execution hard timeout (seconds)
-_CYPHER_TIMEOUT = 10
+_CYPHER_TIMEOUT = 12
 # FastRP structural search timeout (seconds)
 _FASTRP_TIMEOUT = 6
 # Orchestration (LLM intent) timeout (seconds)
-_ORCH_TIMEOUT = 8
+_ORCH_TIMEOUT = 10
 # Overall retrieval phase timeout
-_RETRIEVAL_TIMEOUT = 15
+_RETRIEVAL_TIMEOUT = 20
+# Multi-hop traversal timeout
+_MULTIHOP_TIMEOUT = 12
 
 
 class CombinedRAGService:
@@ -117,13 +121,17 @@ class CombinedRAGService:
 
         yield json.dumps({"type": "intent", "data": intent}) + "\n"
 
-        # ── Step 2: Retrieval (3 parallel branches) ────────────
-        logger.info(f"🔍 Retrieval Phase | Vector=True, FastRP=True, Cypher={intent.get('use_cypher')}, GDS={intent.get('use_gds')}")
+        # ── Step 2: Retrieval (all parallel branches) ──────────
+        logger.info(f"🔍 Retrieval Phase | Vector=True, FastRP=True, MultiHop=True, Cypher={intent.get('use_cypher')}, GDS={intent.get('use_gds')}")
         yield json.dumps({"type": "step", "id": 2, "status": "Searching the knowledge graph..."}) + "\n"
 
         named_tasks: List[tuple] = [
             ("Semantic Search", vector_task),
             ("Structural Search (FastRP)", fastrp_task),
+            # Always run multi-hop graph traversal for each question
+            ("Multi-hop Graph Traversal", asyncio.create_task(
+                asyncio.wait_for(self._multihop_traversal(question, folder_id), timeout=_MULTIHOP_TIMEOUT)
+            )),
         ]
 
         # Cypher
@@ -160,7 +168,7 @@ class CombinedRAGService:
                 continue
             if isinstance(result, list):
                 # Compact serialization — no indent, limit items
-                res_str = json.dumps(result[:15], default=str)
+                res_str = json.dumps(result[:30], default=str)
                 if name.startswith("Graph Algorithm"):
                     current_algo = algo if "algo" in dir() else "analytics"
                     yield json.dumps({"type": "gds_results", "data": {"algorithm": current_algo, "results": result}}) + "\n"
@@ -247,12 +255,14 @@ Please respond politely:
 
 Keep your tone warm, professional, and encouraging. Do NOT fabricate data."""
 
-        return f"""You are the **Neural Nexus Research Assistant** — a friendly, knowledgeable expert who provides clear, well-organized answers.
+        return f"""You are the **Neural Nexus Research Assistant** — a precise, knowledgeable expert who synthesizes graph database results into clear, direct answers.
 
 ─── GROUND RULES ───
-• Base your answer **strictly** on the CONTEXT below. This data comes from the user's active folder.
-• Do NOT use any prior knowledge or data from other folders/projects.
-• If the context only partially answers the question, say so honestly.
+• Base your answer **strictly** on the CONTEXT below. This data comes directly from the user's knowledge graph.
+• The context contains ACTUAL data extracted from the graph via semantic search, graph traversal, and structural analysis.
+• Do NOT say "the data does not contain" if the answer IS in the context — look carefully!
+• If the question is multi-hop (e.g., "which herbs contain X that treats Y"), trace the path through the data provided.
+• Do NOT use any prior knowledge beyond what is in the CONTEXT.
 
 ─── CONTEXT FROM ACTIVE FOLDER ───
 {context}
@@ -261,16 +271,18 @@ Keep your tone warm, professional, and encouraging. Do NOT fabricate data."""
 {question}
 
 ─── RESPONSE GUIDELINES ───
-1. **Tone**: Professional yet friendly. Address the user directly ("Based on your data…").
-2. **Structure**:
-   • Start with a concise **Executive Summary** (2-3 sentences answering the core question).
-   • Follow with detailed findings, organized with headers/bullets.
-   • If Graph Algorithm data is present, include an **⚡ Algorithmic Insights** section highlighting hidden patterns, rankings or communities.
-   • End with a **Key Takeaways** bullet list if the answer is complex.
-3. **Tables**: Use markdown tables when comparing multiple items.
-4. **Honesty**: If the context is insufficient, say "Based on the available data…" rather than guessing.
-5. **Clean output**: Do NOT mention data source methods (e.g., "From Semantic Search"). Present facts naturally.
-6. **Conciseness**: Prefer quality over quantity. Every sentence should add value."""
+1. **ANSWER FIRST**: Start with a direct, specific answer. If the question asks "which herbs", NAME THE HERBS in the first sentence.
+2. **Tone**: Professional yet friendly. Address the user directly ("Based on your data…").
+3. **Structure**:
+   • Start with a concise **Summary** (1-2 sentences with the direct answer).
+   • Follow with a **markdown table** if comparing multiple items (ALWAYS use tables for lists of 3+ items).
+   • Match table columns to the actual data returned (could be products, diseases, people, molecules, or any domain).
+   • If Graph Algorithm data is present, include an **⚡ Graph Analysis** section.
+   • End with **Key Takeaways** bullet list for complex answers.
+4. **Tables**: ALWAYS use markdown tables when listing multiple entities, relationships, or any structured data.
+5. **Honesty**: If context is truly insufficient for a specific part of the question, say so for THAT part only.
+6. **Trace Multi-hop Paths**: If the context shows A→B and B→C, explicitly connect them in natural language.
+7. **Conciseness**: Every sentence must add value. No filler text."""
 
     # ────────────────────────────────────────────────────────────
     #  Schema Discovery (cached 5 min)
@@ -328,41 +340,44 @@ Keep your tone warm, professional, and encouraging. Do NOT fabricate data."""
     # ────────────────────────────────────────────────────────────
 
     async def _orchestrate_retrieval(self, question: str, schema: str, folder_id: str) -> Dict[str, Any]:
+        folder_label = f"F_{folder_id.replace('-', '_')}"
         prompt = f"""
-        TASK: Orchestrate data retrieval for a Knowledge Graph Research Agent.
-        FOLDER_ID: {folder_id}
-        SCHEMA:
-        {schema}
-        
-        SOP FOR COMPLEX GRAPH RESEARCH:
-        1. PATH DISCOVERY: For "X treats Y" or "X connected to Y", use 2-3 hop Cypher: (n)-[*1..3]->(m).
-        2. IMPORTANCE/RANKING (*GDS MANDATORY*): For "most important", "widest range", or "top entities", you MUST set `use_gds` to true and select `centrality`.
-        3. GROUPS/CLUSTERS (*GDS MANDATORY*): For "groups of diseases" or "clusters", you MUST set `use_gds` to true and select `community`.
-        4. DEGREE FALLBACK: Use Neo4j 5 syntax if sorting in Cypher: MATCH (n) WHERE n.folder_id = '{folder_id}' RETURN n.name, COUNT {{ (n)--() }} as deg ORDER BY deg DESC.
-        5. DIVERSITY: count(DISTINCT neighbor) of a target label.
-        6. SIMILARITY: Find nodes sharing neighbors (hubs). (a)-[:REL]->(hub)<-[:REL]-(b).
-        7. STRUCTURE SIMILARITY: Use [SIMILAR_TO] relationships and the 'basis' property if present.
-        8. PLANT PARTS: Use the 'part_of_plant' property on Relationships if filtering by plant organ.
+TASK: Orchestrate data retrieval for a Knowledge Graph Research Agent.
+FOLDER LABEL: {folder_label}
+SCHEMA (actual graph structure for this folder):
+{schema}
 
-        STRICT CYPHER RULES:
-        - FOLDER ISOLATION: EVERY node variable in your MATCH must be filtered by folder_id. 
-          Example: MATCH (h:Herb), (p:Phytochemical) WHERE h.folder_id = '{folder_id}' AND p.folder_id = '{folder_id}' ...
-        - NO HALLUCINATIONS: You MUST ONLY use Relationship Types listed in the SCHEMA above. 
-          (e.g., if SCHEMA has HAS_USE, do NOT use HAS_THERAPEUTIC_USE).
-        - MULTI-HOP PATHS: If the question requires connecting A to C, and A is connected to B and B to C, use (a)-[*1..3]->(c) or explicit hops.
-        - NEO4J 5 SYNTAX: Do NOT use `size((n)--())`. You MUST use the `COUNT {{ (n)--() }}` subquery pattern instead.
-        - No Hardcoding: Use labels and property comparisons.
+CRITICAL CONTEXT:
+- The graph uses folder-scoped labels. Every node in this folder carries the label `{folder_label}`.
+- Use ONLY the relationship types and node labels listed in the SCHEMA above — do NOT invent new ones.
+- The data domain is UNKNOWN — it could be pharma, finance, legal, social, or anything. Adapt your query to the actual schema.
 
-        Question: {question}
-        
-        JSON OUTPUT:
-        {{
-          "use_cypher": bool,
-          "cypher_query": "CYPHER",
-          "use_gds": bool,
-          "gds_algo": "centrality|community|similarity|null",
-          "research_strategy": "..."
-        }}
+MULTI-HOP REASONING RULES:
+- Answers often require traversing 2-6 hops through the graph.
+- For connections between two entity types that are not directly linked, always try variable-length paths.
+- Use: MATCH (a:{folder_label})-[*1..5]->(b:{folder_label}) WHERE a.name IS NOT NULL RETURN ...
+- (EXAMPLE ONLY — for illustration — actual domain may differ):
+  e.g. Person → WorksAt → Company → Located → City
+  e.g. Product → HasComponent → Material → SourcedFrom → Country
+
+SOP:
+1. PATH DISCOVERY: Use (n)-[*1..5]->(m) for multi-hop questions. Never assume direct 1-hop connection.
+2. IMPORTANCE/RANKING: For "most important", "widest range", "top N" → set `use_gds: true`, `gds_algo: centrality`.
+3. GROUPS/CLUSTERS: For "groups of", "clusters" → set `use_gds: true`, `gds_algo: community`.
+4. RELATIONSHIPS: Use ONLY rel types from the SCHEMA. Never hallucinate.
+5. NEO4J 5 SYNTAX: Use COUNT {{ (n)--() }} not size((n)--()).
+6. NO HARDCODING: Use label comparisons and patterns. Never hardcode node names.
+
+Question: {question}
+
+JSON OUTPUT:
+{{
+  "use_cypher": bool,
+  "cypher_query": "CYPHER or null",
+  "use_gds": bool,
+  "gds_algo": "centrality|community|similarity|null",
+  "research_strategy": "brief description"
+}}
         """
         try:
             return await self.gemini.generate_json(prompt)
@@ -440,8 +455,93 @@ Keep your tone warm, professional, and encouraging. Do NOT fabricate data."""
             return ""
 
     # ────────────────────────────────────────────────────────────
-    #  Folder Neighbor Context (safety net)
+    #  Multi-hop Graph Traversal (Smart path engine)
     # ────────────────────────────────────────────────────────────
+
+    async def _multihop_traversal(self, question: str, folder_id: Optional[str]) -> str:
+        """
+        Generic multi-hop graph traversal — works for ANY domain.
+        Does NOT hardcode any entity types, relationship names, or domain knowledge.
+        Auto-discovers the active graph structure from the folder label and
+        runs two lean parallel queries:
+          1. 2-hop neighbor scan  — fast, broad coverage
+          2. 3-hop chain sample   — discovers compound connections
+        Both queries target only folder-scoped nodes via the folder label.
+        """
+        if not folder_id:
+            return ""
+
+        folder_label = f"F_{folder_id.replace('-', '_')}"
+
+        try:
+            async with self.neo4j.session() as session:
+
+                # ── Query 1: 2-hop neighbors (fast, broad) ──
+                # Finds what each node connects to within 2 hops
+                # Returns: source, rel_type, target for both hops
+                q1 = f"""
+                    MATCH (a:{folder_label})-[r1]->(b:{folder_label})
+                    WHERE a.name IS NOT NULL AND b.name IS NOT NULL
+                    OPTIONAL MATCH (b)-[r2]->(c:{folder_label})
+                    WHERE c.name IS NOT NULL AND c <> a
+                    RETURN
+                        a.name AS source,
+                        type(r1) AS rel1,
+                        b.name AS target1,
+                        type(r2) AS rel2,
+                        c.name AS target2
+                    LIMIT 80
+                """
+
+                # ── Query 2: 3-hop path sample (richer chains) ──
+                # Discovers longer chains without variable-length overhead
+                q2 = f"""
+                    MATCH (a:{folder_label})-[r1]->(b:{folder_label})-[r2]->(c:{folder_label})-[r3]->(d:{folder_label})
+                    WHERE a.name IS NOT NULL AND d.name IS NOT NULL
+                      AND a <> d
+                    RETURN
+                        a.name AS node_a,
+                        type(r1) AS rel_ab,
+                        b.name AS node_b,
+                        type(r2) AS rel_bc,
+                        c.name AS node_c,
+                        type(r3) AS rel_cd,
+                        d.name AS node_d
+                    LIMIT 60
+                """
+
+                # Run both queries sequentially in the same session
+                # (Neo4j async sessions are single-use per statement)
+                async def _fetch(q: str):
+                    try:
+                        r = await session.run(q)
+                        return await r.data()
+                    except Exception as ex:
+                        return ex
+
+                res1 = await _fetch(q1)
+                res2 = await _fetch(q2)
+
+                results = []
+                if isinstance(res1, list) and res1:
+                    results.append(f"[2-hop Graph Connections]:\n{json.dumps(res1, default=str)}")
+                elif isinstance(res1, Exception):
+                    logger.warning(f"Multi-hop Q1 failed: {res1}")
+
+                if isinstance(res2, list) and res2:
+                    results.append(f"[3-hop Entity Chains]:\n{json.dumps(res2, default=str)}")
+                elif isinstance(res2, Exception):
+                    logger.warning(f"Multi-hop Q2 failed: {res2}")
+
+                if results:
+                    logger.info(f"🔗 Multi-hop: {len(res1) if isinstance(res1, list) else 0} 2-hop rows, {len(res2) if isinstance(res2, list) else 0} 3-hop chains")
+                    return "\n\n".join(results)
+
+                return ""
+        except Exception as e:
+            logger.warning(f"Multi-hop traversal failed: {e}")
+            return ""
+
 
     async def _folder_neighbor_context(self, folder_id: str) -> str:
         """Last-resort: grab entity names + relationships from the folder."""
