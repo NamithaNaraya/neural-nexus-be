@@ -41,7 +41,6 @@ class UploadStatus(BaseModel):
     current_phase: str
     node_count: int
     relationship_count: int
-    progress: int
     message: str
     error_message: str = None
 
@@ -69,25 +68,34 @@ async def _create_file_record(
     file_type: str,
     file_size: int,
 ) -> None:
-    """Create file record in PostgreSQL."""
+    """Create file record in PostgreSQL with conflict handling for retries."""
     async with get_postgres_session() as session:
-        await session.execute(
-            text("""
-                INSERT INTO neural_nexus.files 
-                (id, folder_id, filename, file_type, file_size, status, created_at)
-                VALUES (:id, :folder_id, :filename, :file_type, :file_size, :status, :created_at)
-            """),
-            {
-                "id": file_id,
-                "folder_id": folder_id,
-                "filename": filename,
-                "file_type": file_type,
-                "file_size": file_size,
-                "status": "pending",
-                "created_at": datetime.utcnow(),
-            }
-        )
-        await session.commit()
+        try:
+            await session.execute(
+                text("""
+                    INSERT INTO neural_nexus.files 
+                    (id, folder_id, filename, file_type, file_size, status, created_at)
+                    VALUES (:id, :folder_id, :filename, :file_type, :file_size, :status, :created_at)
+                    ON CONFLICT (id) DO UPDATE SET
+                        status = 'pending',
+                        error_message = NULL,
+                        file_size = :file_size
+                """),
+                {
+                    "id": file_id,
+                    "folder_id": folder_id,
+                    "filename": filename,
+                    "file_type": file_type,
+                    "file_size": file_size,
+                    "status": "pending",
+                    "created_at": datetime.utcnow(),
+                }
+            )
+            await session.commit()
+        except Exception as e:
+            logger.error(f"Failed to create file record for {file_id}: {e}")
+            await session.rollback()
+            raise
 
 
 async def _process_file_async(
@@ -287,7 +295,15 @@ async def upload_file(
     try:
         # Special handling for Cypher files - bypass extraction pipeline
         if file_type == 'cypher':
-            content = file_bytes.decode('utf-8')
+            try:
+                content = file_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                # Try latin-1 as fallback for non-UTF-8 cypher files
+                content = file_bytes.decode('latin-1')
+                logger.warning(f"Cypher file {file.filename} decoded with latin-1 fallback")
+            
+            if not content.strip():
+                raise HTTPException(status_code=400, detail="Cypher file is empty")
             
             # Create file record
             await _create_file_record(
@@ -299,12 +315,28 @@ async def upload_file(
                 file_size=file_size,
             )
             
-            from app.services.managed_cypher_service import get_managed_cypher_service
-            managed_service = get_managed_cypher_service()
+            # Validate the service can be imported before starting background task
+            try:
+                from app.services.managed_cypher_service import get_managed_cypher_service
+                managed_service = get_managed_cypher_service()
+            except Exception as import_err:
+                logger.error(f"Failed to initialize ManagedCypherService: {import_err}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Cypher ingestion service initialization failed: {import_err}"
+                )
             
             # Run in background to avoid timeout
             async def run_managed_cypher():
+                from app.routes.sse import publish_ingestion_progress
                 try:
+                    logger.info(f"Starting background Cypher ingestion for file {file_id} ({file.filename})")
+                    
+                    # Update status to processing
+                    from app.agents.storage_agent import StorageAgent
+                    storage = StorageAgent()
+                    await storage.update_file_status(file_id, "processing")
+                    
                     result = await managed_service.execute_managed_query(
                         query=content,
                         file_id=file_id,
@@ -312,8 +344,6 @@ async def upload_file(
                         user_id=user_id
                     )
                     
-                    from app.agents.storage_agent import StorageAgent
-                    storage = StorageAgent()
                     await storage.update_file_status(
                         file_id=file_id,
                         status="completed",
@@ -321,19 +351,48 @@ async def upload_file(
                         relationship_count=result.get("relationship_count", 0),
                     )
                     
-                    # Run FastRP Embeddings
+                    logger.info(
+                        f"Cypher ingestion completed for {file_id}: "
+                        f"{result['node_count']} nodes, {result.get('relationship_count', 0)} rels"
+                    )
+                    
+                    # Run FastRP Embeddings (non-fatal)
                     try:
                         from app.services.graph_service import get_graph_service
                         graph_service = get_graph_service()
                         await graph_service.run_fastrp_node_embeddings(folder_id)
                     except Exception as e:
-                        logger.warning(f"FastRP failed: {e}")
+                        logger.warning(f"FastRP failed (non-fatal): {e}")
+                    
+                    # Publish completion via SSE
+                    try:
+                        await publish_ingestion_progress(
+                            user_id=user_id,
+                            file_id=file_id,
+                            phase="completed",
+                            progress=100,
+                            message=f"Cypher ingestion complete: {result['node_count']} nodes",
+                        )
+                    except Exception:
+                        pass
                         
                 except Exception as e:
-                    logger.error(f"Background Cypher ingestion failed: {e}")
+                    logger.error(f"Background Cypher ingestion failed for {file_id}: {e}", exc_info=True)
                     from app.agents.storage_agent import StorageAgent
                     storage = StorageAgent()
                     await storage.update_file_status(file_id, "failed", error_message=str(e))
+                    
+                    # Publish failure via SSE
+                    try:
+                        await publish_ingestion_progress(
+                            user_id=user_id,
+                            file_id=file_id,
+                            phase="failed",
+                            progress=0,
+                            message=f"Cypher ingestion failed: {str(e)}",
+                        )
+                    except Exception:
+                        pass
 
             background_tasks.add_task(run_managed_cypher)
             

@@ -359,7 +359,42 @@ class ManagedCypherService:
             if var:
                 seen_vars.add(var)
 
-           7. Return final counts
+            # Prefix user labels with folder suffix, skip system labels
+            if labels:
+                new_labels = prefix_fn(labels)
+            else:
+                new_labels = f":{folder_label}"
+
+            # Ensure the folder label is present even when other labels exist
+            # Check by splitting to avoid substring match (e.g., folder_label being in 'Biomarker_F_xxx')
+            current_labels = [l for l in new_labels.split(':') if l]
+            if folder_label not in current_labels:
+                new_labels = f"{new_labels}:{folder_label}"
+
+            return f"{prefix}{var}{new_labels}{props}{suffix}"
+
+        # Strip line comments (but not inside strings — good enough for most Cypher)
+        clean_stmt = re.sub(r'//.*', '', stmt)
+        return node_pattern.sub(_inject_folder, clean_stmt)
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Execute Managed Query — full 7-step ingestion pipeline
+    # ──────────────────────────────────────────────────────────────────────
+
+    async def execute_managed_query(
+        self, query: str, file_id: str, folder_id: str, user_id: str
+    ) -> Dict[str, Any]:
+        """
+        Execute a user-provided Cypher query through the managed ingestion pipeline.
+
+        Steps:
+            1. Rewrite the query for folder-level isolation
+            2. Execute the rewritten statements in Neo4j
+            3. Adopt nodes (tag with :Entity, file_id, folder_id)
+            4. Generate UUIDs for new nodes
+            5. Generate embeddings for new nodes
+            6. Sync entities and relationships to PostgreSQL staging
+            7. Return final counts
         """
         folder_label = f"F_{folder_id.replace('-', '_')}"
 
@@ -428,13 +463,12 @@ class ManagedCypherService:
                 raise
 
             # ── Step 2: Adopt nodes — tag with :Entity, file_id, folder_id ──
-            # Improved adoption: catch any node that has the folder-specific label
+            # Adopt ALL nodes with the folder label — unconditionally add current file_id
+            # to file_ids so re-uploads and MERGE-based ingestions always get proper counts.
             logger.info(f"[Step 2/7] Adopting nodes for file {file_id}...")
             try:
-                # to 'name' so RAG and Search can find them.
                 adoption_result = await session.run(f"""
                     MATCH (n:{folder_label})
-                    WHERE NOT n:Entity OR n.file_id IS NULL OR n.file_id = $file_id
                     SET n.file_id = CASE WHEN n.file_id IS NULL THEN $file_id ELSE n.file_id END,
                         n.folder_id = CASE WHEN n.folder_id IS NULL THEN $folder_id ELSE n.folder_id END,
                         n.file_ids = CASE
@@ -463,34 +497,36 @@ class ManagedCypherService:
             # ── Step 2.5: Adopt Relationships ──
             logger.info(f"[Step 2.5/7] Adopting relationships for file {file_id}...")
             try:
-                await session.run("""
-                    MATCH (a:Entity)-[r]->(b:Entity)
-                    WHERE ($file_id IN a.file_ids)
-                      AND ($file_id IN b.file_ids)
-                      AND (r.file_ids IS NULL OR NOT $file_id IN r.file_ids)
+                rel_adopt_result = await session.run(f"""
+                    MATCH (a:{folder_label})-[r]->(b:{folder_label})
+                    WHERE r.file_ids IS NULL OR NOT $file_id IN r.file_ids
                     SET r.file_ids = CASE
                         WHEN r.file_ids IS NULL THEN [$file_id]
                         ELSE r.file_ids + $file_id
                     END
+                    RETURN count(r) as adopted_rels
                 """, {"file_id": file_id})
+                rel_adopt_record = await rel_adopt_result.single()
+                adopted_rels = rel_adopt_record["adopted_rels"] if rel_adopt_record else 0
+                logger.info(f"Adopted {adopted_rels} relationships for file {file_id}")
             except Exception as e:
                 logger.warning(f"Relationship adoption failed: {e}")
 
             # ── Step 3: UUID Generation ──
             logger.info(f"[Step 3/7] Generating UUIDs for file {file_id}...")
             try:
-                await session.run("""
-                    MATCH (n:Entity)
-                    WHERE ($file_id IN n.file_ids OR n.file_id = $file_id) AND n.id IS NULL
+                await session.run(f"""
+                    MATCH (n:{folder_label})
+                    WHERE n.id IS NULL
                     SET n.id = randomUUID()
                 """, {"file_id": file_id})
             except Exception as e:
                 logger.warning(f"randomUUID() failed, falling back to Python UUIDs: {e}")
                 # Fallback: generate UUIDs via Python
                 try:
-                    result = await session.run("""
-                        MATCH (n)
-                        WHERE ($file_id IN n.file_ids OR n.file_id = $file_id) AND n.id IS NULL
+                    result = await session.run(f"""
+                        MATCH (n:{folder_label})
+                        WHERE n.id IS NULL
                         RETURN DISTINCT id(n) as internal_id
                     """, {"file_id": file_id})
                     async for record in result:
@@ -505,9 +541,9 @@ class ManagedCypherService:
             # ── Step 4: Generate missing embeddings ──
             logger.info(f"[Step 4/7] Generating embeddings for file {file_id}...")
             try:
-                result = await session.run("""
-                    MATCH (n:Entity)
-                    WHERE ($file_id IN n.file_ids OR n.file_id = $file_id) AND n.embedding IS NULL
+                result = await session.run(f"""
+                    MATCH (n:{folder_label}:Entity)
+                    WHERE n.embedding IS NULL
                     RETURN DISTINCT n.id as id, n.name as name, n.type as type,
                            coalesce(n.description, '') as description
                 """, {"file_id": file_id})
@@ -541,9 +577,8 @@ class ManagedCypherService:
             # ── Step 5: Sync to PostgreSQL entity_staging ──
             logger.info(f"[Step 5/7] Syncing to PostgreSQL for file {file_id}...")
             try:
-                entities_result = await session.run("""
-                    MATCH (n:Entity)
-                    WHERE $file_id IN n.file_ids OR n.file_id = $file_id
+                entities_result = await session.run(f"""
+                    MATCH (n:{folder_label}:Entity)
                     RETURN DISTINCT n.id as id, n.name as name, n.type as type,
                            coalesce(n.description, '') as description,
                            coalesce(n.confidence, 1.0) as confidence
@@ -559,11 +594,8 @@ class ManagedCypherService:
                         "confidence": record["confidence"],
                     })
 
-                rels_result = await session.run("""
-                    MATCH (a:Entity)-[r]->(b:Entity)
-                    WHERE ($file_id IN a.file_ids OR a.file_id = $file_id)
-                      AND ($file_id IN b.file_ids OR b.file_id = $file_id)
-                      AND ($file_id IN r.file_ids OR r.file_id = $file_id)
+                rels_result = await session.run(f"""
+                    MATCH (a:{folder_label}:Entity)-[r]->(b:{folder_label}:Entity)
                     RETURN DISTINCT a.id as source, b.id as target, type(r) as rel_type,
                            coalesce(r.description, '') as description
                 """, {"file_id": file_id})
@@ -586,23 +618,22 @@ class ManagedCypherService:
                 logger.error(f"PostgreSQL staging sync failed: {e}")
 
             # ── Step 6: Get final counts ──
-            count_result = await session.run("""
-                MATCH (n:Entity)
-                WHERE $file_id IN n.file_ids OR n.file_id = $file_id
+            # Use folder_label for reliable counting — this catches ALL nodes in the folder
+            count_result = await session.run(f"""
+                MATCH (n:{folder_label}:Entity)
                 RETURN count(n) as count
             """, {"file_id": file_id})
             node_count_record = await count_result.single()
             node_count = node_count_record["count"] if node_count_record else 0
 
-            rel_count_result = await session.run("""
-                MATCH (a:Entity)-[r]->(b:Entity)
-                WHERE ($file_id IN a.file_ids OR a.file_id = $file_id)
-                  AND ($file_id IN b.file_ids OR b.file_id = $file_id)
-                  AND ($file_id IN r.file_ids OR r.file_id = $file_id)
+            rel_count_result = await session.run(f"""
+                MATCH (a:{folder_label}:Entity)-[r]->(b:{folder_label}:Entity)
                 RETURN count(r) as count
             """, {"file_id": file_id})
             rel_count_record = await rel_count_result.single()
             rel_count = rel_count_record["count"] if rel_count_record else 0
+
+            logger.info(f"[Step 6/7] Final counts for file {file_id}: {node_count} nodes, {rel_count} relationships")
 
             # ── Step 7: Invalidate Cache ──
             try:
