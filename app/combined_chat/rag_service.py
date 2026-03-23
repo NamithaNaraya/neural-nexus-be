@@ -94,7 +94,13 @@ class CombinedRAGService:
         except Exception as e:
             logger.warning(f"Failed to load history from Redis: {e}")
 
-        combined_history = (stored_history + history) if history else stored_history
+        combined_history = []
+        seen_msgs = set()
+        for msg in (stored_history + (history or [])):
+            msg_str = f"{msg.get('role', '')}:{msg.get('content', '')}"
+            if msg_str not in seen_msgs and msg.get('content', '').strip():
+                seen_msgs.add(msg_str)
+                combined_history.append(msg)
 
         # ── Fast-path: Greeting ────────────────────────────────
         clean_q = question.lower().strip().strip("?!.")
@@ -141,7 +147,7 @@ class CombinedRAGService:
 
         orchestration_task = asyncio.create_task(
             asyncio.wait_for(
-                self._orchestrate_retrieval(question, schema, folder_id or "global"),
+                self._orchestrate_retrieval(question, schema, folder_id or "global", combined_history),
                 timeout=_ORCH_TIMEOUT
             )
         )
@@ -336,6 +342,7 @@ Keep your tone warm, professional, and encouraging. Do NOT fabricate data."""
 
 RULES:
 • Answer ONLY from the CONTEXT below. It is real data from the user's active knowledge graph.
+• CONVERSATION CONTINUITY: The user may refer to previous answers using "them", "it", "those", "he", "she", etc. Check the conversation history (previous messages) to resolve these references. Always answer in the context of the ongoing conversation.
 • Never say "the data doesn't contain" if it actually does — read carefully.
 • Never pad with boilerplate like "Certainly!", "Great question", "Executive Summary", "Key Findings", or "Key Takeaways".
 • NEVER use section headers (##, ###) unless the answer is genuinely multi-part.
@@ -458,18 +465,32 @@ HONESTY: If context is truly incomplete for a specific sub-question, say it in o
     #  Intent Orchestration
     # ────────────────────────────────────────────────────────────
 
-    async def _orchestrate_retrieval(self, question: str, schema: str, folder_id: str) -> Dict[str, Any]:
+    async def _orchestrate_retrieval(self, question: str, schema: str, folder_id: str, history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
         folder_label = f"F_{folder_id.replace('-', '_')}"
+        
+        # Format recent history for the prompt (last 4 turns)
+        history_context = ""
+        if history and len(history) > 0:
+            recent_msgs = history[-4:]
+            history_lines = []
+            for m in recent_msgs:
+                role = m.get('role', 'user').upper()
+                content = m.get('content', '').replace('\n', ' ')
+                history_lines.append(f"{role}: {content}")
+            history_context = "\nRECENT CONVERSATION HISTORY:\n" + "\n".join(history_lines) + "\n"
+
         prompt = f"""
 TASK: Orchestrate data retrieval for a Knowledge Graph Research Agent.
 FOLDER LABEL: {folder_label}
 SCHEMA (actual graph structure for this folder):
 {schema}
+{history_context}
 
 CRITICAL CONTEXT:
 - The graph uses folder-scoped labels. Every node in this folder carries the label `{folder_label}`.
 - Use ONLY the relationship types and node labels listed in the SCHEMA above — do NOT invent new ones.
 - The data domain is UNKNOWN — it could be pharma, finance, legal, social, or anything. Adapt your query to the actual schema.
+- CONVERSATION CONTINUITY: The user's question might refer to answers or entities from the RECENT CONVERSATION HISTORY (e.g., using "them", "it", "those"). Use the history to figure out what entity type or specific name they are asking about before deciding on the query.
 
 MULTI-HOP REASONING RULES:
 - Answers often require traversing 2-6 hops through the graph.
