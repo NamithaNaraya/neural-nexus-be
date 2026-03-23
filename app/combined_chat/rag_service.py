@@ -57,6 +57,17 @@ class CombinedRAGService:
         self._chain_depth_cache: Dict[str, int] = {}  # folder_id -> max chain depth
         self._greetings = {"hi", "hello", "hey", "hola", "greetings", "good morning", "good afternoon", "good evening"}
 
+    def invalidate_schema_cache(self):
+        """
+        Clear the in-memory schema cache so the next query fetches fresh schema.
+        Should be called after any CRUD operation that changes the graph structure
+        (add/update/delete nodes or relationships).
+        """
+        self._schema_cache = None
+        self._schema_expiry = 0
+        self._chain_depth_cache.clear()
+        logger.info("🗑️ RAG schema cache invalidated (CRUD change detected)")
+
     # ────────────────────────────────────────────────────────────
     #  Public API
     # ────────────────────────────────────────────────────────────
@@ -179,6 +190,23 @@ class CombinedRAGService:
                 asyncio.wait_for(
                     self._semantic_node_resolution(question, folder_id, expanded_terms, max_depth),
                     timeout=_SEMANTIC_RESOLVE_TIMEOUT
+                )
+            )),
+            # Direct type enumeration — authoritative counts & complete lists
+            # This is the GROUND TRUTH source for "how many X" and "list all X" questions.
+            # Unlike semantic search (top-K limited), this queries the ENTIRE database.
+            ("Database Facts", asyncio.create_task(
+                asyncio.wait_for(
+                    self._type_enumeration(folder_id),
+                    timeout=5
+                )
+            )),
+            # Focused Entity Scan — exhaustive neighborhood for entities mentioned in the question
+            # Ensures ALL connections (e.g., Tamarind → ALL plant parts → ALL phytoconstituents)
+            ("Focused Entity Scan", asyncio.create_task(
+                asyncio.wait_for(
+                    self._focused_entity_scan(question, folder_id),
+                    timeout=8
                 )
             )),
         ]
@@ -312,6 +340,7 @@ RULES:
 • Never pad with boilerplate like "Certainly!", "Great question", "Executive Summary", "Key Findings", or "Key Takeaways".
 • NEVER use section headers (##, ###) unless the answer is genuinely multi-part.
 • Be direct. Answer first, then support with data.
+• PRIORITY: If the context contains "DATABASE FACTS", those are AUTHORITATIVE counts and complete lists queried directly from the graph database. For counting questions ("how many X?") or listing questions ("list all X"), ALWAYS use the DATABASE FACTS numbers — they are exact and complete. Other sources (semantic search, vector search) are approximate and may be incomplete.
 
 CONTEXT:
 {context}
@@ -445,18 +474,53 @@ CRITICAL CONTEXT:
 MULTI-HOP REASONING RULES:
 - Answers often require traversing 2-6 hops through the graph.
 - For connections between two entity types that are not directly linked, always try variable-length paths.
-- Use: MATCH (a:{folder_label})-[*1..5]->(b:{folder_label}) WHERE a.name IS NOT NULL RETURN ...
+- ALWAYS use UNDIRECTED relationship patterns (no arrow) to catch relationships in BOTH directions:
+  Use: MATCH (a:{folder_label})-[*1..5]-(b:{folder_label}) WHERE a.name IS NOT NULL RETURN ...
+  NEVER use -[*1..5]-> (directed). ALWAYS use -[*1..5]- (undirected).
+  Reason: Relationship directions in the graph are inconsistent — some go A→B, others B→A.
+  Undirected patterns catch BOTH, ensuring no data is missed.
 - (EXAMPLE ONLY — for illustration — actual domain may differ):
-  e.g. Person → WorksAt → Company → Located → City
-  e.g. Product → HasComponent → Material → SourcedFrom → Country
+  e.g. Person -[:WorksAt]- Company -[:Located]- City
+  e.g. Product -[:HasComponent]- Material -[:SourcedFrom]- Country
 
 SOP:
-1. PATH DISCOVERY: Use (n)-[*1..5]->(m) for multi-hop questions. Never assume direct 1-hop connection.
-2. IMPORTANCE/RANKING: For "most important", "widest range", "top N" → set `use_gds: true`, `gds_algo: centrality`.
-3. GROUPS/CLUSTERS: For "groups of", "clusters" → set `use_gds: true`, `gds_algo: community`.
-4. RELATIONSHIPS: Use ONLY rel types from the SCHEMA. Never hallucinate.
-5. NEO4J 5 SYNTAX: Use COUNT {{ (n)--() }} not size((n)--()).
-6. NO HARDCODING: Use label comparisons and patterns. Never hardcode node names.
+1. PATH DISCOVERY: ALWAYS use undirected -[*1..5]-(m) for multi-hop questions. NEVER use directed ->. Never assume direct 1-hop connection.
+2. RELATIONSHIPS: Use ONLY rel types from the SCHEMA. Never hallucinate.
+3. NEO4J 5 SYNTAX: Use COUNT {{{{ (n)--() }}}} not size((n)--()).
+4. NO HARDCODING: Use label comparisons and patterns. Never hardcode node names.
+5. TYPE MATCHING: When filtering by entity type, ALWAYS use BOTH methods to catch all nodes:
+   - Label-based: MATCH (n:TypeLabel_{folder_label})
+   - Property-based (fallback for manually-created nodes): OR toLower(n.type) = 'typename'
+   Example: MATCH (n:{folder_label}) WHERE (n:Student_{folder_label} OR toLower(n.type) = 'student') RETURN count(n)
+   This is CRITICAL because some nodes use labels while others use the `type` property.
+
+GDS ALGORITHM SELECTION — set `use_gds: true` and pick the right `gds_algo` when the question fits:
+
+— CENTRALITY (Who/What is most important?) —
+• "pagerank": Influence, importance, popularity, "best", "most central", ranking.
+• "articlerank": Like PageRank but better for diverse graphs. "Most authoritative".
+• "betweenness": Bridges, bottlenecks, connecting groups, flow control.
+• "closeness": Reachability, "closest to all others", central access point.
+• "degree": Most connections, "most active", "most linked".
+• "hits": Hubs vs authorities. "Which are hubs" vs "which are authorities".
+
+— COMMUNITY DETECTION (How is the data grouped?) —
+• "louvain": Communities, clusters, groups, "who belongs together".
+• "leiden": Same as louvain but higher quality. "Better clustering".
+• "wcc": Islands, disconnected parts, "isolated groups".
+• "kcore": Core structure, "tight-knit core", inner circle vs periphery.
+• "triangle_count": Local density, "tight clusters", "tightly-knit groups".
+
+— SIMILARITY —
+• "similarity": "What is similar to X", "which nodes share neighbors", Jaccard.
+
+— LINK PREDICTION (What connections are missing?) —
+• "link_prediction_common": Predict missing links by shared neighbors.
+• "link_prediction_adamic": Advanced link prediction weighted by rare connections.
+• "link_prediction_resource": Flow-based link prediction.
+
+— TOPOLOGY —
+• "topological_sort": Logical sequence, dependency order, timeline for DAGs.
 
 Question: {question}
 
@@ -465,7 +529,7 @@ JSON OUTPUT:
   "use_cypher": bool,
   "cypher_query": "CYPHER or null",
   "use_gds": bool,
-  "gds_algo": "centrality|community|similarity|null",
+  "gds_algo": "pagerank|articlerank|betweenness|closeness|degree|hits|louvain|leiden|wcc|kcore|triangle_count|similarity|link_prediction_common|link_prediction_adamic|link_prediction_resource|topological_sort|null",
   "research_strategy": "brief description",
   "search_depth": int // Estimated number of hops needed to traverse the graph to answer this question. Example: 1 for direct mapping, 3 for components, 5 for deep supply chain. Defaults to 5 if unsure. Cap at 10.
 }}
@@ -569,12 +633,13 @@ JSON OUTPUT:
             async with self.neo4j.session() as session:
 
                 # ── Query 1: 2-hop neighbors (fast, broad) ──
-                # Finds what each node connects to within 2 hops
-                # Returns: source, rel_type, target for both hops
+                # Uses UNDIRECTED patterns to catch relationships in BOTH directions.
+                # This is critical: Herb→HAS_PART→PlantPart and PlantPart→CONTAINS→Phytoconstituent
+                # may have different directions, so directed queries miss entire branches.
                 q1 = f"""
-                    MATCH (a:{folder_label})-[r1]->(b:{folder_label})
+                    MATCH (a:{folder_label})-[r1]-(b:{folder_label})
                     WHERE a.name IS NOT NULL AND b.name IS NOT NULL
-                    OPTIONAL MATCH (b)-[r2]->(c:{folder_label})
+                    OPTIONAL MATCH (b)-[r2]-(c:{folder_label})
                     WHERE c.name IS NOT NULL AND c <> a
                     RETURN
                         a.name AS source,
@@ -582,15 +647,16 @@ JSON OUTPUT:
                         b.name AS target1,
                         type(r2) AS rel2,
                         c.name AS target2
-                    LIMIT 80
+                    LIMIT 150
                 """
 
                 # ── Query 2: 3-hop path sample (richer chains) ──
-                # Discovers longer chains without variable-length overhead
+                # Discovers longer chains like Herb→PlantPart→Phytoconstituent→Biomarker
+                # Undirected to follow relationship chains regardless of direction.
                 q2 = f"""
-                    MATCH (a:{folder_label})-[r1]->(b:{folder_label})-[r2]->(c:{folder_label})-[r3]->(d:{folder_label})
+                    MATCH (a:{folder_label})-[r1]-(b:{folder_label})-[r2]-(c:{folder_label})-[r3]-(d:{folder_label})
                     WHERE a.name IS NOT NULL AND d.name IS NOT NULL
-                      AND a <> d
+                      AND a <> d AND a <> c AND b <> d
                     RETURN
                         a.name AS node_a,
                         type(r1) AS rel_ab,
@@ -599,7 +665,7 @@ JSON OUTPUT:
                         c.name AS node_c,
                         type(r3) AS rel_cd,
                         d.name AS node_d
-                    LIMIT 60
+                    LIMIT 100
                 """
 
                 # Run both queries sequentially in the same session
@@ -773,7 +839,7 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
                 # Step 2: For each matched node, fetch its MULTI-HOP neighborhood
                 # This is crucial: data like Herb→PlantPart→Compound→TherapeuticUse
                 # requires 3+ hops to connect the full chain
-                resolved_names = [r["name"] for r in matched_nodes[:5]]
+                resolved_names = [r["name"] for r in matched_nodes[:8]]
 
                 # Query A: Direct 1-hop neighbors (fast, essential)
                 q_1hop = f"""
@@ -788,7 +854,7 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
                         neighbor.name AS connected_to,
                         labels(neighbor) AS connected_labels,
                         properties(neighbor) AS connected_props
-                    LIMIT 60
+                    LIMIT 100
                 """
                 res2 = await session.run(q_1hop, names=resolved_names)
                 neighborhood = await res2.data()
@@ -809,7 +875,7 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
                         properties(far) AS connected_props,
                         rel_chain,
                         node_chain
-                    LIMIT 80
+                    LIMIT 120
                 """
                 try:
                     res3 = await session.run(q_multihop, names=resolved_names)
@@ -890,6 +956,181 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
 
         except Exception as e:
             logger.warning(f"Semantic node resolution failed: {e}")
+            return ""
+
+    # ────────────────────────────────────────────────────────────
+    #  Focused Entity Scan (exhaustive neighborhood for mentioned entities)
+    # ────────────────────────────────────────────────────────────
+
+    async def _focused_entity_scan(self, question: str, folder_id: Optional[str]) -> str:
+        """
+        When the question mentions a specific entity (e.g. 'Tamarind', 'Aspirin'),
+        finds that entity and exhaustively traverses ALL its connections up to 4 hops.
+
+        Unlike semantic search (top-K limited) or multi-hop (random scan),
+        this is TARGETED: it starts from the mentioned entity and follows
+        EVERY relationship chain in BOTH directions with NO result limit.
+
+        This ensures questions like "What plant parts of Tamarind..." get
+        ALL plant parts AND all their connections (phytoconstituents, biomarkers, etc.)
+        """
+        if not folder_id:
+            return ""
+
+        folder_label = f"F_{folder_id.replace('-', '_')}"
+
+        # Extract potential entity names from question (words > 3 chars, not stopwords)
+        stopwords = {"what", "which", "where", "when", "that", "this", "those",
+                      "there", "their", "them", "they", "with", "from", "have",
+                      "does", "about", "along", "mention", "used", "medicinally",
+                      "contains", "contain", "plant", "parts", "list", "give",
+                      "show", "find", "tell", "many", "much", "most", "more",
+                      "some", "other", "also", "been", "being", "into", "each",
+                      "only", "your", "very", "just"}
+        words = [w.strip("?,.'\"!").lower() for w in question.split()
+                 if len(w.strip("?,.'\"!")) > 3 and w.strip("?,.'\"!").lower() not in stopwords]
+
+        if not words:
+            return ""
+
+        try:
+            async with self.neo4j.session() as session:
+                # Step 1: Find matching entities by fuzzy name matching
+                kw_conditions = " OR ".join(
+                    f"toLower(n.name) CONTAINS '{kw}'" for kw in words[:6]
+                )
+                find_query = f"""
+                    MATCH (n:{folder_label})
+                    WHERE ({kw_conditions}) AND n.name IS NOT NULL
+                    RETURN DISTINCT n.name AS name
+                    LIMIT 5
+                """
+                res = await session.run(find_query)
+                found = await res.data()
+
+                if not found:
+                    return ""
+
+                entity_names = [r["name"] for r in found]
+                logger.info(f"🎯 Focused scan: found entities {entity_names} from question keywords")
+
+                # Step 2: Exhaustive 4-hop neighborhood scan (undirected, no limit)
+                # This follows ALL relationship chains from the found entities
+                scan_query = f"""
+                    MATCH (root:{folder_label})
+                    WHERE root.name IN $names
+                    MATCH path = (root)-[*1..4]-(connected:{folder_label})
+                    WHERE connected.name IS NOT NULL AND connected <> root
+                    WITH root, connected,
+                         [r IN relationships(path) | type(r)] AS rel_chain,
+                         [nd IN nodes(path) | nd.name] AS node_chain,
+                         length(path) AS hops
+                    RETURN DISTINCT
+                        root.name AS from_entity,
+                        connected.name AS to_entity,
+                        connected.type AS to_type,
+                        rel_chain,
+                        node_chain,
+                        hops
+                    ORDER BY hops, from_entity, to_type
+                    LIMIT 300
+                """
+                res2 = await session.run(scan_query, names=entity_names)
+                paths = await res2.data()
+
+                if not paths:
+                    return ""
+
+                # Format as structured context
+                lines = [f"[FOCUSED ENTITY SCAN — Complete neighborhood for: {', '.join(entity_names)}]:"]
+                by_entity: dict = {}
+                for p in paths:
+                    root = p["from_entity"]
+                    chain_str = " → ".join(
+                        f"({p['node_chain'][i]})-[{p['rel_chain'][i]}]"
+                        for i in range(min(len(p['node_chain'])-1, len(p['rel_chain'])))
+                    ) + f" → ({p['to_entity']})"
+
+                    if root not in by_entity:
+                        by_entity[root] = []
+                    by_entity[root].append(f"    {chain_str}")
+
+                for entity, chains in by_entity.items():
+                    lines.append(f"  From '{entity}' ({len(chains)} paths):")
+                    # Show all unique paths
+                    unique_chains = list(dict.fromkeys(chains))  # deduplicate preserving order
+                    for c in unique_chains[:60]:
+                        lines.append(c)
+
+                logger.info(f"🎯 Focused scan: {len(paths)} paths from {len(entity_names)} entities")
+                return "\n".join(lines)
+
+        except Exception as e:
+            logger.warning(f"Focused entity scan failed: {e}")
+            return ""
+
+    # ────────────────────────────────────────────────────────────
+    #  Direct Type Enumeration (authoritative database counts)
+    # ────────────────────────────────────────────────────────────
+
+    async def _type_enumeration(self, folder_id: Optional[str]) -> str:
+        """
+        Provides authoritative, complete entity counts and names grouped by type.
+
+        This is the GROUND TRUTH source for questions like:
+        - "How many students?"    → exact count from database
+        - "List all courses"      → complete list, no approximation
+
+        Unlike semantic search (top-K limited) or multi-hop (direction-dependent),
+        this queries ALL nodes in the folder using the `type` property.
+        The result is always complete and accurate.
+        """
+        if not folder_id:
+            return ""
+
+        folder_label = f"F_{folder_id.replace('-', '_')}"
+
+        try:
+            async with self.neo4j.session() as session:
+                # Query ALL nodes grouped by type with counts and full name lists
+                query = f"""
+                    MATCH (n:{folder_label})
+                    WHERE n.name IS NOT NULL AND n.type IS NOT NULL
+                    WITH n.type AS entity_type, n.name AS name
+                    ORDER BY entity_type, name
+                    WITH entity_type, collect(DISTINCT name) AS names, count(DISTINCT name) AS total
+                    RETURN entity_type, total, names
+                    ORDER BY total DESC
+                """
+                result = await session.run(query)
+                data = await result.data()
+
+                if not data:
+                    return ""
+
+                # Format as clear, authoritative facts for the LLM
+                lines = ["[DATABASE FACTS — Authoritative entity counts from the graph database]:"]
+                total_entities = 0
+                for row in data:
+                    etype = row["entity_type"]
+                    count = row["total"]
+                    names = row["names"]
+                    total_entities += count
+                    # Show all names for types with ≤ 30 entities, truncate for larger types
+                    if count <= 30:
+                        names_str = ", ".join(names)
+                        lines.append(f"  {etype}: {count} total — [{names_str}]")
+                    else:
+                        sample = ", ".join(names[:20])
+                        lines.append(f"  {etype}: {count} total — [{sample}, ... and {count - 20} more]")
+
+                lines.append(f"  TOTAL ENTITIES IN FOLDER: {total_entities}")
+
+                logger.info(f"📋 Type Enumeration: {len(data)} types, {total_entities} entities")
+                return "\n".join(lines)
+
+        except Exception as e:
+            logger.warning(f"Type enumeration failed: {e}")
             return ""
 
     # ────────────────────────────────────────────────────────────
@@ -1144,20 +1385,60 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
             return ""
 
     # ────────────────────────────────────────────────────────────
-    #  GDS Dispatch
+    #  GDS Dispatch (full algorithm coverage)
     # ────────────────────────────────────────────────────────────
 
     def _dispatch_gds(self, algo: str, folder_id: Optional[str]):
         """Create the correct GDS task based on algorithm name."""
         fid = folder_id or "global"
         try:
-            if algo == "similarity":
+            # ── Centrality ──
+            if algo == "pagerank":
+                return self.gds_suite.get_pagerank_context(fid)
+            elif algo == "articlerank":
+                return self.gds_suite.get_articlerank_context(fid)
+            elif algo == "betweenness":
+                return self.gds_suite.get_betweenness_context(fid)
+            elif algo == "closeness":
+                return self.gds_suite.get_closeness_context(fid)
+            elif algo == "degree":
+                return self.gds_suite.get_degree_context(fid)
+            elif algo == "hits":
+                return self.gds_suite.get_hits_context(fid)
+            # ── Community Detection ──
+            elif algo == "louvain":
+                return self.gds_suite.get_louvain_context(fid)
+            elif algo == "leiden":
+                return self.gds_suite.get_leiden_context(fid)
+            elif algo == "wcc":
+                return self.gds_suite.get_wcc_context(fid)
+            elif algo == "kcore":
+                return self.gds_suite.get_kcore_context(fid)
+            elif algo == "triangle_count":
+                return self.gds_suite.get_triangle_count_context(fid)
+            # ── Similarity ──
+            elif algo == "similarity":
                 return self.gds_suite.get_similarity_context(fid)
+            # ── Link Prediction ──
+            elif algo == "link_prediction_common":
+                return self.gds_suite.get_link_prediction_common_context(fid)
+            elif algo == "link_prediction_adamic":
+                return self.gds_suite.get_link_prediction_adamic_context(fid)
+            elif algo == "link_prediction_resource":
+                return self.gds_suite.get_link_prediction_resource_context(fid)
+            # ── Topology ──
+            elif algo == "topological_sort":
+                return self.gds_suite.get_topological_sort_context(fid)
+            # ── Legacy fallback aliases ──
+            elif algo == "centrality":
+                return self.gds_suite.get_centrality_context(fid)
             elif algo == "community":
                 return self.gds_suite.get_community_context(fid)
             elif algo == "paths":
                 return self.gds_suite.get_path_context("", "", fid)
             else:
+                # Default fallback to ArticleRank centrality
+                logger.warning(f"Unknown GDS algo '{algo}' — falling back to centrality")
                 return self.gds_suite.get_centrality_context(fid)
         except Exception as e:
             logger.error(f"GDS dispatch failed: {e}")

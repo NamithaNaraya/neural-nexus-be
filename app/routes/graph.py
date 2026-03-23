@@ -15,6 +15,8 @@ from app.services.gds_service import get_gds_service, GDSService
 from app.db.connections import get_neo4j, get_postgres_session
 from app.core.config import settings
 from app.utils.graph_utils import get_node_type, get_node_name, clean_label
+from app.combined_chat.router import invalidate_rag_caches
+from app.services.ai_service import get_ai_service
 from sqlalchemy import text
 
 router = APIRouter()
@@ -896,6 +898,8 @@ async def create_node(
     Create a new node in Neo4j.
     
     Supports custom properties, styling (color, size), and folder/file association.
+    Also generates vector embedding and adds folder label so the node is
+    immediately visible to the RAG pipeline.
     """
     import uuid
     from datetime import datetime
@@ -934,7 +938,18 @@ async def create_node(
                 if key not in props:  # Don't overwrite core props
                     props[key] = value
         
-        # Create node
+        # ── Generate vector embedding so RAG vector search can find this node ──
+        try:
+            ai = get_ai_service()
+            embed_text = f"{request.name} {request.type} {request.description or ''}"
+            embedding = await ai.embed(embed_text)
+            props["embedding"] = embedding
+            logger.info(f"Generated embedding for new node: {request.name}")
+        except Exception as emb_err:
+            logger.warning(f"Failed to generate embedding for node {request.name}: {emb_err}")
+            # Continue without embedding — lexical search will still find it
+        
+        # Create node with Entity label
         query = """
         CREATE (n:Entity $props)
         RETURN n
@@ -942,9 +957,34 @@ async def create_node(
         
         result = await neo4j.execute_query(query, {"props": props})
         
-        # Invalidate cache
+        # ── Add folder-scoped labels matching the platform convention ──
+        # The managed_cypher_service labels nodes like:  :Entity:F_xxx:Student_F_xxx
+        # We must replicate this so LLM-generated Cypher using schema labels finds CRUD nodes.
+        if request.folder_id:
+            folder_label = f"F_{request.folder_id.replace('-', '_')}"
+            # Build the type-specific label (e.g. "Student" -> "Student_F_xxx")
+            safe_type = request.type.replace(" ", "_").replace("-", "_") if request.type else None
+            type_label = f"{safe_type}_{folder_label}" if safe_type else None
+            
+            # Compose SET clause with folder label + type label
+            set_labels = f"n:{folder_label}"
+            if type_label:
+                set_labels += f", n:{type_label}"
+            
+            label_query = f"""
+            MATCH (n:Entity {{id: $node_id}})
+            SET {set_labels}
+            """
+            try:
+                await neo4j.execute_query(label_query, {"node_id": node_id})
+                logger.info(f"Added labels [{folder_label}, {type_label or 'no-type'}] to node {node_id}")
+            except Exception as lbl_err:
+                logger.warning(f"Failed to add folder/type labels to node {node_id}: {lbl_err}")
+        
+        # Invalidate cache + GDS projections + RAG schema cache
         await cache.invalidate_all()
         await gds.invalidate_all()
+        invalidate_rag_caches()
         
         logger.info(f"Created node: {node_id} ({request.name})")
         
@@ -979,7 +1019,7 @@ async def update_node(
     
     try:
         # Look up the folder_id from the node to check permission
-        folder_query = "MATCH (n) WHERE n.id = $node_id RETURN n.folder_id as folder_id"
+        folder_query = "MATCH (n) WHERE n.id = $node_id RETURN n.folder_id as folder_id, n.name as current_name, n.type as current_type, n.description as current_desc"
         folder_result = await neo4j.execute_query(folder_query, {"node_id": node_id})
         if folder_result.records:
             fid = folder_result.records[0].get("folder_id")
@@ -1021,6 +1061,24 @@ async def update_node(
         if not set_clauses:
             return {"success": False, "error": "No fields to update"}
         
+        # ── Regenerate embedding if name or description changed ──
+        needs_reembed = request.name is not None or request.description is not None
+        if needs_reembed:
+            try:
+                ai = get_ai_service()
+                # Use new values if provided, else fall back to existing values
+                current = folder_result.records[0] if folder_result.records else {}
+                embed_name = request.name if request.name is not None else (current.get("current_name") or "")
+                embed_type = request.type if request.type is not None else (current.get("current_type") or "")
+                embed_desc = request.description if request.description is not None else (current.get("current_desc") or "")
+                embed_text = f"{embed_name} {embed_type} {embed_desc}"
+                embedding = await ai.embed(embed_text)
+                set_clauses.append("n.embedding = $embedding")
+                params["embedding"] = embedding
+                logger.info(f"Regenerated embedding for updated node: {node_id}")
+            except Exception as emb_err:
+                logger.warning(f"Failed to regenerate embedding for node {node_id}: {emb_err}")
+        
         query = f"""
         MATCH (n) WHERE n.id = $node_id
         SET {', '.join(set_clauses)}
@@ -1032,9 +1090,38 @@ async def update_node(
         if not result.records:
             raise HTTPException(status_code=404, detail="Node not found")
         
-        # Invalidate cache
+        # ── Update type label if type changed ──
+        # e.g. changing type "Student" → "Teacher" means: REMOVE n:Student_F_xxx, SET n:Teacher_F_xxx
+        if request.type is not None:
+            current = folder_result.records[0] if folder_result.records else {}
+            fid = current.get("folder_id")
+            old_type = current.get("current_type")
+            if fid:
+                folder_label = f"F_{fid.replace('-', '_')}"
+                new_safe_type = request.type.replace(" ", "_").replace("-", "_")
+                new_type_label = f"{new_safe_type}_{folder_label}"
+                try:
+                    # Remove old type label if it existed
+                    if old_type and old_type != request.type:
+                        old_safe_type = old_type.replace(" ", "_").replace("-", "_")
+                        old_type_label = f"{old_safe_type}_{folder_label}"
+                        await neo4j.execute_query(
+                            f"MATCH (n:Entity {{id: $node_id}}) REMOVE n:{old_type_label}",
+                            {"node_id": node_id}
+                        )
+                    # Add new type label
+                    await neo4j.execute_query(
+                        f"MATCH (n:Entity {{id: $node_id}}) SET n:{new_type_label}",
+                        {"node_id": node_id}
+                    )
+                    logger.info(f"Updated type label to {new_type_label} for node {node_id}")
+                except Exception as lbl_err:
+                    logger.warning(f"Failed to update type label for node {node_id}: {lbl_err}")
+        
+        # Invalidate cache + GDS projections + RAG schema cache
         await cache.invalidate_all()
         await gds.invalidate_all()
+        invalidate_rag_caches()
         
         logger.info(f"Updated node: {node_id}")
         
@@ -1083,9 +1170,10 @@ async def delete_node(
         
         result = await neo4j.execute_query(delete_query, {"node_id": node_id})
         
-        # Invalidate cache
+        # Invalidate cache + GDS projections + RAG schema cache
         await cache.invalidate_all()
         await gds.invalidate_all()
+        invalidate_rag_caches()
         
         logger.info(f"Deleted node: {node_id}")
         
@@ -1163,9 +1251,10 @@ async def create_relationship(
             "props": props,
         })
         
-        # Invalidate cache
+        # Invalidate cache + GDS projections + RAG schema cache
         await cache.invalidate_all()
         await gds.invalidate_all()
+        invalidate_rag_caches()
         
         if not result.records:
             raise HTTPException(status_code=404, detail="One or both nodes not found")
@@ -1213,9 +1302,10 @@ async def delete_relationship(
         
         result = await neo4j.execute_query(query, {"rel_id": relationship_id})
         
-        # Invalidate cache
+        # Invalidate cache + GDS projections + RAG schema cache
         await cache.invalidate_all()
         await gds.invalidate_all()
+        invalidate_rag_caches()
         
         deleted_count = result.records[0]["deleted"] if result.records else 0
         
@@ -1261,9 +1351,10 @@ async def update_relationship(
         if not success:
             raise HTTPException(status_code=404, detail="Relationship not found")
         
-        # Invalidate cache
+        # Invalidate cache + GDS projections + RAG schema cache
         await cache.invalidate_all()
         await gds.invalidate_all()
+        invalidate_rag_caches()
         
         return {
             "success": True,
@@ -1300,6 +1391,7 @@ async def rename_relationship_type(
         if count > 0:
             await cache.invalidate_all()
             await gds.invalidate_all()
+            invalidate_rag_caches()
         
         return {
             "success": True,
@@ -1473,9 +1565,10 @@ async def merge_nodes(
             "secondary_ids": request.secondary_ids
         })
 
-        # Invalidate cache
+        # Invalidate cache + GDS projections + RAG schema cache
         await cache.invalidate_all()
         await gds.invalidate_all()
+        invalidate_rag_caches()
 
         return {
             "success": True, 

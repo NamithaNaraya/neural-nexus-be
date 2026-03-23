@@ -13,6 +13,18 @@ def get_rag_service() -> CombinedRAGService:
         _rag_service = CombinedRAGService()
     return _rag_service
 
+
+def invalidate_rag_caches():
+    """
+    Invalidate the RAG service caches (schema, depth, etc.).
+    Called by CRUD routes after graph mutations so the very next
+    question sees the updated data.
+    """
+    global _rag_service
+    if _rag_service is not None:
+        _rag_service.invalidate_schema_cache()
+
+
 class ChatRequest(BaseModel):
     question: str
     folder_id: Optional[str] = None
