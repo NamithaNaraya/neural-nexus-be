@@ -60,5 +60,11 @@ async def stream_combined_answer(
             history=request.history,
             user_id=user_id
         ),
-        media_type="text/event-stream"
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked",
+        }
     )

@@ -25,11 +25,20 @@ class ErrorHandlingMiddleware(BaseHTTPMiddleware):
     
     Catches all unhandled exceptions and returns
     a consistent JSON error response.
+    NOTE: BaseHTTPMiddleware buffers the ENTIRE response body.
+    Streaming endpoints MUST be skipped to prevent SSE buffering.
     """
+    
+    # Endpoints that use StreamingResponse — must not be buffered
+    STREAMING_PATHS = ["/stream-answer", "/sse/"]
     
     async def dispatch(
         self, request: Request, call_next: Callable
     ) -> Response:
+        # Skip streaming endpoints — BaseHTTPMiddleware buffers the entire body!
+        if any(p in request.url.path for p in self.STREAMING_PATHS):
+            return await call_next(request)
+        
         try:
             response = await call_next(request)
             return response
@@ -61,11 +70,20 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     Request logging middleware.
     
     Logs all incoming requests with timing information.
+    NOTE: BaseHTTPMiddleware buffers the ENTIRE response body.
+    Streaming endpoints MUST be skipped to prevent SSE buffering.
     """
+    
+    # Endpoints that use StreamingResponse — must not be buffered
+    STREAMING_PATHS = ["/stream-answer", "/sse/"]
     
     async def dispatch(
         self, request: Request, call_next: Callable
     ) -> Response:
+        # Skip streaming endpoints — BaseHTTPMiddleware buffers the entire body!
+        if any(p in request.url.path for p in self.STREAMING_PATHS):
+            return await call_next(request)
+        
         # Start timer
         start_time = time.time()
         

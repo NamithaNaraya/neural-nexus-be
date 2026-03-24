@@ -35,13 +35,13 @@ _FASTRP_TIMEOUT = 6
 # Orchestration (LLM intent) timeout (seconds)
 _ORCH_TIMEOUT = 10
 # Overall retrieval phase timeout
-_RETRIEVAL_TIMEOUT = 25
+_RETRIEVAL_TIMEOUT = 12
 # Multi-hop traversal timeout
-_MULTIHOP_TIMEOUT = 12
+_MULTIHOP_TIMEOUT = 8
 # Query expansion timeout
-_EXPANSION_TIMEOUT = 6
+_EXPANSION_TIMEOUT = 4
 # Semantic node resolution timeout
-_SEMANTIC_RESOLVE_TIMEOUT = 10
+_SEMANTIC_RESOLVE_TIMEOUT = 8
 
 
 class CombinedRAGService:
@@ -274,12 +274,12 @@ class CombinedRAGService:
         # ── Step 3: Synthesize ─────────────────────────────────
         yield json.dumps({"type": "step", "id": 3, "status": "Synthesizing research results..."}) + "\n"
 
-        full_answer = ""
-        prompt = self._build_answer_prompt(question, context, folder_id)
-
-        async for chunk in self.gemini.astream_response(prompt, combined_history):
-            full_answer += chunk
-            yield json.dumps({"type": "content", "data": chunk}) + "\n"
+        # Using non-streaming generation for the consolidated answer
+        full_answer = await self.gemini.generate_response(
+            self._build_answer_prompt(question, context, folder_id),
+            combined_history
+        )
+        yield json.dumps({"type": "content", "data": full_answer}) + "\n"
 
         # ── Step 4: Finalize ───────────────────────────────────
         logger.info(f"✅ Research completed for user {user_id}")
@@ -301,19 +301,26 @@ class CombinedRAGService:
         history: Optional[List[Dict[str, str]]] = None,
         user_id: str = "anonymous",
     ) -> Dict[str, Any]:
-        """Non-streaming wrapper for backward compatibility."""
+        """Non-streaming: collects stream_answer into a single JSON response."""
         full_answer = ""
         intent = {}
+        algorithm = None
+        results = None
         async for chunk_raw in self.stream_answer(question, folder_id, file_id, history, user_id):
             chunk = json.loads(chunk_raw.strip())
             if chunk["type"] == "content":
                 full_answer += chunk["data"]
             elif chunk["type"] == "intent":
                 intent = chunk["data"]
+            elif chunk["type"] == "gds_results":
+                algorithm = chunk["data"].get("algorithm")
+                results = chunk["data"].get("results")
 
         return {
             "answer": full_answer,
             "intent": intent,
+            "algorithm": algorithm,
+            "results": results,
             "context_summary": f"Retrieved from folder {folder_id or 'global'}.",
         }
 
@@ -371,16 +378,46 @@ Short paragraphs, **bold** key terms. Max 4-5 sentences total.
 Opening sentence → table with comparison columns → 1-2 sentence takeaway.
 
 ─── PATTERN E: Algorithm / graph analysis ───
-Opening sentence → ranked table or list → 2-sentence interpretation of what the algorithm found.
+Opening sentence → ranked table with score column → summary that DIRECTLY answers the user's question.
+If the CONTEXT contains GDS/algorithm results (look for sections labeled "Graph Algorithm" or "GDS"), you MUST follow this structure:
+
+STEP 1 — State the algorithm:
+Open with ONE sentence identifying which algorithm was used and what it mathematically measures. Use this reference:
+  - PageRank → measures global importance via link quality (score = probability of being visited)
+  - ArticleRank → improved PageRank for diverse degree distributions (score = adjusted importance)
+  - Betweenness Centrality → measures how often a node lies on shortest paths (score = fraction of shortest paths passing through)
+  - Closeness Centrality → measures how close a node is to all others (score = inverse of average distance)
+  - Degree Centrality → counts direct connections (score = fraction of possible connections)
+  - HITS → identifies hubs (link to many) and authorities (linked by many) (hub_score + auth_score)
+  - Louvain / Leiden → community detection (community_id = cluster assignment)
+  - WCC → weakly connected components (component_id = component assignment)
+  - K-Core → stable densely-connected core (coreness = minimum degree within core)
+  - Triangle Count → local clustering density (triangles = count of triangles through node)
+  - Node Similarity → shared connectivity patterns (similarity = Jaccard coefficient 0-1)
+  - Link Prediction → predicts missing connections (score = likelihood of future link)
+  - Topological Sort → linear ordering of nodes (position = order rank)
+
+STEP 2 — Ranked table:
+Present the results in a Markdown table with THESE EXACT columns:
+  | Rank | Name | Type | [Algorithm Score Column] |
+The score column name MUST match the algorithm used (e.g., "PageRank Score", "Betweenness Score", "Closeness Score", "Community ID", "Similarity Score", "Triangles", "Coreness").
+- Round decimal scores to 4-6 decimal places.
+- Include ALL results from the context, not just top 3.
+
+STEP 3 — Answer the question:
+Write 2-3 sentences that DIRECTLY answer the user's original question using the algorithm results.
+- Name the #1 result explicitly and explain WHY it ranked highest.
+- If there is a pattern (e.g., all top nodes are the same type, scores drop off sharply), mention it.
+- Connect the finding to the user's question — don't just describe the algorithm generically.
 
 TABLE RULES:
-- Include ALL data columns you have evidence for — never omit relevant columns.
+- NEVER omit the score column — it is the mathematical evidence that supports your answer.
 - Column headers should be short and clear.
 - Always wrap the table with an opening sentence AND a closing summary.
 
 AFTER-TABLE SUMMARY RULES:
 - 2-3 sentences max.
-- Mention the count (e.g. "4 phytochemicals were identified"), the most notable finding, and any pattern.
+- Directly answer the user's question first, then mention any notable pattern.
 - Write in plain English — no jargon, no bullet points in the summary.
 
 HONESTY: If context is truly incomplete for a specific sub-question, say it in one sentence only."""
@@ -515,25 +552,38 @@ SOP:
    Example: MATCH (n:{folder_label}) WHERE (n:Student_{folder_label} OR toLower(n.type) = 'student') RETURN count(n)
    This is CRITICAL because some nodes use labels while others use the `type` property.
 
-GDS ALGORITHM SELECTION — set `use_gds: true` and pick the right `gds_algo` when the question fits:
+GDS ALGORITHM SELECTION — set `use_gds: true` and pick the right `gds_algo` ONLY when the question genuinely needs graph-algorithmic analysis:
+
+INTELLIGENT GDS DECISION GUIDE:
+- DO NOT use GDS for simple lookups, listings, counting, or direct relationship queries. These are handled perfectly by Cypher alone.
+  Examples that do NOT need GDS: "How many students?", "List all herbs", "What is X connected to?", "What are the properties of Y?"
+- DO use GDS when the question requires mathematical graph analysis that Cypher alone cannot provide accurately:
+  • Ranking by structural importance (not just counting connections — PageRank considers the quality of connections, not just quantity)
+  • Finding hidden communities or clusters that are not obvious from labels
+  • Measuring similarity between nodes based on neighborhood overlap
+  • Finding bridges/bottlenecks in the network
+  • Predicting missing connections
+  Examples that NEED GDS: "Which is the most important hub?", "Find natural clusters", "What nodes are structurally similar?", "Which node is the biggest bottleneck?", "Rank all herbs by influence"
+- GDS and Cypher are NOT mutually exclusive. You can set BOTH `use_cypher: true` AND `use_gds: true` when the question benefits from both direct data AND algorithmic analysis.
+- Be ACCURATE: only trigger GDS when the algorithm genuinely adds insight the Cypher query cannot.
 
 — CENTRALITY (Who/What is most important?) —
-• "pagerank": Influence, importance, popularity, "best", "most central", ranking.
+• "pagerank": Influence, importance, popularity, "best", "most central", ranking, "most important".
 • "articlerank": Like PageRank but better for diverse graphs. "Most authoritative".
 • "betweenness": Bridges, bottlenecks, connecting groups, flow control.
 • "closeness": Reachability, "closest to all others", central access point.
-• "degree": Most connections, "most active", "most linked".
+• "degree": Most connections, "most active", "most linked", "most connected", "hub".
 • "hits": Hubs vs authorities. "Which are hubs" vs "which are authorities".
 
 — COMMUNITY DETECTION (How is the data grouped?) —
-• "louvain": Communities, clusters, groups, "who belongs together".
+• "louvain": Communities, clusters, groups, "who belongs together", "natural cluster".
 • "leiden": Same as louvain but higher quality. "Better clustering".
 • "wcc": Islands, disconnected parts, "isolated groups".
 • "kcore": Core structure, "tight-knit core", inner circle vs periphery.
 • "triangle_count": Local density, "tight clusters", "tightly-knit groups".
 
 — SIMILARITY —
-• "similarity": "What is similar to X", "which nodes share neighbors", Jaccard.
+• "similarity": "What is similar to X", "which nodes share neighbors", "most similar", Jaccard.
 
 — LINK PREDICTION (What connections are missing?) —
 • "link_prediction_common": Predict missing links by shared neighbors.
