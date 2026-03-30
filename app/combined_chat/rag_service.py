@@ -271,6 +271,12 @@ class CombinedRAGService:
 
         logger.info(f"🧪 Context Fusion | Sources: {len(fused)} | Size: {len(context)} chars")
 
+        # ── Web Search Suggestion ──────────────────────────────
+        # Always allow web search, but flag it strongly when context is thin
+        suggest_web_search = True  # always available
+        thin_context = len(context.strip()) < 50
+        yield json.dumps({"type": "web_search_suggestion", "data": suggest_web_search, "emphasized": thin_context}) + "\n"
+
         # ── Step 3: Synthesize ─────────────────────────────────
         yield json.dumps({"type": "step", "id": 3, "status": "Synthesizing research results..."}) + "\n"
 
@@ -306,6 +312,8 @@ class CombinedRAGService:
         intent = {}
         algorithm = None
         results = None
+        suggest_web_search = True
+        web_search_emphasized = False
         async for chunk_raw in self.stream_answer(question, folder_id, file_id, history, user_id):
             chunk = json.loads(chunk_raw.strip())
             if chunk["type"] == "content":
@@ -315,12 +323,17 @@ class CombinedRAGService:
             elif chunk["type"] == "gds_results":
                 algorithm = chunk["data"].get("algorithm")
                 results = chunk["data"].get("results")
+            elif chunk["type"] == "web_search_suggestion":
+                suggest_web_search = chunk.get("data", True)
+                web_search_emphasized = chunk.get("emphasized", False)
 
         return {
             "answer": full_answer,
             "intent": intent,
             "algorithm": algorithm,
             "results": results,
+            "suggest_web_search": suggest_web_search,
+            "web_search_emphasized": web_search_emphasized,
             "context_summary": f"Retrieved from folder {folder_id or 'global'}.",
         }
 
