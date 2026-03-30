@@ -112,7 +112,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     
     Limits requests per IP per minute.
     Uses in-memory storage (use Redis for production).
+    NOTE: BaseHTTPMiddleware buffers the ENTIRE response body.
+    Streaming endpoints MUST be skipped to prevent SSE buffering.
     """
+    
+    # Endpoints that use StreamingResponse — must not be buffered
+    STREAMING_PATHS = ["/stream-answer", "/sse/"]
     
     def __init__(self, app, requests_per_minute: int = 100):
         super().__init__(app)
@@ -122,6 +127,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     async def dispatch(
         self, request: Request, call_next: Callable
     ) -> Response:
+        # Skip streaming endpoints — BaseHTTPMiddleware buffers the entire body!
+        if any(p in request.url.path for p in self.STREAMING_PATHS):
+            return await call_next(request)
+        
         # Get client IP
         client_ip = request.client.host if request.client else "unknown"
         

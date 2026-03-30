@@ -13,6 +13,18 @@ class GeminiService:
             temperature=0.1,
             convert_system_message_to_human=True
         )
+        # Native google-genai client for true streaming
+        self._native_client = None
+
+    def _get_native_client(self):
+        """Lazy-init native google-genai client."""
+        if self._native_client is None:
+            try:
+                from google import genai
+                self._native_client = genai.Client(api_key=settings.GOOGLE_API_KEY)
+            except Exception as e:
+                logger.warning(f"Could not init native genai client: {e}")
+        return self._native_client
 
     async def generate_response(self, prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
         """Simple wrapper for text generation."""
@@ -33,7 +45,93 @@ class GeminiService:
             return f"Error: {str(e)}"
 
     async def astream_response(self, prompt: str, history: Optional[List[Dict[str, str]]] = None):
-        """Streaming version of generate_response."""
+        """
+        True streaming using native google-genai SDK.
+        Disables thinking to get immediate token-by-token output.
+        Falls back to LangChain astream if native fails.
+        """
+        client = self._get_native_client()
+        if client:
+            try:
+                import asyncio
+                from google.genai import types
+
+                # Build conversation with history
+                contents = []
+                if history:
+                    for m in history:
+                        role = "user" if m["role"] == "user" else "model"
+                        contents.append(types.Content(
+                            role=role,
+                            parts=[types.Part.from_text(text=m["content"])]
+                        ))
+                contents.append(types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=prompt)]
+                ))
+
+                # Use gemini-2.5-flash with thinking DISABLED:
+                # - Quality answers (2.0-flash dumps raw JSON)
+                # - Fast synthesis (~1.4s vs 14.8s with thinking)
+                # - Only 5 large chunks → we split into words below
+                synthesis_model = settings.GEMINI_MODEL or "gemini-2.5-flash"
+
+                config = types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    temperature=0.1,
+                )
+
+                import queue
+                import threading
+
+                chunk_queue = queue.Queue()
+                done_event = threading.Event()
+                error_holder = [None]
+
+                def _stream_worker():
+                    try:
+                        for chunk in client.models.generate_content_stream(
+                            model=synthesis_model,
+                            contents=contents,
+                            config=config,
+                        ):
+                            if chunk.text:
+                                # Split large chunks into ~8-word sub-chunks
+                                # for smooth word-by-word streaming
+                                words = chunk.text.split(' ')
+                                sub_chunk = []
+                                for w in words:
+                                    sub_chunk.append(w)
+                                    if len(sub_chunk) >= 8:
+                                        chunk_queue.put(' '.join(sub_chunk) + ' ')
+                                        sub_chunk = []
+                                if sub_chunk:
+                                    chunk_queue.put(' '.join(sub_chunk))
+                    except Exception as e:
+                        error_holder[0] = e
+                    finally:
+                        done_event.set()
+
+                thread = threading.Thread(target=_stream_worker, daemon=True)
+                thread.start()
+
+                while not done_event.is_set() or not chunk_queue.empty():
+                    try:
+                        text = chunk_queue.get(timeout=0.05)
+                        yield text
+                    except queue.Empty:
+                        await asyncio.sleep(0.02)
+
+                if error_holder[0]:
+                    logger.error(f"Native streaming error: {error_holder[0]}")
+                    yield f"\n[Error]: {error_holder[0]}"
+
+                return  # Success — don't fall through to LangChain
+
+            except Exception as e:
+                logger.warning(f"Native streaming failed, falling back to LangChain: {e}")
+
+        # Fallback: LangChain astream
         try:
             from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
             messages = []

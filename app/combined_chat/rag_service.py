@@ -29,19 +29,21 @@ import time
 logger = logging.getLogger(__name__)
 
 # Cypher execution hard timeout (seconds)
-_CYPHER_TIMEOUT = 12
+_CYPHER_TIMEOUT = 6
 # FastRP structural search timeout (seconds)
-_FASTRP_TIMEOUT = 6
+_FASTRP_TIMEOUT = 4
 # Orchestration (LLM intent) timeout (seconds)
-_ORCH_TIMEOUT = 10
+_ORCH_TIMEOUT = 6
 # Overall retrieval phase timeout
-_RETRIEVAL_TIMEOUT = 12
+_RETRIEVAL_TIMEOUT = 7
 # Multi-hop traversal timeout
-_MULTIHOP_TIMEOUT = 8
+_MULTIHOP_TIMEOUT = 5
 # Query expansion timeout
-_EXPANSION_TIMEOUT = 4
+_EXPANSION_TIMEOUT = 3
 # Semantic node resolution timeout
-_SEMANTIC_RESOLVE_TIMEOUT = 8
+_SEMANTIC_RESOLVE_TIMEOUT = 5
+# Maximum context chars sent to synthesis LLM
+_MAX_CONTEXT_CHARS = 20000
 
 
 class CombinedRAGService:
@@ -80,7 +82,8 @@ class CombinedRAGService:
         history: Optional[List[Dict[str, str]]] = None,
         user_id: str = "anonymous",
     ):
-        """Streaming Orchestrator with strict folder isolation."""
+        """Streaming Orchestrator with strict folder isolation and massive parallelization."""
+        t_start = time.time()
 
         logger.info(f"🚀 Research starting for folder {folder_id or 'global'} | Question: {question}")
         yield json.dumps({"type": "step", "id": 1, "status": "Analyzing research intent..."}) + "\n"
@@ -114,37 +117,89 @@ class CombinedRAGService:
             yield json.dumps({"type": "step", "id": 4, "status": "Done"}) + "\n"
             return
 
-        # ── Step 0.5: Query Expansion (LLM expands user terms) ─
-        # e.g. user says "stress" → LLM expands to ["stress physiological", ...]
-        expanded_terms = []
-        try:
-            expanded_terms = await asyncio.wait_for(
+        # Determine fallback dynamic depth
+        fallback_depth = await self._get_dynamic_depth(folder_id, question)
+
+        # ══════════════════════════════════════════════════════════
+        #  MASSIVE PARALLEL LAUNCH: Fire EVERYTHING at once
+        #  - Query expansion (LLM)      → runs in parallel
+        #  - Schema fetch (cached)       → runs in parallel
+        #  - All 7 retrieval branches    → start immediately with raw question
+        #    (don't wait for expansion — we'll re-search with expanded terms if ready)
+        # ══════════════════════════════════════════════════════════
+
+        # LLM tasks (fire and forget — will be awaited later)
+        expansion_task = asyncio.create_task(
+            asyncio.wait_for(
                 self._expand_query(question, folder_id),
                 timeout=_EXPANSION_TIMEOUT
             )
+        )
+        schema_task = asyncio.create_task(self._get_schema())
+
+        # Retrieval branches that DON'T need expansion or orchestration
+        # (start immediately with raw question for speed)
+        vector_task = asyncio.create_task(
+            self.vector_engine.vector_search(question, folder_id)
+        )
+        fastrp_task = asyncio.create_task(
+            asyncio.wait_for(
+                self.fastrp_engine.structural_search(question, folder_id),
+                timeout=_FASTRP_TIMEOUT
+            )
+        )
+        multihop_task = asyncio.create_task(
+            asyncio.wait_for(
+                self._multihop_traversal(question, folder_id),
+                timeout=_MULTIHOP_TIMEOUT
+            )
+        )
+        type_enum_task = asyncio.create_task(
+            asyncio.wait_for(
+                self._type_enumeration(folder_id),
+                timeout=5
+            )
+        )
+        entity_scan_task = asyncio.create_task(
+            asyncio.wait_for(
+                self._focused_entity_scan(question, folder_id),
+                timeout=6
+            )
+        )
+
+        # ── Wait for expansion + schema (needed for orchestration + expansion-dependent branches) ──
+        expanded_terms = []
+        try:
+            expanded_terms = await expansion_task
         except asyncio.TimeoutError:
             logger.warning("⏱️ Query expansion timed out")
         except Exception as e:
             logger.warning(f"Query expansion failed: {e}")
 
-        # Determine fallback dynamic depth if LLM fails
-        fallback_depth = await self._get_dynamic_depth(folder_id, question)
-
-        # Build expanded question for searches that benefit from it
         expanded_question = question
         if expanded_terms:
             logger.info(f"🔎 Query Expansion: {expanded_terms}")
             expanded_question = question + " " + " ".join(expanded_terms)
 
-        # ── Step 1: Schema + Intent + Vector + FastRP (all fully parallel) ─
-        schema_task  = asyncio.create_task(self._get_schema())
-        vector_task  = asyncio.create_task(self.vector_engine.vector_search(expanded_question, folder_id))
-        fastrp_task  = asyncio.create_task(
-            asyncio.wait_for(self.fastrp_engine.structural_search(expanded_question, folder_id), timeout=_FASTRP_TIMEOUT)
+        schema = await schema_task
+        t_phase1 = time.time()
+        logger.info(f"⏱️ Phase 1 (expansion+schema): {t_phase1 - t_start:.2f}s")
+
+        # Launch expansion-dependent branches NOW (they run in parallel with already-running branches)
+        property_task = asyncio.create_task(
+            asyncio.wait_for(
+                self._property_search(question, folder_id, expanded_terms, fallback_depth),
+                timeout=6
+            )
+        )
+        semantic_resolve_task = asyncio.create_task(
+            asyncio.wait_for(
+                self._semantic_node_resolution(question, folder_id, expanded_terms, fallback_depth),
+                timeout=_SEMANTIC_RESOLVE_TIMEOUT
+            )
         )
 
-        schema = await schema_task
-
+        # ── Orchestration (in parallel with retrieval) ──────────
         orchestration_task = asyncio.create_task(
             asyncio.wait_for(
                 self._orchestrate_retrieval(question, schema, folder_id or "global", combined_history),
@@ -152,85 +207,23 @@ class CombinedRAGService:
             )
         )
 
-        try:
-            intent = await orchestration_task
-        except asyncio.TimeoutError:
-            logger.warning("⏱️ Orchestration timed out — using vector-only fallback")
-            intent = {"use_cypher": False, "cypher_query": None, "use_gds": False, "gds_algo": None, "research_strategy": "Timeout Fallback"}
-        except Exception as e:
-            logger.error(f"Orchestration error: {e}")
-            intent = {"use_cypher": False, "cypher_query": None, "use_gds": False, "gds_algo": None, "research_strategy": "Fallback"}
-        logger.info(f"🧠 Research Intent: {intent.get('research_strategy', 'Standard')}")
-        if intent.get("cypher_query"):
-            logger.info(f"🔗 Generated Cypher: {intent['cypher_query']}")
-
-        # Read the AI-determined search depth, fallback to regex/default 6
-        req_depth = intent.get("search_depth")
-        if isinstance(req_depth, int) and req_depth > 0:
-            max_depth = min(req_depth, 20)  # cap at 20 hops for safety
-        else:
-            max_depth = fallback_depth
-            
-        logger.info(f"📏 AI-determined chain depth for folder {folder_id}: {max_depth} hops")
-
-        yield json.dumps({"type": "intent", "data": intent}) + "\n"
-
-        # ── Step 2: Retrieval (all parallel branches) ──────────
-        logger.info(f"🔍 Retrieval Phase | Vector=True, FastRP=True, MultiHop=True, Cypher={intent.get('use_cypher')}, GDS={intent.get('use_gds')}")
         yield json.dumps({"type": "step", "id": 2, "status": "Searching the knowledge graph..."}) + "\n"
 
+        # ── Gather ONLY the 7 retrieval branches (no orchestration!) ────
+        # Orchestration runs in background — we check it AFTER retrieval finishes
         named_tasks: List[tuple] = [
             ("Semantic Search", vector_task),
             ("Structural Search (FastRP)", fastrp_task),
-            # Always run multi-hop graph traversal
-            ("Multi-hop Graph Traversal", asyncio.create_task(
-                asyncio.wait_for(self._multihop_traversal(question, folder_id), timeout=_MULTIHOP_TIMEOUT)
-            )),
-            # Property-aware search — now enhanced with LLM-expanded terms
-            ("Property Search", asyncio.create_task(
-                asyncio.wait_for(self._property_search(question, folder_id, expanded_terms, max_depth), timeout=8)
-            )),
-            # Semantic Node Resolution — uses vector similarity to find closest
-            # matching nodes, then traverses their full neighborhood dynamically
-            ("Semantic Node Resolution", asyncio.create_task(
-                asyncio.wait_for(
-                    self._semantic_node_resolution(question, folder_id, expanded_terms, max_depth),
-                    timeout=_SEMANTIC_RESOLVE_TIMEOUT
-                )
-            )),
-            # Direct type enumeration — authoritative counts & complete lists
-            # This is the GROUND TRUTH source for "how many X" and "list all X" questions.
-            # Unlike semantic search (top-K limited), this queries the ENTIRE database.
-            ("Database Facts", asyncio.create_task(
-                asyncio.wait_for(
-                    self._type_enumeration(folder_id),
-                    timeout=5
-                )
-            )),
-            # Focused Entity Scan — exhaustive neighborhood for entities mentioned in the question
-            # Ensures ALL connections (e.g., Tamarind → ALL plant parts → ALL phytoconstituents)
-            ("Focused Entity Scan", asyncio.create_task(
-                asyncio.wait_for(
-                    self._focused_entity_scan(question, folder_id),
-                    timeout=8
-                )
-            )),
+            ("Multi-hop Graph Traversal", multihop_task),
+            ("Property Search", property_task),
+            ("Semantic Node Resolution", semantic_resolve_task),
+            ("Database Facts", type_enum_task),
+            ("Focused Entity Scan", entity_scan_task),
         ]
 
-        # Cypher
-        if intent.get("use_cypher") and intent.get("cypher_query"):
-            named_tasks.append(("Graph Traversal", self._execute_cypher_safe(intent["cypher_query"], folder_id, file_id)))
-
-        # GDS
-        if intent.get("use_gds"):
-            algo = intent.get("gds_algo", "centrality")
-            gds_task = self._dispatch_gds(algo, folder_id)
-            if gds_task:
-                named_tasks.append((f"Graph Algorithm ({algo})", gds_task))
-
-        # Gather all retrieval outputs with global timeout
-        names  = [t[0] for t in named_tasks]
-        tasks  = [t[1] for t in named_tasks]
+        # Gather retrieval only — orchestration does NOT block this!
+        names = [t[0] for t in named_tasks]
+        tasks = [t[1] for t in named_tasks]
         try:
             raw_outputs = await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True),
@@ -240,8 +233,73 @@ class CombinedRAGService:
             logger.warning(f"⏱️ Global retrieval timeout ({_RETRIEVAL_TIMEOUT}s) — using partial results")
             raw_outputs = [asyncio.TimeoutError()] * len(tasks)
 
+        # ── Check if orchestration finished while retrieval was running ──
+        # Give it 1 more second grace if it's still running
+        if not orchestration_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(orchestration_task), timeout=1.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
+        if orchestration_task.done() and not orchestration_task.cancelled():
+            try:
+                orch_result = orchestration_task.result()
+                intent = orch_result if isinstance(orch_result, dict) else {"use_cypher": False, "cypher_query": None, "use_gds": False, "gds_algo": None, "research_strategy": "Fallback"}
+            except Exception as e:
+                logger.warning(f"⏱️ Orchestration failed: {e}")
+                intent = {"use_cypher": False, "cypher_query": None, "use_gds": False, "gds_algo": None, "research_strategy": "Timeout Fallback"}
+        else:
+            logger.info("⏱️ Orchestration still running — skipping Cypher/GDS to save time")
+            orchestration_task.cancel()
+            intent = {"use_cypher": False, "cypher_query": None, "use_gds": False, "gds_algo": None, "research_strategy": "Fast Fallback"}
+
+        logger.info(f"🧠 Research Intent: {intent.get('research_strategy', 'Standard')}")
+        if intent.get("cypher_query"):
+            logger.info(f"🔗 Generated Cypher: {intent['cypher_query']}")
+
+        # Read the AI-determined search depth
+        req_depth = intent.get("search_depth")
+        if isinstance(req_depth, int) and req_depth > 0:
+            max_depth = min(req_depth, 20)
+        else:
+            max_depth = fallback_depth
+
+        logger.info(f"📏 AI-determined chain depth for folder {folder_id}: {max_depth} hops")
+        yield json.dumps({"type": "intent", "data": intent}) + "\n"
+
+        # ── Quick second pass: Cypher/GDS (only if orchestration succeeded) ──
+        algo = None
+        extra_tasks: List[tuple] = []
+        if intent.get("use_cypher") and intent.get("cypher_query"):
+            extra_tasks.append(("Graph Traversal", asyncio.create_task(
+                self._execute_cypher_safe(intent["cypher_query"], folder_id, file_id)
+            )))
+        if intent.get("use_gds"):
+            algo = intent.get("gds_algo", "centrality")
+            gds_coro = self._dispatch_gds(algo, folder_id)
+            if gds_coro:
+                extra_tasks.append((f"Graph Algorithm ({algo})", asyncio.create_task(gds_coro)))
+
+        extra_names = []
+        extra_outputs = []
+        if extra_tasks:
+            extra_names = [t[0] for t in extra_tasks]
+            extra_task_list = [t[1] for t in extra_tasks]
+            try:
+                extra_outputs = await asyncio.wait_for(
+                    asyncio.gather(*extra_task_list, return_exceptions=True),
+                    timeout=4  # tight timeout for cypher/gds
+                )
+            except asyncio.TimeoutError:
+                logger.warning("⏱️ Cypher/GDS second pass timed out")
+                extra_outputs = [asyncio.TimeoutError()] * len(extra_task_list)
+
+        t_retrieval = time.time()
+        logger.info(f"⏱️ Phase 2 (retrieval): {t_retrieval - t_phase1:.2f}s")
+
         # ── Fuse with labels (compact serialization) ──────────
         fused = []
+        # Process main retrieval results
         for name, result in zip(names, raw_outputs):
             if isinstance(result, (Exception, type(None))):
                 if isinstance(result, Exception):
@@ -250,10 +308,26 @@ class CombinedRAGService:
             if not result:
                 continue
             if isinstance(result, list):
-                # Compact serialization — no indent, limit items
                 res_str = json.dumps(result[:30], default=str)
                 if name.startswith("Graph Algorithm"):
-                    current_algo = algo if "algo" in dir() else "analytics"
+                    current_algo = algo if algo else "analytics"
+                    yield json.dumps({"type": "gds_results", "data": {"algorithm": current_algo, "results": result}}) + "\n"
+            else:
+                res_str = str(result)
+            fused.append(f"=== {name} ===\n{res_str}")
+
+        # Process extra (Cypher/GDS) results
+        for name, result in zip(extra_names, extra_outputs):
+            if isinstance(result, (Exception, type(None))):
+                if isinstance(result, Exception):
+                    logger.warning(f"Extra source '{name}' raised: {result}")
+                continue
+            if not result:
+                continue
+            if isinstance(result, list):
+                res_str = json.dumps(result[:30], default=str)
+                if name.startswith("Graph Algorithm"):
+                    current_algo = algo if algo else "analytics"
                     yield json.dumps({"type": "gds_results", "data": {"algorithm": current_algo, "results": result}}) + "\n"
             else:
                 res_str = str(result)
@@ -269,23 +343,52 @@ class CombinedRAGService:
                 fused.append(f"=== Folder Overview ===\n{safety_ctx}")
                 context = "\n\n".join(fused)
 
+        # ── Cap context to prevent slow synthesis (source-aware) ──
+        if len(context) > _MAX_CONTEXT_CHARS:
+            logger.info(f"✂️ Trimming context from {len(context)} to {_MAX_CONTEXT_CHARS} chars")
+            # Proportional trimming: give each source a fair share
+            budget_per_source = _MAX_CONTEXT_CHARS // max(len(fused), 1)
+            trimmed_fused = []
+            for f in fused:
+                if len(f) > budget_per_source:
+                    trimmed_fused.append(f[:budget_per_source] + "\n[...truncated]")
+                else:
+                    trimmed_fused.append(f)
+            context = "\n\n".join(trimmed_fused)
+            # Final safety cap
+            if len(context) > _MAX_CONTEXT_CHARS:
+                context = context[:_MAX_CONTEXT_CHARS]
+
         logger.info(f"🧪 Context Fusion | Sources: {len(fused)} | Size: {len(context)} chars")
 
         # ── Web Search Suggestion ──────────────────────────────
-        # Always allow web search, but flag it strongly when context is thin
-        suggest_web_search = True  # always available
+        suggest_web_search = True
         thin_context = len(context.strip()) < 50
         yield json.dumps({"type": "web_search_suggestion", "data": suggest_web_search, "emphasized": thin_context}) + "\n"
 
-        # ── Step 3: Synthesize ─────────────────────────────────
+        # ── Step 3: Synthesize (STREAMING token-by-token) ──────
         yield json.dumps({"type": "step", "id": 3, "status": "Synthesizing research results..."}) + "\n"
 
-        # Using non-streaming generation for the consolidated answer
-        full_answer = await self.gemini.generate_response(
+        # Flush padding: small JSON chunks (<100 bytes) get buffered by TCP/proxy.
+        # Adding space padding forces the buffer to flush each chunk immediately.
+        _FLUSH_PAD = " " * 256
+
+        full_answer = ""
+        chunk_count = 0
+        async for chunk in self.gemini.astream_response(
             self._build_answer_prompt(question, context, folder_id),
             combined_history
-        )
-        yield json.dumps({"type": "content", "data": full_answer}) + "\n"
+        ):
+            if chunk:
+                full_answer += chunk
+                chunk_count += 1
+                yield json.dumps({"type": "content", "data": chunk}) + _FLUSH_PAD + "\n"
+        
+        logger.info(f"📝 Streamed {chunk_count} content chunks")
+
+        t_synth = time.time()
+        logger.info(f"⏱️ Phase 3 (synthesis): {t_synth - t_retrieval:.2f}s")
+        logger.info(f"⏱️ TOTAL: {t_synth - t_start:.2f}s")
 
         # ── Step 4: Finalize ───────────────────────────────────
         logger.info(f"✅ Research completed for user {user_id}")
@@ -731,7 +834,7 @@ JSON OUTPUT:
                         b.name AS target1,
                         type(r2) AS rel2,
                         c.name AS target2
-                    LIMIT 150
+                    LIMIT 80
                 """
 
                 # ── Query 2: 3-hop path sample (richer chains) ──
@@ -1274,8 +1377,9 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
 
         # Build conditions: match on node name OR any property value
         # Support multi-word expanded terms (e.g. "stress physiological")
+        # Escape single quotes to prevent Cypher injection/syntax errors
         kw_conditions = " OR ".join(
-            f"toLower(n.name) CONTAINS '{kw}'"
+            f"toLower(n.name) CONTAINS '{kw.replace(chr(39), chr(92)+chr(39))}'"
             for kw in keywords[:10]  # increased cap for expanded terms
         )
 
