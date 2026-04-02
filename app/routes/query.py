@@ -187,6 +187,37 @@ async def get_chat_history(
         }
 
 
+@router.get("/query/chat/v2/sessions")
+async def list_chat_sessions_v2(
+    current_user: dict = Depends(get_current_user),
+) -> List[Dict[str, Any]]:
+    """
+    List all chat sessions for the current user with metadata for V2.
+    Uses an optimized query to get the last message and timestamp for each session.
+    """
+    async with get_postgres_session() as session:
+        # Optimized window function approach for clean distinct sessions with latest message
+        result = await session.execute(
+            text("""
+                WITH latest_messages AS (
+                    SELECT 
+                        session_id, 
+                        message as last_message, 
+                        timestamp as last_activity,
+                        ROW_NUMBER() OVER(PARTITION BY session_id ORDER BY timestamp DESC) as rn
+                    FROM neural_nexus.chat_history
+                    WHERE user_id = :user_id
+                )
+                SELECT session_id, last_message, last_activity
+                FROM latest_messages
+                WHERE rn = 1
+                ORDER BY last_activity DESC
+            """),
+            {"user_id": current_user['id']}
+        )
+        return [dict(r) for r in result.mappings().all()]
+
+
 @router.get("/query/chat/sessions")
 async def list_chat_sessions(
     current_user: dict = Depends(get_current_user),

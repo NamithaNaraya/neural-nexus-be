@@ -100,7 +100,7 @@ def upgrade() -> None:
         sa.Column('message', sa.Text(), nullable=False),
         sa.Column('citations', postgresql.JSONB(), nullable=True),
         sa.Column('timestamp', sa.DateTime(), server_default=sa.text('now()')),
-        sa.CheckConstraint("role IN ('user', 'assistant')", name='valid_chat_role'),
+        sa.CheckConstraint("role IN ('user', 'assistant', 'web_search')", name='valid_chat_role'),
         schema=SCHEMA_NAME,
     )
     op.create_index('idx_chat_session', 'chat_history', ['session_id', 'timestamp'], schema=SCHEMA_NAME)

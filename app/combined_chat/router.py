@@ -101,6 +101,7 @@ async def web_search(
             import json
             from sqlalchemy import text as sa_text
             from app.db.connections import get_postgres_session
+            import logging
 
             user_id = current_user.get("id") or current_user.get("sub")
             db_session_id = request.session_id
@@ -109,24 +110,81 @@ async def web_search(
             except (ValueError, TypeError):
                 db_session_id = str(uuid.uuid5(uuid.NAMESPACE_OID, db_session_id))
 
-            # Encode sources as JSON for the citations column
-            sources_json = json.dumps(
-                result.get("grounding_metadata", {}).get("grounding_chunks", []) if result.get("grounding_metadata") else []
+            # Persist sources as a real JSON array so history reload can parse them
+            # consistently across frontend versions.
+            sources = (
+                result.get("grounding_metadata", {}).get("grounding_chunks", [])
+                if result.get("grounding_metadata")
+                else []
+            )
+            sources_json = json.dumps(sources)
+            web_attachment_json = json.dumps(
+                {
+                    "answer": result.get("answer", ""),
+                    "sources": sources,
+                }
             )
 
             async with get_postgres_session() as session:
-                await session.execute(
-                    sa_text("""
-                        INSERT INTO neural_nexus.chat_history (user_id, session_id, role, message, citations)
-                        VALUES (:user_id, :session_id, 'web_search', :message, :citations)
-                    """),
-                    {
-                        "user_id": user_id,
-                        "session_id": db_session_id,
-                        "message": result.get("answer", ""),
-                        "citations": sources_json,
-                    }
-                )
+                try:
+                    await session.execute(
+                        sa_text("""
+                            INSERT INTO neural_nexus.chat_history (user_id, session_id, role, message, citations)
+                            VALUES (:user_id, :session_id, 'web_search', :message, CAST(:citations AS JSONB))
+                        """),
+                        {
+                            "user_id": user_id,
+                            "session_id": db_session_id,
+                            "message": result.get("answer", ""),
+                            "citations": sources_json,
+                        }
+                    )
+                except Exception as insert_error:
+                    logging.getLogger(__name__).warning(
+                        f"Falling back to assistant-row web search persistence: {insert_error}"
+                    )
+                    updated = await session.execute(
+                        sa_text("""
+                            UPDATE neural_nexus.chat_history
+                            SET citations = jsonb_set(
+                                CASE
+                                    WHEN citations IS NULL THEN '{}'::jsonb
+                                    WHEN jsonb_typeof(citations) = 'object' THEN citations
+                                    ELSE jsonb_build_object('rag_citations', citations)
+                                END,
+                                '{web_search_attachment}',
+                                CAST(:web_attachment AS JSONB),
+                                true
+                            )
+                            WHERE id = (
+                                SELECT id
+                                FROM neural_nexus.chat_history
+                                WHERE user_id = :user_id
+                                  AND session_id = :session_id
+                                  AND role = 'assistant'
+                                ORDER BY timestamp DESC
+                                LIMIT 1
+                            )
+                        """),
+                        {
+                            "user_id": user_id,
+                            "session_id": db_session_id,
+                            "web_attachment": web_attachment_json,
+                        }
+                    )
+
+                    if updated.rowcount == 0:
+                        await session.execute(
+                            sa_text("""
+                                INSERT INTO neural_nexus.chat_history (user_id, session_id, role, message, citations)
+                                VALUES (:user_id, :session_id, 'assistant', '', CAST(:citations AS JSONB))
+                            """),
+                            {
+                                "user_id": user_id,
+                                "session_id": db_session_id,
+                                "citations": json.dumps({"web_search_attachment": json.loads(web_attachment_json)}),
+                            }
+                        )
                 await session.commit()
         except Exception as e:
             import logging

@@ -385,7 +385,7 @@ class ChatHistory(Base):
     __table_args__ = (
         Index("idx_chat_session", "session_id", "timestamp"),
         Index("idx_chat_user", "user_id"),
-        CheckConstraint("role IN ('user', 'assistant')", name="valid_chat_role"),
+        CheckConstraint("role IN ('user', 'assistant', 'web_search')", name="valid_chat_role"),
     )
 
 
