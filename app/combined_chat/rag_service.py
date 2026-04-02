@@ -25,6 +25,7 @@ from app.db.connections import get_neo4j_driver, get_redis_client
 from app.core.config import settings
 import json
 import time
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,7 @@ class CombinedRAGService:
         file_id: Optional[str] = None,
         history: Optional[List[Dict[str, str]]] = None,
         user_id: str = "anonymous",
+        session_id: Optional[str] = None,
     ):
         """Streaming Orchestrator with strict folder isolation and massive parallelization."""
         t_start = time.time()
@@ -400,7 +402,39 @@ class CombinedRAGService:
             await self.redis.ltrim(history_key, -20, -1)
             await self.redis.expire(history_key, 86400)
         except Exception as e:
-            logger.warning(f"Failed to save history: {e}")
+            logger.warning(f"Failed to save history to Redis: {e}")
+
+        # ── Save to PostgreSQL for persistent cross-session history ──
+        try:
+            from sqlalchemy import text as sa_text
+            from app.db.connections import get_postgres_session
+
+            # Convert frontend session_id to a valid UUID
+            db_session_id = session_id or str(uuid.uuid4())
+            try:
+                db_session_id = str(uuid.UUID(db_session_id))
+            except (ValueError, TypeError):
+                db_session_id = str(uuid.uuid5(uuid.NAMESPACE_OID, db_session_id))
+
+            async with get_postgres_session() as session:
+                await session.execute(
+                    sa_text("""
+                        INSERT INTO neural_nexus.chat_history (user_id, session_id, role, message)
+                        VALUES (:user_id, :session_id, 'user', :message)
+                    """),
+                    {"user_id": user_id, "session_id": db_session_id, "message": question}
+                )
+                await session.execute(
+                    sa_text("""
+                        INSERT INTO neural_nexus.chat_history (user_id, session_id, role, message)
+                        VALUES (:user_id, :session_id, 'assistant', :message)
+                    """),
+                    {"user_id": user_id, "session_id": db_session_id, "message": full_answer}
+                )
+                await session.commit()
+            logger.info(f"💾 Saved chat to PostgreSQL (session: {db_session_id})")
+        except Exception as e:
+            logger.warning(f"Failed to save chat history to PostgreSQL: {e}")
 
     async def answer(
         self,
