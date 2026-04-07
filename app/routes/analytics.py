@@ -29,6 +29,7 @@ from app.algorithms import (
     TopicClustering,
 )
 from app.services.gds_service import get_gds_service, GDSService
+from app.services.cache_service import get_cache_service, CacheService
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -45,6 +46,21 @@ def _name_col(alias: str) -> str:
 
 def _type_col(alias: str) -> str:
     return f"coalesce({alias}.type, labels({alias})[0])"
+
+
+def _normalize_list(values: Optional[List[str]]) -> List[str]:
+    return sorted(values) if values else []
+
+
+def _analytics_cache_key(name: str, **params: Any) -> str:
+    normalized = {}
+    for key, value in params.items():
+        if isinstance(value, list):
+            normalized[key] = sorted(value)
+        else:
+            normalized[key] = value
+    payload = json.dumps(normalized, sort_keys=True, default=str)
+    return f"{name}:{payload}"
 
 
 # === Algorithm Availability ===
@@ -99,8 +115,14 @@ async def run_pagerank(
     weight_formula: Optional[str] = Query(default=None, description="JSON weight formula"),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Run PageRank algorithm using Neo4j GDS for accurate centrality scores."""
+    cache_key = _analytics_cache_key("pagerank", folder_id=folder_id, node_ids=_normalize_list(node_ids), top_k=top_k, damping_factor=damping_factor, max_iterations=max_iterations, weight_formula=weight_formula)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     wf = json.loads(weight_formula) if weight_formula else None
     graph_name = await gds.ensure_projection(folder_id, node_ids, weight_formula=wf)
@@ -130,7 +152,7 @@ async def run_pagerank(
             else:
                 insight = "No significant influence hubs were identified in the current selection."
             
-            return {
+            payload = {
                 "algorithm": "pagerank",
                 "engine": "gds.pageRank.stream",
                 "folder_id": folder_id,
@@ -138,6 +160,8 @@ async def run_pagerank(
                 "results": records,
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         logger.error(f"GDS PageRank error: {e}")
         raise HTTPException(status_code=500, detail=f"PageRank failed: {str(e)}")
@@ -152,8 +176,14 @@ async def run_betweenness(
     weight_formula: Optional[str] = Query(default=None, description="JSON weight formula"),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Run Betweenness Centrality using Neo4j GDS to find critical bridge nodes."""
+    cache_key = _analytics_cache_key("betweenness", folder_id=folder_id, node_ids=_normalize_list(node_ids), top_k=top_k, sampling_size=sampling_size, weight_formula=weight_formula)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     wf = json.loads(weight_formula) if weight_formula else None
     graph_name = await gds.ensure_projection(folder_id, node_ids, weight_formula=wf)
@@ -197,7 +227,7 @@ async def run_betweenness(
             else:
                 insight = "No clear bridge entities were detected."
             
-            return {
+            payload = {
                 "algorithm": "betweenness",
                 "engine": "gds.betweenness.stream",
                 "folder_id": folder_id,
@@ -205,6 +235,8 @@ async def run_betweenness(
                 "results": records,
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         logger.error(f"GDS Betweenness error: {e}")
         raise HTTPException(status_code=500, detail=f"Betweenness failed: {str(e)}")
@@ -219,8 +251,14 @@ async def run_closeness(
     weight_formula: Optional[str] = Query(default=None, description="JSON weight formula"),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Run Closeness Centrality using Neo4j GDS to find nodes closest to all others."""
+    cache_key = _analytics_cache_key("closeness", folder_id=folder_id, node_ids=_normalize_list(node_ids), top_k=top_k, use_wasserman_faust=use_wasserman_faust, weight_formula=weight_formula)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     wf = json.loads(weight_formula) if weight_formula else None
     graph_name = await gds.ensure_projection(folder_id, node_ids, weight_formula=wf)
@@ -247,7 +285,7 @@ async def run_closeness(
             else:
                 insight = "Could not identify a central focus point in this specific dataset fragment."
             
-            return {
+            payload = {
                 "algorithm": "closeness",
                 "engine": "gds.closeness.stream",
                 "folder_id": folder_id,
@@ -255,6 +293,8 @@ async def run_closeness(
                 "results": records,
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         logger.error(f"GDS Closeness error: {e}")
         raise HTTPException(status_code=500, detail=f"Closeness failed: {str(e)}")
@@ -270,8 +310,14 @@ async def run_articlerank(
     weight_formula: Optional[str] = Query(default=None, description="JSON weight formula"),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Run ArticleRank (influence variant for diverse degree distributions)."""
+    cache_key = _analytics_cache_key("articlerank", folder_id=folder_id, node_ids=_normalize_list(node_ids), damping_factor=damping_factor, max_iterations=max_iterations, top_k=top_k, weight_formula=weight_formula)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     wf = json.loads(weight_formula) if weight_formula else None
     graph_name = await gds.ensure_projection(folder_id, node_ids, weight_formula=wf)
@@ -293,7 +339,7 @@ async def run_articlerank(
             records = await result.data()
             insight = f"ArticleRank identified '{records[0]['name']}' as the primary authority." if records else "No results."
             
-            return {
+            payload = {
                 "algorithm": "articlerank",
                 "engine": "gds.articleRank.stream",
                 "folder_id": folder_id,
@@ -301,6 +347,8 @@ async def run_articlerank(
                 "results": records,
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         logger.error(f"GDS ArticleRank error: {e}")
         raise HTTPException(status_code=500, detail=f"ArticleRank failed: {str(e)}")
@@ -314,8 +362,14 @@ async def run_degree_centrality(
     weight_formula: Optional[str] = Query(default=None, description="JSON weight formula"),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Run Degree Centrality to find the most directly connected nodes."""
+    cache_key = _analytics_cache_key("degree", folder_id=folder_id, node_ids=_normalize_list(node_ids), top_k=top_k, weight_formula=weight_formula)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     wf = json.loads(weight_formula) if weight_formula else None
     graph_name = await gds.ensure_projection(folder_id, node_ids, weight_formula=wf)
@@ -339,7 +393,7 @@ async def run_degree_centrality(
             else:
                 insight = "No degree data found."
             
-            return {
+            payload = {
                 "algorithm": "degree",
                 "engine": "gds.degree.stream",
                 "folder_id": folder_id,
@@ -347,6 +401,8 @@ async def run_degree_centrality(
                 "results": records,
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         logger.error(f"GDS Degree error: {e}")
         raise HTTPException(status_code=500, detail=f"Degree failed: {str(e)}")
@@ -360,8 +416,14 @@ async def run_hits_gds(
     weight_formula: Optional[str] = Query(default=None, description="JSON weight formula"),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Run HITS (Hubs and Authorities) algorithm using Neo4j GDS."""
+    cache_key = _analytics_cache_key("hits", folder_id=folder_id, node_ids=_normalize_list(node_ids), max_iterations=max_iterations, top_k=top_k, weight_formula=weight_formula)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     wf = json.loads(weight_formula) if weight_formula else None
     graph_name = await gds.ensure_projection(folder_id, node_ids, weight_formula=wf)
@@ -386,7 +448,7 @@ async def run_hits_gds(
             else:
                 insight = "No clear hubs or authorities found."
             
-            return {
+            payload = {
                 "algorithm": "hits",
                 "engine": "gds.hits.stream",
                 "folder_id": folder_id,
@@ -394,6 +456,8 @@ async def run_hits_gds(
                 "results": records,
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         logger.error(f"GDS HITS error: {e}")
         raise HTTPException(status_code=500, detail=f"HITS failed: {str(e)}")
@@ -407,8 +471,14 @@ async def run_louvain(
     include_intermediate: bool = Query(default=False),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Run Louvain community detection using Neo4j GDS."""
+    cache_key = _analytics_cache_key("louvain", folder_id=folder_id, node_ids=_normalize_list(node_ids), include_intermediate=include_intermediate)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
     
@@ -452,7 +522,7 @@ async def run_louvain(
             
             insight = f"The engine successfully mapped {len(communities)} distinct thematic clusters. The largest group represents a dense hub of {community_sizes[0][1]} related entities working in unison." if communities else "No distinct community structures were identified in this selection."
             
-            return {
+            payload = {
                 "algorithm": "louvain",
                 "engine": "gds.louvain.stream",
                 "folder_id": folder_id,
@@ -462,6 +532,8 @@ async def run_louvain(
                 "results": records[:50],  # Limit for response size
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         logger.error(f"GDS Louvain error: {e}")
         raise HTTPException(status_code=500, detail=f"Louvain failed: {str(e)}")
@@ -474,8 +546,14 @@ async def run_leiden(
     gamma: float = Query(default=1.0, ge=0.1, le=10.0, description="Resolution parameter"),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Run Leiden community detection (improved Louvain) using Neo4j GDS."""
+    cache_key = _analytics_cache_key("leiden", folder_id=folder_id, node_ids=_normalize_list(node_ids), gamma=gamma)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
     
@@ -514,7 +592,7 @@ async def run_leiden(
             
             insight = f"Leiden found {len(communities)} communities with gamma={gamma}." if communities else "No communities found."
             
-            return {
+            payload = {
                 "algorithm": "leiden",
                 "engine": "gds.leiden.stream",
                 "folder_id": folder_id,
@@ -524,11 +602,13 @@ async def run_leiden(
                 "results": records[:50],
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         error_msg = str(e).lower()
         logger.error(f"GDS Leiden error: {e}")
         if "undirected" in error_msg or "orientation" in error_msg or "not found" in error_msg or "weight" in error_msg:
-            return {
+            payload = {
                 "algorithm": "leiden",
                 "engine": "gds.leiden.stream",
                 "folder_id": folder_id,
@@ -537,6 +617,8 @@ async def run_leiden(
                 "community_count": 0,
                 "insight": "Leiden could not run on this dataset. The graph may not have enough relationships or the right structure for community detection. Try Louvain instead.",
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
         raise HTTPException(status_code=500, detail=f"Leiden failed: {str(e)}")
 
 
@@ -546,8 +628,14 @@ async def run_wcc_gds(
     node_ids: Optional[List[str]] = Query(default=None),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Run Weakly Connected Components (WCC) to identify disconnected islands."""
+    cache_key = _analytics_cache_key("wcc", folder_id=folder_id, node_ids=_normalize_list(node_ids))
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
     
@@ -603,7 +691,7 @@ async def run_wcc_gds(
                 insight = (f"Found {len(sorted_comps)} disconnected islands. The main cluster has {len(giant_nodes)} nodes. "
                           f"There are {len(islands)} isolated islands (total {island_node_count} nodes), including: {names_str}.")
             
-            return {
+            payload = {
                 "algorithm": "wcc",
                 "engine": "gds.wcc.stream",
                 "folder_id": folder_id,
@@ -612,6 +700,8 @@ async def run_wcc_gds(
                 "results": records[:50],
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         logger.error(f"GDS WCC error: {e}")
         raise HTTPException(status_code=500, detail=f"WCC failed: {str(e)}")
@@ -624,8 +714,14 @@ async def run_kcore_gds(
     k: int = Query(default=3, ge=1),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Run K-Core decomposition to find the stable core of the graph."""
+    cache_key = _analytics_cache_key("kcore", folder_id=folder_id, node_ids=_normalize_list(node_ids), k=k)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
     
@@ -654,7 +750,7 @@ async def run_kcore_gds(
             
             insight = f"{len(records)} nodes belong to the {k}-core (the most stable, highly-connected center of the graph)." if records else f"No nodes found in the {k}-core."
             
-            return {
+            payload = {
                 "algorithm": "kcore",
                 "engine": "gds.kcore.stream",
                 "folder_id": folder_id,
@@ -662,17 +758,21 @@ async def run_kcore_gds(
                 "results": records,
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         error_msg = str(e).lower()
         logger.error(f"GDS K-Core error: {e}")
         if "undirected" in error_msg or "orientation" in error_msg:
-            return {
+            payload = {
                 "algorithm": "kcore",
                 "engine": "gds.kcore.stream",
                 "folder_id": folder_id,
                 "results": [],
                 "insight": "K-Core requires undirected relationships. Your graph might be directed or have a structure that doesn't support core decomposition yet.",
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
         raise HTTPException(status_code=500, detail=f"K-Core failed: {str(e)}")
 
 
@@ -682,8 +782,14 @@ async def run_triangle_count_gds(
     node_ids: Optional[List[str]] = Query(default=None),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Run Triangle Counting to measure local group density."""
+    cache_key = _analytics_cache_key("triangle_count", folder_id=folder_id, node_ids=_normalize_list(node_ids))
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
     
@@ -714,24 +820,28 @@ async def run_triangle_count_gds(
             
             insight = f"Found {total_triangles} structural triangles. Entities with high triangle counts are part of very tight-knit, collaborative groups."
             
-            return {
+            payload = {
                 "algorithm": "triangle_count",
                 "engine": "gds.triangleCount.stream",
                 "folder_id": folder_id,
                 "results": records,
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         error_msg = str(e).lower()
         logger.error(f"GDS Triangle Count error: {e}")
         if "undirected" in error_msg or "orientation" in error_msg:
-            return {
+            payload = {
                 "algorithm": "triangle_count",
                 "engine": "gds.triangleCount.stream",
                 "folder_id": folder_id,
                 "results": [],
                 "insight": "Triangle Count requires undirected relationships. Your current data may not have the right structure for this algorithm. Try adding more interconnected entities.",
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
         raise HTTPException(status_code=500, detail=f"Triangle count failed: {str(e)}")
 
 
@@ -744,8 +854,14 @@ async def run_node_similarity(
     similarity_cutoff: float = Query(default=0.1, ge=0.0, le=1.0),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Find similar node pairs using GDS Node Similarity (Jaccard)."""
+    cache_key = _analytics_cache_key("node_similarity", folder_id=folder_id, node_ids=_normalize_list(node_ids), top_k=top_k, similarity_cutoff=similarity_cutoff)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
     
@@ -783,7 +899,7 @@ async def run_node_similarity(
             else:
                 insight = "No similar node pairs found above the cutoff."
             
-            return {
+            payload = {
                 "algorithm": "node_similarity",
                 "engine": "gds.nodeSimilarity.stream",
                 "folder_id": folder_id,
@@ -791,6 +907,8 @@ async def run_node_similarity(
                 "results": records,
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         logger.error(f"GDS Node Similarity error: {e}")
         raise HTTPException(status_code=500, detail=f"Node Similarity failed: {str(e)}")
@@ -821,15 +939,20 @@ async def find_shortest_path(
     node_ids: Optional[List[str]] = Query(default=None),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Find shortest path between two nodes using GDS Dijkstra."""
-    driver = get_neo4j_driver()
-    # Ensure source and target are in the node_ids list for the projection
     projection_ids = list(node_ids) if node_ids else None
     if projection_ids is not None:
         if source_id not in projection_ids: projection_ids.append(source_id)
         if target_id not in projection_ids: projection_ids.append(target_id)
 
+    cache_key = _analytics_cache_key("shortest_path", folder_id=folder_id, node_ids=_normalize_list(projection_ids), source_id=source_id, target_id=target_id)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
+    driver = get_neo4j_driver()
     graph_name = await gds.ensure_projection(folder_id, projection_ids)
     
     try:
@@ -876,7 +999,7 @@ async def find_shortest_path(
                 length = 0
                 insight = "No path exists between these nodes."
             
-            return {
+            payload = {
                 "algorithm": "shortest_path",
                 "engine": "gds.shortestPath.dijkstra.stream",
                 "source_id": source_id,
@@ -887,18 +1010,22 @@ async def find_shortest_path(
                 "path_length": length,
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except HTTPException:
         raise
     except Exception as e:
         error_msg = str(e).lower()
         logger.error(f"GDS Shortest Path error: {e}")
         if "not found" in error_msg or "projection" in error_msg or "in-memory" in error_msg or "not exist" in error_msg:
-            return {
+            payload = {
                 "algorithm": "shortest_path",
                 "engine": "gds.shortestPath.dijkstra.stream",
                 "results": [],
                 "insight": "Could not find a path. One or both nodes might not be present in the current view or folder."
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
         raise HTTPException(status_code=500, detail=f"Shortest path failed: {str(e)}")
 
 
@@ -910,8 +1037,14 @@ async def run_traversal(
     node_ids: Optional[List[str]] = Query(default=None),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Run BFS or DFS traversal from a source node."""
+    cache_key = _analytics_cache_key("traversal", folder_id=folder_id, node_ids=_normalize_list(node_ids), source_id=source_id, method=method)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     # BFS/DFS often work best on undirected graphs to find all conceptual neighbors
     graph_name = await gds.ensure_projection(folder_id, node_ids, undirected=True)
@@ -929,24 +1062,28 @@ async def run_traversal(
             else:
                 records = await gds.run_dfs(source_id, folder_id, node_ids)
 
-            return {
+            payload = {
                 "algorithm": method,
                 "engine": f"gds.{proc}.stream",
                 "source_id": source_id,
                 "results": records,
                 "insight": f"{method.upper()} traversal explored {len(records)} nodes starting from '{source_id}'."
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         error_msg = str(e).lower()
         logger.error(f"GDS Traversal error: {e}")
         if "not found" in error_msg or "projection" in error_msg:
-            return {
+            payload = {
                 "algorithm": method,
                 "engine": f"gds.{method}.stream",
                 "source_id": source_id,
                 "results": [],
                 "insight": f"Could not start {method.upper()} traversal. The starting node might not be present in the current view or folder."
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
         raise HTTPException(status_code=500, detail=f"Traversal failed: {str(e)}")
 
 
@@ -959,14 +1096,19 @@ async def run_random_walk(
     node_ids: Optional[List[str]] = Query(default=None),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Simulate random walks from a source node."""
-    driver = get_neo4j_driver()
-    # Ensure source node is in the node_ids list for the projection
     projection_ids = list(node_ids) if node_ids else None
     if projection_ids is not None and source_id not in projection_ids:
         projection_ids.append(source_id)
 
+    cache_key = _analytics_cache_key("random_walk", folder_id=folder_id, node_ids=_normalize_list(projection_ids), source_id=source_id, walk_length=walk_length, walk_count=walk_count)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
+    driver = get_neo4j_driver()
     graph_name = await gds.ensure_projection(folder_id, projection_ids)
     
     try:
@@ -978,22 +1120,26 @@ async def run_random_walk(
             
             records = await gds.run_random_walk(source_id, folder_id, projection_ids, walk_length, walk_count)
             
-            return {
+            payload = {
                 "algorithm": "random_walk",
                 "engine": "gds.randomWalk.stream",
                 "results": records,
                 "insight": f"Completed {walk_count} random walks of length {walk_length}."
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         error_msg = str(e).lower()
         logger.error(f"GDS Random Walk error: {e}")
         if "not found" in error_msg or "projection" in error_msg or "in-memory" in error_msg or "not exist" in error_msg:
-            return {
+            payload = {
                 "algorithm": "random_walk",
                 "engine": "gds.randomWalk.stream",
                 "results": [],
                 "insight": "Could not start random walk. The starting node might not be present in the current view or folder."
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
         raise HTTPException(status_code=500, detail=f"Random walk failed: {str(e)}")
 
 
@@ -1003,8 +1149,14 @@ async def run_topological_sort(
     node_ids: Optional[List[str]] = Query(default=None),
     current_user: dict = Depends(get_current_user),
     gds: GDSService = Depends(get_gds_service),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Sequence nodes in a Directed Acyclic Graph (DAG)."""
+    cache_key = _analytics_cache_key("topological_sort", folder_id=folder_id, node_ids=_normalize_list(node_ids))
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     # Note: Topological sort requires directed relationships, so we use undirected=False (default)
     graph_name = await gds.ensure_projection(folder_id, node_ids)
@@ -1029,13 +1181,15 @@ async def run_topological_sort(
             """, **params)
             
             records = await result.data()
-            return {
+            payload = {
                 "algorithm": "topological_sort",
                 "engine": "gds.dag.topologicalSort.stream",
                 "folder_id": folder_id,
                 "results": records,
                 "insight": f"Topological sort successful for {len(records)} nodes. This defines a valid logical sequence."
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         logger.error(f"GDS TopoSort error: {e}")
         raise HTTPException(status_code=500, detail="Topological sort failed. Ensure your graph is a DAG (Directed Acyclic Graph).")
@@ -1055,8 +1209,14 @@ async def run_link_prediction_gds(
     ]),
     top_k: int = Query(default=20, le=100),
     current_user: dict = Depends(get_current_user),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Predict missing links using Cypher-based link prediction algorithms."""
+    cache_key = _analytics_cache_key("link_prediction", folder_id=folder_id, method=method, top_k=top_k)
+    cached = await cache.get_cached_analytics(cache_key)
+    if cached:
+        return cached
+
     driver = get_neo4j_driver()
     
     try:
@@ -1174,7 +1334,7 @@ async def run_link_prediction_gds(
             else:
                 insight = "No new link predictions above threshold."
             
-            return {
+            payload = {
                 "algorithm": "link_prediction",
                 "engine": f"cypher.linkPrediction.{method}",
                 "folder_id": folder_id,
@@ -1182,6 +1342,8 @@ async def run_link_prediction_gds(
                 "results": records,
                 "insight": insight,
             }
+            await cache.set_cached_analytics(cache_key, payload)
+            return payload
     except Exception as e:
         logger.error(f"GDS Link Prediction error: {e}")
         raise HTTPException(status_code=500, detail=f"Link prediction failed: {str(e)}")
