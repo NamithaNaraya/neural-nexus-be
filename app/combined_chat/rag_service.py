@@ -21,6 +21,7 @@ from app.combined_chat.gemini_service import GeminiService
 from app.combined_chat.embedding_service import EmbeddingService
 from app.combined_chat.fastrp_service import FastRPService
 from app.combined_chat.gds_service import GDSCombinedService
+from app.combined_chat.web_search_service import get_web_search_service
 from app.db.connections import get_neo4j_driver, get_redis_client
 from app.core.config import settings
 import json
@@ -83,6 +84,7 @@ class CombinedRAGService:
         history: Optional[List[Dict[str, str]]] = None,
         user_id: str = "anonymous",
         session_id: Optional[str] = None,
+        web_search: bool = False,
     ):
         """Streaming Orchestrator with strict folder isolation and massive parallelization."""
         t_start = time.time()
@@ -168,6 +170,13 @@ class CombinedRAGService:
                 timeout=6
             )
         )
+
+        web_search_task = None
+        if web_search:
+            logger.info("🌐 Integrated Web Search enabled")
+            web_search_task = asyncio.create_task(
+                get_web_search_service().search(question)
+            )
 
         # ── Wait for expansion + schema (needed for orchestration + expansion-dependent branches) ──
         expanded_terms = []
@@ -365,6 +374,25 @@ class CombinedRAGService:
 
         # ── Web Search Suggestion ──────────────────────────────
         suggest_web_search = True
+        if web_search and web_search_task:
+            try:
+                web_result = await web_search_task
+                if web_result and not web_result.get("error"):
+                    yield json.dumps({
+                        "type": "web_search_result",
+                        "data": {
+                            "answer": web_result.get("answer", ""),
+                            "sources": (
+                                web_result.get("grounding_metadata", {}).get("grounding_chunks", [])
+                                if web_result.get("grounding_metadata")
+                                else []
+                            )
+                        }
+                    }) + "\n"
+                    suggest_web_search = False # Already performed
+            except Exception as e:
+                logger.warning(f"🌐 Integrated Web Search failed: {e}")
+
         thin_context = len(context.strip()) < 50
         yield json.dumps({"type": "web_search_suggestion", "data": suggest_web_search, "emphasized": thin_context}) + "\n"
 

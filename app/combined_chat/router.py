@@ -31,6 +31,7 @@ class ChatRequest(BaseModel):
     folder_id: Optional[str] = None
     session_id: Optional[str] = None
     history: Optional[List[Dict[str, str]]] = []
+    web_search: bool = False
 
 
 class WebSearchRequest(BaseModel):
@@ -68,6 +69,7 @@ async def stream_combined_answer(
             history=request.history,
             user_id=user_id,
             session_id=request.session_id,
+            web_search=request.web_search,
         ),
         media_type="text/event-stream",
         headers={

@@ -1,34 +1,77 @@
-import requests
-import json
-import time
-from jose import jwt
-from datetime import datetime, timedelta
+"""
+Quick test: hit the stream-answer endpoint with web_search=true
+and print each chunk type as it arrives.
+"""
+import requests, json, sys
 
-def test_stream():
-    url = "http://127.0.0.1:8000/api/v1/combined-chat/stream-answer"
-    payload = {
-        "question": "What is Neuroprotective agents?",
-        "folder_id": "a92d748e-d903-4b29-ac91-fb0e0e59ba72",
+BASE = "http://localhost:8000"
+
+# 1. Login to get token
+login_resp = requests.post(f"{BASE}/api/v1/auth/login", json={
+    "username": "admin",
+    "password": "admin"
+})
+
+if login_resp.status_code != 200:
+    print(f"Login failed {login_resp.status_code}: {login_resp.text[:200]}")
+    # Try without auth
+    token = None
+else:
+    token = login_resp.json().get("access_token") or login_resp.json().get("token")
+
+headers = {"Content-Type": "application/json"}
+if token:
+    headers["Authorization"] = f"Bearer {token}"
+
+# 2. Stream answer with web_search=true
+print("\\n=== Sending stream-answer with web_search=true ===")
+resp = requests.post(
+    f"{BASE}/api/v1/combined-chat/stream-answer",
+    json={
+        "question": "What is neural nexus?",
+        "web_search": True,
         "history": []
-    }
-    
-    # Generate token
-    SECRET_KEY = "jwt-secret-key-change-in-production"  # Match standard local secret or pass from env
-    to_encode = {"sub": "dfb89684-072e-4d31-93ee-712122a566f8", "email": "test@test.com", "role": "user"}
-    to_encode.update({"exp": datetime.utcnow() + timedelta(minutes=60)})
-    token = jwt.encode(to_encode, SECRET_KEY, algorithm="HS256")
-    
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    
-    print("Sending POST request to stream endpoint...")
-    start = time.time()
-    try:
-        with requests.post(url, json=payload, headers=headers, stream=True) as r:
-            for line in r.iter_lines():
-                if line:
-                    print(f"[{time.time() - start:.2f}s] {line.decode('utf-8')}")
-    except Exception as e:
-        print("Error:", e)
+    },
+    headers=headers,
+    stream=True
+)
 
-if __name__ == "__main__":
-    test_stream()
+print(f"Status: {resp.status_code}")
+if resp.status_code != 200:
+    print(f"Error: {resp.text[:500]}")
+    sys.exit(1)
+
+chunk_types = []
+for line in resp.iter_lines():
+    if not line:
+        continue
+    decoded = line.decode('utf-8').strip()
+    if not decoded:
+        continue
+    try:
+        chunk = json.loads(decoded)
+        ctype = chunk.get('type', 'unknown')
+        chunk_types.append(ctype)
+        if ctype == 'web_search_result':
+            print(f"  ✅ WEB_SEARCH_RESULT: answer={chunk.get('data',{}).get('answer','')[:100]}...")
+            print(f"     sources count: {len(chunk.get('data',{}).get('sources',[]))}")
+        elif ctype == 'content':
+            pass  # Too verbose
+        elif ctype == 'web_search_suggestion':
+            print(f"  📋 WEB_SEARCH_SUGGESTION: {chunk.get('data')}")
+        elif ctype == 'step':
+            print(f"  📌 STEP {chunk.get('id')}: {chunk.get('status')}")
+        elif ctype == 'intent':
+            print(f"  🎯 INTENT: {json.dumps(chunk.get('data',{}))[:100]}")
+        else:
+            print(f"  [{ctype}]: {json.dumps(chunk)[:100]}")
+    except json.JSONDecodeError:
+        pass
+
+print(f"\\n=== Summary: {len(chunk_types)} chunks received ===")
+print(f"Types: {dict((t, chunk_types.count(t)) for t in set(chunk_types))}")
+
+if 'web_search_result' in chunk_types:
+    print("\\n✅ Web search result WAS streamed")
+else:
+    print("\\n❌ Web search result was NOT streamed")
