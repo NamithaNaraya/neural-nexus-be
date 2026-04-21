@@ -19,30 +19,38 @@ class WebSearchService:
     """Performs web-grounded search using Gemini + Google Search."""
 
     def __init__(self):
-        api_key = settings.GOOGLE_API_KEY
-        if not api_key:
-            raise ValueError("GOOGLE_API_KEY is required for WebSearchService")
-        self.client = genai.Client(api_key=api_key)
+        self.api_key = settings.GOOGLE_API_KEY
+        self.client = None
         self.model = settings.GEMINI_MODEL or "gemini-2.5-flash"
-        self.google_search_tool = types.Tool(
-            google_search=types.GoogleSearch()
-        )
-        logger.info(f"🌐 WebSearchService initialized (model={self.model})")
+        self.google_search_tool = None
+        
+        if self.api_key:
+            try:
+                self.client = genai.Client(api_key=self.api_key)
+                self.google_search_tool = types.Tool(
+                    google_search=types.GoogleSearch()
+                )
+                logger.info(f"🌐 WebSearchService initialized (model={self.model})")
+            except Exception as e:
+                logger.warning(f"🌐 Failed to initialize Gemini for WebSearch: {e}")
+        else:
+            logger.warning("🌐 WebSearchService initialized in DISABLED mode (missing GOOGLE_API_KEY)")
 
     async def search(self, question: str, context_hint: Optional[str] = None) -> dict:
         """
         Perform a web-grounded search for the given question.
-
-        Args:
-            question: The user's question to search for.
-            context_hint: Optional previous RAG answer to give context.
-
-        Returns:
-            dict with keys:
-                - answer: str (the web-grounded response)
-                - source: "web_search"
-                - grounding_metadata: dict | None (search entry point, sources)
+        Returns a graceful error if Gemini is not configured.
         """
+        if not self.client:
+            return {
+                "answer": (
+                    "Web search is currently unavailable because the Gemini API is not configured. "
+                    "Please check your environment settings if you need web-grounded results."
+                ),
+                "source": "web_search",
+                "grounding_metadata": None,
+                "error": "Gemini API key missing",
+            }
         try:
             # Build the prompt — if we have a RAG context hint,
             # tell the model to supplement/verify it

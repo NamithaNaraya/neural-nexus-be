@@ -34,7 +34,8 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     
     # === AI Services ===
-    LLM_PROVIDER: str = "gemini"  # "ollama" or "gemini"
+    LLM_PROVIDER: str = "ollama"  # "ollama" or "gemini"
+    EMBEDDING_PROVIDER: str = "ollama"  # "ollama" or "gemini"
     
     # Ollama (used for embeddings)
     OLLAMA_BASE_URL: str = "http://localhost:11434"

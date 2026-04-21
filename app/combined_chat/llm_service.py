@@ -272,7 +272,7 @@ class OllamaService(BaseLLMService):
 
 def get_llm_service() -> BaseLLMService:
     """Factory to return the configured LLM provider."""
-    provider = getattr(settings, "LLM_PROVIDER", "gemini").lower()
+    provider = getattr(settings, "LLM_PROVIDER", "ollama").lower()
     if provider == "ollama":
         logger.info("🤖 Initializing Ollama Service")
         return OllamaService()

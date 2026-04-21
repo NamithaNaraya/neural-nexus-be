@@ -27,26 +27,50 @@ class AIService:
     """
     
     def __init__(self):
-        # 1. Initialize Gemini via LangChain
+        # 1. Initialize LLM via LangChain (respecting provider)
         self.llm = None
         if settings.LLM_PROVIDER == "gemini":
-            if not settings.GOOGLE_API_KEY:
-                logger.error("GOOGLE_API_KEY is missing!")
-            
-            self.llm = ChatGoogleGenerativeAI(
-                model=settings.GEMINI_MODEL, # gemini-2.5-flash
-                google_api_key=settings.GOOGLE_API_KEY,
-                temperature=0.1,
-                convert_system_message_to_human=True # Helper for some Gemini versions
+            if settings.GOOGLE_API_KEY:
+                self.llm = ChatGoogleGenerativeAI(
+                    model=settings.GEMINI_MODEL,
+                    google_api_key=settings.GOOGLE_API_KEY,
+                    temperature=0.1,
+                    convert_system_message_to_human=True
+                )
+                logger.info(f"LangChain: Gemini initialized with model {settings.GEMINI_MODEL}")
+            else:
+                logger.warning("AIService: GEMINI provider requested but GOOGLE_API_KEY is missing!")
+        elif settings.LLM_PROVIDER == "ollama":
+            from langchain_ollama import ChatOllama
+            self.llm = ChatOllama(
+                model=settings.OLLAMA_MODEL,
+                base_url=settings.OLLAMA_BASE_URL,
+                temperature=0.1
             )
-            logger.info(f"LangChain: Gemini initialized with model {settings.GEMINI_MODEL}")
+            logger.info(f"LangChain: Ollama initialized with model {settings.OLLAMA_MODEL} at {settings.OLLAMA_BASE_URL}")
+        else:
+            logger.warning(f"AIService: Unknown LLM_PROVIDER '{settings.LLM_PROVIDER}'")
         
-        # 2. Initialize Ollama Embeddings via LangChain
-        self.embeddings = OllamaEmbeddings(
-            base_url=settings.OLLAMA_BASE_URL,
-            model=settings.OLLAMA_EMBED_MODEL # mxbai-embed-large
-        )
-        logger.info(f"LangChain: Ollama Embeddings initialized with {settings.OLLAMA_EMBED_MODEL}")
+        # 2. Initialize Embeddings via LangChain (configurable)
+        self.embeddings = None
+        if getattr(settings, "EMBEDDING_PROVIDER", "ollama") == "gemini":
+            from langchain_google_genai import GoogleGenerativeAIEmbeddings
+            if settings.GOOGLE_API_KEY:
+                self.embeddings = GoogleGenerativeAIEmbeddings(
+                    model="models/embedding-001", # standard fallback
+                    google_api_key=settings.GOOGLE_API_KEY
+                )
+                logger.info("LangChain: Gemini Embeddings initialized")
+            else:
+                logger.warning("AIService: GEMINI embeddings requested but GOOGLE_API_KEY missing!")
+        
+        # Fallback to Ollama or if explicitly requested
+        if self.embeddings is None:
+            self.embeddings = OllamaEmbeddings(
+                base_url=settings.OLLAMA_BASE_URL,
+                model=settings.OLLAMA_EMBED_MODEL # mxbai-embed-large
+            )
+            logger.info(f"LangChain: Ollama Embeddings initialized with {settings.OLLAMA_EMBED_MODEL}")
 
     def _convert_messages(self, messages: List[Dict[str, str]]) -> List[Any]:
         """Convert dict-style messages to LangChain message objects."""
