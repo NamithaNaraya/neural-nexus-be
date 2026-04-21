@@ -17,7 +17,7 @@ import logging
 import asyncio
 import re
 from typing import List, Dict, Any, Optional
-from app.combined_chat.gemini_service import GeminiService
+from app.combined_chat.llm_service import get_llm_service
 from app.combined_chat.embedding_service import EmbeddingService
 from app.combined_chat.fastrp_service import FastRPService
 from app.combined_chat.gds_service import GDSCombinedService
@@ -50,7 +50,7 @@ _MAX_CONTEXT_CHARS = 20000
 
 class CombinedRAGService:
     def __init__(self):
-        self.gemini = GeminiService()
+        self.llm = get_llm_service()
         self.vector_engine = EmbeddingService()
         self.fastrp_engine = FastRPService()
         self.gds_suite = GDSCombinedService()
@@ -405,7 +405,7 @@ class CombinedRAGService:
 
         full_answer = ""
         chunk_count = 0
-        async for chunk in self.gemini.astream_response(
+        async for chunk in self.llm.astream_response(
             self._build_answer_prompt(question, context, folder_id),
             combined_history
         ):
@@ -784,7 +784,7 @@ JSON OUTPUT:
 }}
         """
         try:
-            return await self.gemini.generate_json(prompt)
+            return await self.llm.generate_json(prompt)
         except Exception as e:
             logger.error(f"Orchestration failed: {e}")
             return {
@@ -1014,7 +1014,7 @@ Return ONLY a JSON array of strings, nothing else.
 Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
 
         try:
-            result = await self.gemini.generate_json(prompt)
+            result = await self.llm.generate_json(prompt)
             if isinstance(result, list):
                 expanded = [str(t).lower().strip() for t in result if isinstance(t, str) and len(str(t).strip()) > 2]
                 logger.info(f"🔎 Query expanded: {expanded}")

@@ -17,6 +17,7 @@ from app.routes import health, auth, folders, files, upload, graph, query, analy
 from app.combined_chat import router as combined_chat_router
 from app.routes import weights as weight_routes
 from app.routes.ml import ml_routes
+from app.combined_chat.llm_service import get_llm_service
 from app.db.connections import (
     init_neo4j, 
     close_neo4j, 
@@ -91,6 +92,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ Redis connection failed: {e}")
     
+    # === LLM Provider Check ===
+    try:
+        llm_service = get_llm_service()
+        provider_name = settings.LLM_PROVIDER.upper()
+        model_name = settings.GEMINI_MODEL if provider_name == "GEMINI" else settings.OLLAMA_MODEL
+        
+        is_healthy = await llm_service.check_health()
+        if is_healthy:
+            logger.info(f"✅ {provider_name} LLM Active & Running ({model_name})")
+        else:
+            logger.warning(f"⚠️ {provider_name} LLM Check Failed — synthesis might be slow or unavailable")
+    except Exception as e:
+        logger.error(f"❌ LLM initialization check failed: {e}")
+
     logger.info("🧠 Neural Nexus Backend is ready!")
     
     yield
