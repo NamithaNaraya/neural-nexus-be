@@ -44,6 +44,10 @@ _MULTIHOP_TIMEOUT = 5
 _EXPANSION_TIMEOUT = 3
 # Semantic node resolution timeout
 _SEMANTIC_RESOLVE_TIMEOUT = 5
+# Fast-path retrieval timeout
+_FAST_RETRIEVAL_TIMEOUT = 4
+# Fast-path context cap
+_FAST_CONTEXT_CHARS = 8000
 # Maximum context chars sent to synthesis LLM
 _MAX_CONTEXT_CHARS = 20000
 
@@ -71,6 +75,184 @@ class CombinedRAGService:
         self._schema_expiry = 0
         self._chain_depth_cache.clear()
         logger.info("🗑️ RAG schema cache invalidated (CRUD change detected)")
+
+    def _normalize_question(self, question: str) -> str:
+        return re.sub(r"\s+", " ", question.lower().strip())
+
+    def _select_retrieval_mode(self, question: str, folder_id: Optional[str]) -> str:
+        normalized = self._normalize_question(question)
+        if normalized in self._greetings:
+            return "greeting"
+
+        deep_phrases = (
+            "connected to", "connection", "connections", "relationship", "relationships",
+            "path ", "paths", "chain", "travers", "bridge", "bottleneck", "cluster",
+            "community", "communities", "central", "influence", "important", "rank",
+            "ranking", "similar", "similarity", "predict", "missing link", "algorithm",
+            "pagerank", "articlerank", "betweenness", "closeness", "degree centrality",
+            "hits", "louvain", "leiden", "wcc", "kcore", "triangle", "topological",
+            "multi-hop", "multihop", "why is", "why are", "how is", "how are",
+        )
+        if any(phrase in normalized for phrase in deep_phrases):
+            return "deep"
+
+        catalog_phrases = (
+            "how many", "count ", "counts ", "list all", "what are all", "what are the",
+            "which are all", "show all", "give all", "all of the", "total number", "number of",
+        )
+        if folder_id and any(phrase in normalized for phrase in catalog_phrases):
+            return "catalog"
+
+        return "fast"
+
+    async def _stream_fast_answer(
+        self,
+        question: str,
+        folder_id: Optional[str],
+        file_id: Optional[str],
+        combined_history: Optional[List[Dict[str, str]]],
+        user_id: str,
+        session_id: Optional[str],
+        web_search: bool,
+        catalog_mode: bool = False,
+    ):
+        yield json.dumps({"type": "step", "id": 2, "status": "Searching relevant sources..."}) + "\n"
+
+        vector_task = asyncio.create_task(
+            asyncio.wait_for(
+                self.vector_engine.vector_search(question, folder_id),
+                timeout=_FAST_RETRIEVAL_TIMEOUT,
+            )
+        )
+
+        named_tasks: List[tuple] = [("Semantic Search", vector_task)]
+        if catalog_mode and folder_id:
+            named_tasks.append((
+                "Database Facts",
+                asyncio.create_task(
+                    asyncio.wait_for(self._type_enumeration(folder_id), timeout=_FAST_RETRIEVAL_TIMEOUT)
+                ),
+            ))
+
+        web_search_task = None
+        if web_search:
+            logger.info("🌐 Integrated Web Search enabled")
+            web_search_task = asyncio.create_task(get_web_search_service().search(question))
+
+        names = [t[0] for t in named_tasks]
+        tasks = [t[1] for t in named_tasks]
+        try:
+            raw_outputs = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=_FAST_RETRIEVAL_TIMEOUT + 1,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"⏱️ Fast retrieval timeout ({_FAST_RETRIEVAL_TIMEOUT}s) — using partial results")
+            raw_outputs = [asyncio.TimeoutError()] * len(tasks)
+
+        fused = []
+        for name, result in zip(names, raw_outputs):
+            if isinstance(result, (Exception, type(None))) or not result:
+                if isinstance(result, Exception):
+                    logger.warning(f"Fast retrieval source '{name}' raised: {result}")
+                continue
+            if isinstance(result, list):
+                res_str = json.dumps(result[:20], default=str)
+            else:
+                res_str = str(result)
+            fused.append(f"=== {name} ===\n{res_str}")
+
+        context = "\n\n".join(fused)
+        if len(context) > _FAST_CONTEXT_CHARS:
+            logger.info(f"✂️ Trimming fast context from {len(context)} to {_FAST_CONTEXT_CHARS} chars")
+            context = context[:_FAST_CONTEXT_CHARS]
+
+        suggest_web_search = True
+        if web_search and web_search_task:
+            try:
+                web_result = await web_search_task
+                if web_result and not web_result.get("error"):
+                    yield json.dumps({
+                        "type": "web_search_result",
+                        "data": {
+                            "answer": web_result.get("answer", ""),
+                            "sources": (
+                                web_result.get("grounding_metadata", {}).get("grounding_chunks", [])
+                                if web_result.get("grounding_metadata")
+                                else []
+                            )
+                        }
+                    }) + "\n"
+                    suggest_web_search = False
+            except Exception as e:
+                logger.warning(f"🌐 Integrated Web Search failed: {e}")
+
+        thin_context = len(context.strip()) < 50
+        yield json.dumps({"type": "web_search_suggestion", "data": suggest_web_search, "emphasized": thin_context}) + "\n"
+
+        yield json.dumps({"type": "step", "id": 3, "status": "Synthesizing answer..."}) + "\n"
+
+        full_answer = ""
+        chunk_count = 0
+        answer_history = (combined_history or [])[-4:]
+        async for chunk in self.llm.astream_response(
+            self._build_answer_prompt(question, context, folder_id, fast_mode=True),
+            answer_history
+        ):
+            if chunk:
+                full_answer += chunk
+                chunk_count += 1
+                yield json.dumps({"type": "content", "data": chunk}) + "\n"
+
+        logger.info(f"📝 Streamed {chunk_count} content chunks")
+        yield json.dumps({"type": "step", "id": 4, "status": "Research completed."}) + "\n"
+
+        try:
+            history_key = f"chat:history:{user_id}:{folder_id or 'global'}"
+            await self.redis.rpush(history_key, json.dumps({"role": "user", "content": question}))
+            await self.redis.rpush(history_key, json.dumps({"role": "assistant", "content": full_answer}))
+            await self.redis.ltrim(history_key, -20, -1)
+
+            if session_id:
+                await self.redis.hset(
+                    f"chat:meta:{session_id}",
+                    mapping={
+                        "folder_id": folder_id or "",
+                        "updated_at": str(int(time.time())),
+                    },
+                )
+        except Exception as e:
+            logger.warning(f"Failed to persist fast chat history: {e}")
+
+        try:
+            from app.core.database import SessionLocal
+            from app.models.chat import ChatSession, ChatMessage
+            from sqlalchemy import select
+
+            async with SessionLocal() as db:
+                session_obj = None
+                if session_id:
+                    stmt = select(ChatSession).where(ChatSession.id == session_id)
+                    session_obj = (await db.execute(stmt)).scalar_one_or_none()
+                if session_obj:
+                    session_obj.updated_at = time.time()
+                    db.add(
+                        ChatMessage(
+                            session_id=session_obj.id,
+                            role="user",
+                            content=question,
+                        )
+                    )
+                    db.add(
+                        ChatMessage(
+                            session_id=session_obj.id,
+                            role="assistant",
+                            content=full_answer,
+                        )
+                    )
+                    await db.commit()
+        except Exception as e:
+            logger.warning(f"Failed to persist fast chat session: {e}")
 
     # ────────────────────────────────────────────────────────────
     #  Public API
@@ -119,6 +301,22 @@ class CombinedRAGService:
             )
             yield json.dumps({"type": "content", "data": ans}) + "\n"
             yield json.dumps({"type": "step", "id": 4, "status": "Done"}) + "\n"
+            return
+
+        retrieval_mode = self._select_retrieval_mode(question, folder_id)
+        logger.info(f"⚡ Retrieval mode selected: {retrieval_mode}")
+        if retrieval_mode in {"fast", "catalog"}:
+            async for chunk in self._stream_fast_answer(
+                question=question,
+                folder_id=folder_id,
+                file_id=file_id,
+                combined_history=combined_history,
+                user_id=user_id,
+                session_id=session_id,
+                web_search=web_search,
+                catalog_mode=(retrieval_mode == "catalog"),
+            ):
+                yield chunk
             return
 
         # Determine fallback dynamic depth
@@ -506,9 +704,31 @@ class CombinedRAGService:
     #  Answer Prompt (polished, user-friendly)
     # ────────────────────────────────────────────────────────────
 
-    def _build_answer_prompt(self, question: str, context: str, folder_id: Optional[str]) -> str:
+    def _build_answer_prompt(self, question: str, context: str, folder_id: Optional[str], fast_mode: bool = False) -> str:
         has_context = bool(context.strip())
-        
+        if fast_mode:
+            if not has_context:
+                return f"""You are Neural Nexus, a concise knowledge-graph assistant.
+
+The user asked: "{question}"
+
+No matching data was found in the active folder{f' ({folder_id})' if folder_id else ''}.
+
+Reply briefly, explain that you could not find a confident match, and suggest a clearer rephrase or another folder. Do not fabricate data."""
+
+            return f"""You are Neural Nexus, a concise knowledge-graph assistant.
+
+Answer using only the CONTEXT below.
+If the context includes "[DATABASE FACTS]", use those counts and lists exactly.
+Be direct, accurate, and brief. Avoid filler.
+
+CONTEXT:
+{context}
+
+QUESTION: {question}
+
+Answer in the shortest form that fully addresses the question."""
+
         if not has_context:
             return f"""You are the **Neural Nexus Research Assistant** — a friendly, knowledgeable expert.
 
