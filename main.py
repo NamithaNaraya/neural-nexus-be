@@ -11,6 +11,7 @@ from typing import Dict, Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from app.routes import health, auth, folders, files, upload, graph, query, analytics, sse, websocket, deletion, dashboard, reasoning, browse, analytics_chat, herb
@@ -145,6 +146,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Compress JSON/HTTP responses for faster frontend payload delivery.
+# Streaming endpoints are not buffered by GZip middleware.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # Request logging middleware
 if settings.DEBUG:

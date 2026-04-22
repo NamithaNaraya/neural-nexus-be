@@ -345,7 +345,7 @@ async def delete_folder(
     try:
         from app.services.cache_service import get_cache_service
         cache = get_cache_service()
-        await cache.invalidate_all()
+        await cache.invalidate_folder_graph(folder_id=folder_id, include_global=True)
     except Exception as e:
         logger.warning(f"Cache invalidation failed after folder delete: {e}")
     

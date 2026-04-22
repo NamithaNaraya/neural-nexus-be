@@ -453,7 +453,7 @@ async def approve_file_ingestion(
         try:
             from app.services.cache_service import get_cache_service
             cache_service = get_cache_service()
-            await cache_service.invalidate_all()
+            await cache_service.invalidate_file_graph(file_id=file_id, folder_id=folder_id)
             logger.info(f"Invalidated all graph caches for file approval: {file_id}")
         except Exception as e:
             logger.error(f"Failed to invalidate cache: {e}")
@@ -702,7 +702,7 @@ async def delete_file(
     try:
         from app.services.cache_service import get_cache_service
         cache = get_cache_service()
-        await cache.invalidate_all()
+        await cache.invalidate_file_graph(file_id=file_id, folder_id=folder_id)
     except Exception as e:
         logger.warning(f"Cache invalidation failed after file delete: {e}")
     

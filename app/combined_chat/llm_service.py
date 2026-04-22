@@ -193,58 +193,95 @@ class OllamaService(BaseLLMService):
         self.llm = ChatOllama(
             model=settings.OLLAMA_MODEL,
             base_url=settings.OLLAMA_BASE_URL,
-            temperature=0.1
+            temperature=0.1,
+            top_p=settings.OLLAMA_TOP_P,
+            repeat_penalty=settings.OLLAMA_REPEAT_PENALTY,
+            num_predict=settings.OLLAMA_NUM_PREDICT,
+            num_ctx=settings.OLLAMA_NUM_CTX,
         )
+        self._timeout_seconds = max(10, settings.OLLAMA_CHAT_TIMEOUT_SECONDS)
+        self._retry_attempts = max(1, settings.OLLAMA_RETRY_ATTEMPTS)
+
+    def _build_messages(self, prompt: str, history: Optional[List[Dict[str, str]]] = None):
+        from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+        messages = []
+        if history:
+            for m in history:
+                if m["role"] == "user":
+                    messages.append(HumanMessage(content=m["content"]))
+                elif m["role"] == "assistant":
+                    messages.append(AIMessage(content=m["content"]))
+                elif m["role"] == "system":
+                    messages.append(SystemMessage(content=m["content"]))
+        messages.append(HumanMessage(content=prompt))
+        return messages
 
     async def generate_response(self, prompt: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-        try:
-            from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-            messages = []
-            if history:
-                for m in history:
-                    if m["role"] == "user": messages.append(HumanMessage(content=m["content"]))
-                    elif m["role"] == "assistant": messages.append(AIMessage(content=m["content"]))
-                    elif m["role"] == "system": messages.append(SystemMessage(content=m["content"]))
-            
-            messages.append(HumanMessage(content=prompt))
-            response = await self.llm.ainvoke(messages)
-            return response.content
-        except Exception as e:
-            logger.error(f"Ollama Service error: {e}")
-            return f"Error: {str(e)}"
+        messages = self._build_messages(prompt, history)
+        for attempt in range(1, self._retry_attempts + 1):
+            try:
+                response = await asyncio.wait_for(
+                    self.llm.ainvoke(messages),
+                    timeout=self._timeout_seconds,
+                )
+                return response.content
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Ollama response timed out after {self._timeout_seconds}s "
+                    f"(attempt {attempt}/{self._retry_attempts})"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Ollama Service error (attempt {attempt}/{self._retry_attempts}): {e}"
+                )
+        return "Error: Ollama response timed out. Please try a shorter or more specific question."
 
     async def astream_response(self, prompt: str, history: Optional[List[Dict[str, str]]] = None):
         """Streaming for Ollama with the same sub-chunking logic for word-by-word feel."""
         try:
-            from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-            messages = []
-            if history:
-                for m in history:
-                    if m["role"] == "user": messages.append(HumanMessage(content=m["content"]))
-                    elif m["role"] == "assistant": messages.append(AIMessage(content=m["content"]))
-                    elif m["role"] == "system": messages.append(SystemMessage(content=m["content"]))
-            
-            messages.append(HumanMessage(content=prompt))
-            
-            async for chunk in self.llm.astream(messages):
-                if chunk and chunk.content:
-                    # Apply sub-chunking logic if chunk is large
-                    # (Though Ollama usually streams faster, we keep parity)
-                    if len(chunk.content.split(' ')) > 15:
-                        words = chunk.content.split(' ')
-                        sub_chunk = []
-                        for w in words:
-                            sub_chunk.append(w)
-                            if len(sub_chunk) >= 8:
-                                yield ' '.join(sub_chunk) + ' '
-                                sub_chunk = []
-                        if sub_chunk:
-                            yield ' '.join(sub_chunk)
-                    else:
-                        yield chunk.content
+            messages = self._build_messages(prompt, history)
+            async with asyncio.timeout(self._timeout_seconds):
+                async for chunk in self.llm.astream(messages):
+                    if chunk and chunk.content:
+                        # Keep chunk streaming smooth while reducing UI render churn.
+                        if len(chunk.content.split(" ")) > 24:
+                            words = chunk.content.split(" ")
+                            sub_chunk = []
+                            for w in words:
+                                sub_chunk.append(w)
+                                if len(sub_chunk) >= 10:
+                                    yield " ".join(sub_chunk) + " "
+                                    sub_chunk = []
+                            if sub_chunk:
+                                yield " ".join(sub_chunk)
+                        else:
+                            yield chunk.content
+        except asyncio.TimeoutError:
+            logger.warning(f"Ollama streaming timed out after {self._timeout_seconds}s")
+            yield "\n[Ollama timeout]: The response took too long. Try a more specific question."
         except Exception as e:
             logger.error(f"Ollama Streaming error: {e}")
             yield f"\n[Ollama Error]: {str(e)}"
+
+    async def generate_json(self, prompt: str) -> Dict[str, Any]:
+        """JSON generation tuned for local models that may emit extra prose."""
+        strict_prompt = (
+            f"{prompt}\n\n"
+            "IMPORTANT: Return ONLY valid JSON. "
+            "Do not include markdown fences, comments, explanations, or extra text."
+        )
+        response_text = ""
+        try:
+            response_text = await self.generate_response(strict_prompt)
+            clean = response_text.strip()
+            if "```json" in clean:
+                clean = clean.split("```json", 1)[1].split("```", 1)[0].strip()
+            elif "```" in clean:
+                clean = clean.split("```", 1)[1].split("```", 1)[0].strip()
+            return json.loads(clean)
+        except Exception as e:
+            logger.warning(f"Ollama JSON parsing failed: {e}")
+            return {"error": str(e), "raw": response_text}
 
 
     async def check_health(self) -> bool:

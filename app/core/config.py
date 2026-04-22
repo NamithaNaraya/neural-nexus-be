@@ -41,6 +41,15 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3:latest"
     OLLAMA_EMBED_MODEL: str = "mxbai-embed-large:latest"
+    OLLAMA_CHAT_TIMEOUT_SECONDS: int = 90
+    OLLAMA_RETRY_ATTEMPTS: int = 2
+    OLLAMA_NUM_PREDICT: int = 768
+    OLLAMA_NUM_CTX: int = 8192
+    OLLAMA_TOP_P: float = 0.9
+    OLLAMA_REPEAT_PENALTY: float = 1.05
+    RAG_FAST_ANSWER_CACHE_TTL_SECONDS: int = 120
+    RAG_HISTORY_WINDOW_MESSAGES: int = 20
+    RAG_FAST_HISTORY_WINDOW_MESSAGES: int = 8
     
     # Gemini (used for extracting and chat)
     GEMINI_MODEL: str = "gemini-1.5-pro"
@@ -58,6 +67,11 @@ class Settings(BaseSettings):
     MAX_CHUNK_PARALLEL: int = 10
     AI_REQUEST_TIMEOUT: int = 120  # Increased for large documents
     CIRCUIT_BREAKER_THRESHOLD: int = 5
+    GRAPH_ALL_DEFAULT_LIMIT: int = 10000
+    GRAPH_ALL_MAX_LIMIT: int = 100000
+    GRAPH_FOLDER_DEFAULT_LIMIT: int = 1000
+    GRAPH_FOLDER_MAX_LIMIT: int = 10000
+    GRAPH_LINK_LIMIT_MULTIPLIER: int = 2
     
     # === Feature Flags ===
     ENABLE_WEBSOCKET: bool = True

@@ -62,6 +62,7 @@ class CombinedRAGService:
         self.redis = get_redis_client()
         self._schema_cache: Optional[str] = None
         self._schema_expiry: float = 0
+        self._schema_version: int = 1
         self._chain_depth_cache: Dict[str, int] = {}  # folder_id -> max chain depth
         self._greetings = {"hi", "hello", "hey", "hola", "greetings", "good morning", "good afternoon", "good evening"}
 
@@ -73,8 +74,124 @@ class CombinedRAGService:
         """
         self._schema_cache = None
         self._schema_expiry = 0
+        self._schema_version += 1
         self._chain_depth_cache.clear()
-        logger.info("🗑️ RAG schema cache invalidated (CRUD change detected)")
+        logger.info(f"🗑️ RAG schema cache invalidated (CRUD change detected, v{self._schema_version})")
+
+    def _fast_answer_cache_key(
+        self,
+        question: str,
+        folder_id: Optional[str],
+        user_id: str,
+        catalog_mode: bool,
+        combined_history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        normalized = self._normalize_question(question)
+        scope = folder_id or "global"
+        mode = "catalog" if catalog_mode else "fast"
+        history_window = max(1, int(settings.RAG_FAST_HISTORY_WINDOW_MESSAGES))
+        history_slice = (combined_history or [])[-history_window:]
+        history_fingerprint = "|".join(
+            f"{m.get('role', '')}:{self._normalize_question(str(m.get('content', '')))}"
+            for m in history_slice
+            if str(m.get("content", "")).strip()
+        )
+        digest = uuid.uuid5(
+            uuid.NAMESPACE_OID,
+            f"{user_id}|{scope}|{mode}|{normalized}|{history_fingerprint}|{self._schema_version}",
+        )
+        return f"chat:fast_answer:{digest}"
+
+    async def _get_cached_fast_answer(
+        self,
+        question: str,
+        folder_id: Optional[str],
+        user_id: str,
+        catalog_mode: bool,
+        combined_history: Optional[List[Dict[str, str]]] = None,
+    ) -> Optional[str]:
+        try:
+            key = self._fast_answer_cache_key(
+                question,
+                folder_id,
+                user_id,
+                catalog_mode,
+                combined_history=combined_history,
+            )
+            value = await self.redis.get(key)
+            if value:
+                logger.info("⚡ Fast-answer cache HIT")
+                return str(value)
+        except Exception as e:
+            logger.warning(f"Fast-answer cache read failed: {e}")
+        return None
+
+    async def _set_cached_fast_answer(
+        self,
+        question: str,
+        folder_id: Optional[str],
+        user_id: str,
+        catalog_mode: bool,
+        answer: str,
+        combined_history: Optional[List[Dict[str, str]]] = None,
+    ) -> None:
+        if not answer or len(answer.strip()) < 16:
+            return
+        try:
+            ttl = max(30, int(settings.RAG_FAST_ANSWER_CACHE_TTL_SECONDS))
+            key = self._fast_answer_cache_key(
+                question,
+                folder_id,
+                user_id,
+                catalog_mode,
+                combined_history=combined_history,
+            )
+            await self.redis.set(key, answer, ex=ttl)
+        except Exception as e:
+            logger.warning(f"Fast-answer cache write failed: {e}")
+
+    async def _persist_fast_history(
+        self,
+        question: str,
+        answer: str,
+        user_id: str,
+        folder_id: Optional[str],
+        session_id: Optional[str],
+    ) -> None:
+        try:
+            history_key = f"chat:history:{user_id}:{folder_id or 'global'}"
+            await self.redis.rpush(history_key, json.dumps({"role": "user", "content": question}))
+            await self.redis.rpush(history_key, json.dumps({"role": "assistant", "content": answer}))
+            await self.redis.ltrim(history_key, -20, -1)
+
+            if session_id:
+                await self.redis.hset(
+                    f"chat:meta:{session_id}",
+                    mapping={
+                        "folder_id": folder_id or "",
+                        "updated_at": str(int(time.time())),
+                    },
+                )
+        except Exception as e:
+            logger.warning(f"Failed to persist fast chat history: {e}")
+
+        try:
+            from app.core.database import SessionLocal
+            from app.models.chat import ChatSession, ChatMessage
+            from sqlalchemy import select
+
+            async with SessionLocal() as db:
+                session_obj = None
+                if session_id:
+                    stmt = select(ChatSession).where(ChatSession.id == session_id)
+                    session_obj = (await db.execute(stmt)).scalar_one_or_none()
+                if session_obj:
+                    session_obj.updated_at = time.time()
+                    db.add(ChatMessage(session_id=session_obj.id, role="user", content=question))
+                    db.add(ChatMessage(session_id=session_obj.id, role="assistant", content=answer))
+                    await db.commit()
+        except Exception as e:
+            logger.warning(f"Failed to persist fast chat session: {e}")
 
     def _normalize_question(self, question: str) -> str:
         return re.sub(r"\s+", " ", question.lower().strip())
@@ -194,7 +311,7 @@ class CombinedRAGService:
 
         full_answer = ""
         chunk_count = 0
-        answer_history = (combined_history or [])[-4:]
+        answer_history = (combined_history or [])[-max(1, int(settings.RAG_FAST_HISTORY_WINDOW_MESSAGES))]
         async for chunk in self.llm.astream_response(
             self._build_answer_prompt(question, context, folder_id, fast_mode=True),
             answer_history
@@ -207,52 +324,23 @@ class CombinedRAGService:
         logger.info(f"📝 Streamed {chunk_count} content chunks")
         yield json.dumps({"type": "step", "id": 4, "status": "Research completed."}) + "\n"
 
-        try:
-            history_key = f"chat:history:{user_id}:{folder_id or 'global'}"
-            await self.redis.rpush(history_key, json.dumps({"role": "user", "content": question}))
-            await self.redis.rpush(history_key, json.dumps({"role": "assistant", "content": full_answer}))
-            await self.redis.ltrim(history_key, -20, -1)
+        if not web_search:
+            await self._set_cached_fast_answer(
+                question=question,
+                folder_id=folder_id,
+                user_id=user_id,
+                catalog_mode=catalog_mode,
+                answer=full_answer,
+                combined_history=combined_history,
+            )
 
-            if session_id:
-                await self.redis.hset(
-                    f"chat:meta:{session_id}",
-                    mapping={
-                        "folder_id": folder_id or "",
-                        "updated_at": str(int(time.time())),
-                    },
-                )
-        except Exception as e:
-            logger.warning(f"Failed to persist fast chat history: {e}")
-
-        try:
-            from app.core.database import SessionLocal
-            from app.models.chat import ChatSession, ChatMessage
-            from sqlalchemy import select
-
-            async with SessionLocal() as db:
-                session_obj = None
-                if session_id:
-                    stmt = select(ChatSession).where(ChatSession.id == session_id)
-                    session_obj = (await db.execute(stmt)).scalar_one_or_none()
-                if session_obj:
-                    session_obj.updated_at = time.time()
-                    db.add(
-                        ChatMessage(
-                            session_id=session_obj.id,
-                            role="user",
-                            content=question,
-                        )
-                    )
-                    db.add(
-                        ChatMessage(
-                            session_id=session_obj.id,
-                            role="assistant",
-                            content=full_answer,
-                        )
-                    )
-                    await db.commit()
-        except Exception as e:
-            logger.warning(f"Failed to persist fast chat session: {e}")
+        await self._persist_fast_history(
+            question=question,
+            answer=full_answer,
+            user_id=user_id,
+            folder_id=folder_id,
+            session_id=session_id,
+        )
 
     # ────────────────────────────────────────────────────────────
     #  Public API
@@ -278,7 +366,8 @@ class CombinedRAGService:
         history_key = f"chat:history:{user_id}:{folder_id or 'global'}"
         stored_history = []
         try:
-            raw_history = await self.redis.lrange(history_key, -10, -1)
+            history_window = max(1, int(settings.RAG_HISTORY_WINDOW_MESSAGES))
+            raw_history = await self.redis.lrange(history_key, -history_window, -1)
             stored_history = [json.loads(m) for m in raw_history]
         except Exception as e:
             logger.warning(f"Failed to load history from Redis: {e}")
@@ -306,6 +395,28 @@ class CombinedRAGService:
         retrieval_mode = self._select_retrieval_mode(question, folder_id)
         logger.info(f"⚡ Retrieval mode selected: {retrieval_mode}")
         if retrieval_mode in {"fast", "catalog"}:
+            if not web_search:
+                cached_answer = await self._get_cached_fast_answer(
+                    question=question,
+                    folder_id=folder_id,
+                    user_id=user_id,
+                    catalog_mode=(retrieval_mode == "catalog"),
+                    combined_history=combined_history,
+                )
+                if cached_answer:
+                    yield json.dumps({"type": "step", "id": 2, "status": "Using cached response..."}) + "\n"
+                    yield json.dumps({"type": "web_search_suggestion", "data": False, "emphasized": False}) + "\n"
+                    yield json.dumps({"type": "step", "id": 3, "status": "Finalizing answer..."}) + "\n"
+                    yield json.dumps({"type": "content", "data": cached_answer}) + "\n"
+                    yield json.dumps({"type": "step", "id": 4, "status": "Research completed."}) + "\n"
+                    await self._persist_fast_history(
+                        question=question,
+                        answer=cached_answer,
+                        user_id=user_id,
+                        folder_id=folder_id,
+                        session_id=session_id,
+                    )
+                    return
             async for chunk in self._stream_fast_answer(
                 question=question,
                 folder_id=folder_id,

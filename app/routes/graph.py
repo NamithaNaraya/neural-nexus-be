@@ -131,6 +131,14 @@ class MergeNodesRequest(BaseModel):
 
 
 # === Utilities ===
+def _sanitize_limit(limit: int, default_limit: int, max_limit: int) -> int:
+    """Clamp user-provided limits to safe bounds."""
+    try:
+        parsed = int(limit)
+    except (TypeError, ValueError):
+        return default_limit
+    return max(1, min(parsed, max_limit))
+
 
 async def check_folder_write_permission(folder_id: Optional[str], user_id: str) -> None:
     """
@@ -168,6 +176,23 @@ async def check_folder_write_permission(folder_id: Optional[str], user_id: str) 
                 status_code=403, 
                 detail="You have view-only access to this folder. Contact the owner for edit permissions."
             )
+
+
+async def _invalidate_graph_mutation_caches(
+    cache: CacheService,
+    folder_id: Optional[str] = None,
+    file_id: Optional[str] = None,
+) -> None:
+    """
+    Invalidate only graph-related cache scopes affected by a mutation.
+    Keeps cache flush narrow to avoid cold-starting unrelated keys.
+    """
+    if file_id:
+        await cache.invalidate_file_graph(file_id=file_id, folder_id=folder_id)
+    elif folder_id:
+        await cache.invalidate_folder_graph(folder_id=folder_id, include_global=True)
+    else:
+        await cache.invalidate_graph_global()
 
 
 def serialize_neo4j_values(data: Any) -> Any:
@@ -224,14 +249,19 @@ async def search_nodes_for_crud(
 @router.get("/all", response_model=GraphResponse)
 async def get_all_graph(
     current_user: dict = Depends(get_current_user),
-    limit: int = Query(default=10000, le=100000),
+    limit: int = Query(default=settings.GRAPH_ALL_DEFAULT_LIMIT, ge=1, le=settings.GRAPH_ALL_MAX_LIMIT),
     neo4j = Depends(get_neo4j),
     cache = Depends(get_cache_service),
 ) -> GraphResponse:
     """
     Get all nodes across all folders (Floating Island view).
     """
-    cache_key = f"all_{limit}"
+    safe_limit = _sanitize_limit(
+        limit=limit,
+        default_limit=settings.GRAPH_ALL_DEFAULT_LIMIT,
+        max_limit=settings.GRAPH_ALL_MAX_LIMIT,
+    )
+    cache_key = f"all_{safe_limit}"
     cached_data = await cache.get_cached_graph(cache_key)
     if cached_data:
         return GraphResponse(**cached_data)
@@ -245,7 +275,7 @@ async def get_all_graph(
         RETURN n, degree
         LIMIT $limit
         """
-        nodes_result = await neo4j.execute_query(nodes_query, {"limit": limit})
+        nodes_result = await neo4j.execute_query(nodes_query, {"limit": safe_limit})
         
         nodes = []
         node_ids = set()
@@ -296,7 +326,10 @@ async def get_all_graph(
                properties(r) as properties
         LIMIT $limit
         """
-        links_result = await neo4j.execute_query(links_query, {"limit": limit * 2})
+        links_result = await neo4j.execute_query(
+            links_query,
+            {"limit": safe_limit * max(1, settings.GRAPH_LINK_LIMIT_MULTIPLIER)},
+        )
         
         links = []
         for record in links_result.records:
@@ -326,12 +359,17 @@ async def get_folder_graph(
     current_user: dict = Depends(get_current_user),
     node_type: Optional[str] = Query(default=None),
     min_connections: int = Query(default=0),
-    limit: int = Query(default=1000, le=10000),
+    limit: int = Query(default=settings.GRAPH_FOLDER_DEFAULT_LIMIT, ge=1, le=settings.GRAPH_FOLDER_MAX_LIMIT),
     neo4j = Depends(get_neo4j),
     cache = Depends(get_cache_service),
 ) -> GraphResponse:
     """Get graph data for all files in a folder."""
-    cache_key = f"folder_{folder_id}_{node_type}_{min_connections}_{limit}"
+    safe_limit = _sanitize_limit(
+        limit=limit,
+        default_limit=settings.GRAPH_FOLDER_DEFAULT_LIMIT,
+        max_limit=settings.GRAPH_FOLDER_MAX_LIMIT,
+    )
+    cache_key = f"folder_{folder_id}_{node_type}_{min_connections}_{safe_limit}"
     
     # TEMPORARY: Skip cache to ensure fresh data with link properties
     # Check cache
@@ -342,8 +380,14 @@ async def get_folder_graph(
     try:
         # Build type filter
         type_filter = ""
+        query_params = {
+            "folder_id": folder_id,
+            "min_connections": min_connections,
+            "limit": safe_limit,
+        }
         if node_type:
-            type_filter = f"AND (n.type = '{node_type}' OR '{node_type}' IN labels(n))"
+            type_filter = "AND (n.type = $node_type OR $node_type IN labels(n))"
+            query_params["node_type"] = node_type
         
         # Query nodes — with smart limiting for large graphs
         # If the dataset is large, prioritize high-degree nodes first
@@ -359,11 +403,7 @@ async def get_folder_graph(
         LIMIT $limit
         """
         
-        nodes_result = await neo4j.execute_query(nodes_query, {
-            "folder_id": folder_id,
-            "min_connections": min_connections,
-            "limit": limit,
-        })
+        nodes_result = await neo4j.execute_query(nodes_query, query_params)
         
         nodes = []
         node_ids = set()
@@ -419,7 +459,7 @@ async def get_folder_graph(
         
         links_result = await neo4j.execute_query(links_query, {
             "folder_id": folder_id,
-            "limit": limit * 2,
+            "limit": safe_limit * max(1, settings.GRAPH_LINK_LIMIT_MULTIPLIER),
         })
         
         links = []
@@ -982,7 +1022,7 @@ async def create_node(
                 logger.warning(f"Failed to add folder/type labels to node {node_id}: {lbl_err}")
         
         # Invalidate cache + GDS projections + RAG schema cache
-        await cache.invalidate_all()
+        await _invalidate_graph_mutation_caches(cache=cache, folder_id=request.folder_id)
         await gds.invalidate_all()
         invalidate_rag_caches()
         
@@ -1021,6 +1061,7 @@ async def update_node(
         # Look up the folder_id from the node to check permission
         folder_query = "MATCH (n) WHERE n.id = $node_id RETURN n.folder_id as folder_id, n.name as current_name, n.type as current_type, n.description as current_desc"
         folder_result = await neo4j.execute_query(folder_query, {"node_id": node_id})
+        fid = None
         if folder_result.records:
             fid = folder_result.records[0].get("folder_id")
             await check_folder_write_permission(fid, current_user["id"])
@@ -1119,7 +1160,7 @@ async def update_node(
                     logger.warning(f"Failed to update type label for node {node_id}: {lbl_err}")
         
         # Invalidate cache + GDS projections + RAG schema cache
-        await cache.invalidate_all()
+        await _invalidate_graph_mutation_caches(cache=cache, folder_id=fid)
         await gds.invalidate_all()
         invalidate_rag_caches()
         
@@ -1150,6 +1191,7 @@ async def delete_node(
         # Look up the folder_id from the node to check permission
         folder_query = "MATCH (n) WHERE n.id = $node_id RETURN n.folder_id as folder_id"
         folder_result = await neo4j.execute_query(folder_query, {"node_id": node_id})
+        fid = None
         if folder_result.records:
             fid = folder_result.records[0].get("folder_id")
             await check_folder_write_permission(fid, current_user["id"])
@@ -1171,7 +1213,7 @@ async def delete_node(
         result = await neo4j.execute_query(delete_query, {"node_id": node_id})
         
         # Invalidate cache + GDS projections + RAG schema cache
-        await cache.invalidate_all()
+        await _invalidate_graph_mutation_caches(cache=cache, folder_id=fid)
         await gds.invalidate_all()
         invalidate_rag_caches()
         
@@ -1209,6 +1251,7 @@ async def create_relationship(
         # Look up the folder from the source node to check permission
         folder_query = "MATCH (n:Entity) WHERE n.id = $source_id RETURN n.folder_id as folder_id"
         folder_result = await neo4j.execute_query(folder_query, {"source_id": request.source_id})
+        fid = None
         if folder_result.records:
             fid = folder_result.records[0].get("folder_id")
             await check_folder_write_permission(fid, current_user["id"])
@@ -1252,7 +1295,7 @@ async def create_relationship(
         })
         
         # Invalidate cache + GDS projections + RAG schema cache
-        await cache.invalidate_all()
+        await _invalidate_graph_mutation_caches(cache=cache)
         await gds.invalidate_all()
         invalidate_rag_caches()
         
@@ -1303,7 +1346,7 @@ async def delete_relationship(
         result = await neo4j.execute_query(query, {"rel_id": relationship_id})
         
         # Invalidate cache + GDS projections + RAG schema cache
-        await cache.invalidate_all()
+        await _invalidate_graph_mutation_caches(cache=cache)
         await gds.invalidate_all()
         invalidate_rag_caches()
         
@@ -1352,7 +1395,7 @@ async def update_relationship(
             raise HTTPException(status_code=404, detail="Relationship not found")
         
         # Invalidate cache + GDS projections + RAG schema cache
-        await cache.invalidate_all()
+        await _invalidate_graph_mutation_caches(cache=cache, folder_id=request.folder_id, file_id=request.file_id)
         await gds.invalidate_all()
         invalidate_rag_caches()
         
@@ -1389,7 +1432,7 @@ async def rename_relationship_type(
         
         # Invalidate cache if any changes made
         if count > 0:
-            await cache.invalidate_all()
+            await _invalidate_graph_mutation_caches(cache=cache, folder_id=request.folder_id, file_id=request.file_id)
             await gds.invalidate_all()
             invalidate_rag_caches()
         
@@ -1566,7 +1609,7 @@ async def merge_nodes(
         })
 
         # Invalidate cache + GDS projections + RAG schema cache
-        await cache.invalidate_all()
+        await _invalidate_graph_mutation_caches(cache=cache)
         await gds.invalidate_all()
         invalidate_rag_caches()
 
