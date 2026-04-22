@@ -11,7 +11,7 @@ from typing import Dict, Set
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 import json
 import logging
-import asyncio
+from app.combined_chat.router import get_rag_service
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -158,6 +158,51 @@ async def websocket_endpoint(
                     folder_id,
                     exclude_user=user_id,
                 )
+
+            elif event_type == "chat_stream":
+                try:
+                    rag = get_rag_service()
+                    request_id = message.get("request_id")
+                    question = str(message.get("question") or "").strip()
+                    if not question:
+                        await manager.send_personal(
+                            {"type": "error", "message": "question is required", "request_id": request_id},
+                            user_id,
+                        )
+                        continue
+
+                    history = message.get("history") or []
+                    folder_id = message.get("folder_id")
+                    session_id = message.get("session_id")
+                    web_search = bool(message.get("web_search", False))
+
+                    async for raw_chunk in rag.stream_answer(
+                        question=question,
+                        folder_id=folder_id,
+                        history=history,
+                        user_id=user_id,
+                        session_id=session_id,
+                        web_search=web_search,
+                    ):
+                        for line in str(raw_chunk).splitlines():
+                            chunk = line.strip()
+                            if not chunk:
+                                continue
+                            try:
+                                parsed = json.loads(chunk)
+                            except Exception:
+                                parsed = {"type": "content", "data": chunk}
+                            await manager.send_personal(
+                                {"type": "chat_chunk", "data": parsed, "request_id": request_id},
+                                user_id,
+                            )
+                    await manager.send_personal({"type": "chat_done", "request_id": request_id}, user_id)
+                except Exception as stream_err:
+                    logger.error(f"WebSocket chat_stream error: {stream_err}")
+                    await manager.send_personal(
+                        {"type": "chat_error", "message": str(stream_err), "request_id": request_id},
+                        user_id,
+                    )
     
     except WebSocketDisconnect:
         manager.disconnect(websocket, user_id)

@@ -8,6 +8,7 @@ import logging
 from typing import Dict, Any, List
 from sqlalchemy import text
 from app.db.connections import get_neo4j_driver, get_postgres_session
+from app.services.cache_service import get_cache_service
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,12 @@ class DashboardService:
     
     async def get_stats(self) -> List[Dict[str, Any]]:
         """Get global graph statistics."""
+        cache = get_cache_service()
+        cache_key = f"{cache.analytics_prefix}dashboard:stats"
+        cached = await cache.get_cached_value(cache_key)
+        if cached is not None:
+            return cached
+
         driver = get_neo4j_driver()
         
         async with driver.session() as session:
@@ -36,12 +43,14 @@ class DashboardService:
             doc_result = await session.execute(text("SELECT count(*) FROM neural_nexus.files WHERE status = 'completed'"))
             doc_count = doc_result.scalar()
             
-        return [
+        payload = [
             {"label": "Total Nodes", "value": f"{node_count:,}", "change": "Live", "trend": "up"},
             {"label": "Relationships", "value": f"{rel_count:,}", "change": "Live", "trend": "up"},
             {"label": "Entity Types", "value": str(type_count), "change": "Active", "trend": "up"},
             {"label": "Stored Documents", "value": str(doc_count), "change": "Processed", "trend": "up"},
         ]
+        await cache.set_cached_value(cache_key, payload, ttl=60)
+        return payload
 
     async def get_recent_activity(self, limit: int = 5) -> List[Dict[str, Any]]:
         """Get recent activity from audit logs."""

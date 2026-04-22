@@ -12,6 +12,7 @@ from app.core.security import get_current_user
 from app.db.connections import get_neo4j
 from app.core.config import settings
 from app.utils.graph_utils import get_node_name, get_node_type, clean_label
+from app.services.cache_service import CacheService, get_cache_service
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -29,9 +30,16 @@ async def get_all_node_types(
     folder_id: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_user),
     neo4j = Depends(get_neo4j),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """Retrieve all unique node types and their counts. Optional: Filter by folder_id."""
     try:
+        scope = folder_id or "global"
+        cache_key = f"browse_types:{scope}"
+        cached = await cache.get_cached_value(f"{cache.analytics_prefix}{cache_key}")
+        if cached is not None:
+            return cached
+
         where_clause = ""
         params = {}
         if folder_id:
@@ -68,7 +76,9 @@ async def get_all_node_types(
         final_types = [{"type": k, "count": v} for k, v in merged_types.items()]
         final_types.sort(key=lambda x: x["count"], reverse=True)
         
-        return {"types": final_types, "total_types": len(final_types)}
+        payload = {"types": final_types, "total_types": len(final_types)}
+        await cache.set_cached_value(f"{cache.analytics_prefix}{cache_key}", payload, ttl=180)
+        return payload
     except Exception as e:
         logger.error(f"Failed to fetch node types: {e}")
         return {"types": [], "total_types": 0}
@@ -82,6 +92,7 @@ async def get_nodes_by_type(
     page_size: int = Query(20, ge=1, le=100),
     current_user: dict = Depends(get_current_user),
     neo4j = Depends(get_neo4j),
+    cache: CacheService = Depends(get_cache_service),
 ) -> Dict[str, Any]:
     """
     Get paginated nodes of a specific type with connection statistics.
@@ -89,6 +100,12 @@ async def get_nodes_by_type(
     """
     try:
         skip = (page - 1) * page_size
+        scope = folder_id or "global"
+        query_part = (q or "").strip().lower()
+        cache_key = f"browse_nodes:{scope}:{node_type}:{page}:{page_size}:{query_part}"
+        cached = await cache.get_cached_value(f"{cache.analytics_prefix}{cache_key}")
+        if cached is not None:
+            return cached
         
         # Use a more robust check that mirrors get_all_node_types and handles suffixes
         # We first identify the 'raw' type, then clean it, then compare
@@ -158,13 +175,15 @@ async def get_nodes_by_type(
                 "connections": connections
             })
             
-        return {
+        payload = {
             "nodes": nodes,
             "total": total_nodes,
             "page": page,
             "page_size": page_size,
             "total_pages": (total_nodes + page_size - 1) // page_size if total_nodes > 0 else 0
         }
+        await cache.set_cached_value(f"{cache.analytics_prefix}{cache_key}", payload, ttl=120)
+        return payload
     except Exception as e:
         logger.error(f"Failed to fetch nodes for type {node_type}: {e}")
         return {"nodes": [], "total": 0, "error": str(e)}
