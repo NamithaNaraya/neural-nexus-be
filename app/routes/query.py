@@ -199,7 +199,13 @@ async def list_chat_sessions_v2(
         # Optimized window function approach for clean distinct sessions with latest message
         result = await session.execute(
             text("""
-                WITH latest_messages AS (
+                WITH session_stats AS (
+                    SELECT session_id, count(*) as message_count
+                    FROM neural_nexus.chat_history
+                    WHERE user_id = :user_id
+                    GROUP BY session_id
+                ),
+                latest_messages AS (
                     SELECT 
                         session_id, 
                         message as last_message, 
@@ -208,10 +214,11 @@ async def list_chat_sessions_v2(
                     FROM neural_nexus.chat_history
                     WHERE user_id = :user_id
                 )
-                SELECT session_id, last_message, last_activity
-                FROM latest_messages
-                WHERE rn = 1
-                ORDER BY last_activity DESC
+                SELECT lm.session_id, lm.last_message, lm.last_activity, ss.message_count
+                FROM latest_messages lm
+                JOIN session_stats ss ON lm.session_id = ss.session_id
+                WHERE lm.rn = 1
+                ORDER BY lm.last_activity DESC
             """),
             {"user_id": current_user['id']}
         )

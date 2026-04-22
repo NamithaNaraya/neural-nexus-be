@@ -614,22 +614,6 @@ class CombinedRAGService:
         
         logger.info(f"📝 Streamed {chunk_count} content chunks")
 
-        t_synth = time.time()
-        logger.info(f"⏱️ Phase 3 (synthesis): {t_synth - t_retrieval:.2f}s")
-        logger.info(f"⏱️ TOTAL: {t_synth - t_start:.2f}s")
-
-        # ── Step 4: Finalize ───────────────────────────────────
-        logger.info(f"✅ Research completed for user {user_id}")
-        yield json.dumps({"type": "step", "id": 4, "status": "Research completed."}) + "\n"
-
-        try:
-            await self.redis.rpush(history_key, json.dumps({"role": "user", "content": question}))
-            await self.redis.rpush(history_key, json.dumps({"role": "assistant", "content": full_answer}))
-            await self.redis.ltrim(history_key, -20, -1)
-            await self.redis.expire(history_key, 86400)
-        except Exception as e:
-            logger.warning(f"Failed to save history to Redis: {e}")
-
         # ── Save to PostgreSQL for persistent cross-session history ──
         try:
             from sqlalchemy import text as sa_text
@@ -700,15 +684,16 @@ class CombinedRAGService:
             "context_summary": f"Retrieved from folder {folder_id or 'global'}.",
         }
 
-    # ────────────────────────────────────────────────────────────
-    #  Answer Prompt (polished, user-friendly)
-    # ────────────────────────────────────────────────────────────
-
     def _build_answer_prompt(self, question: str, context: str, folder_id: Optional[str], fast_mode: bool = False) -> str:
         has_context = bool(context.strip())
+        
+        # STRICT UI REQUIREMENT: NO TECHNICAL IDS
+        id_rule = "CRITICAL: NEVER include technical node IDs, UUIDs, or database identifiers in your response. Refer to items by their 'Name' only."
+
         if fast_mode:
             if not has_context:
                 return f"""You are Neural Nexus, a concise knowledge-graph assistant.
+{id_rule}
 
 The user asked: "{question}"
 
@@ -717,6 +702,7 @@ No matching data was found in the active folder{f' ({folder_id})' if folder_id e
 Reply briefly, explain that you could not find a confident match, and suggest a clearer rephrase or another folder. Do not fabricate data."""
 
             return f"""You are Neural Nexus, a concise knowledge-graph assistant.
+{id_rule}
 
 Answer using only the CONTEXT below.
 If the context includes "[DATABASE FACTS]", use those counts and lists exactly.
@@ -731,6 +717,7 @@ Answer in the shortest form that fully addresses the question."""
 
         if not has_context:
             return f"""You are the **Neural Nexus Research Assistant** — a friendly, knowledgeable expert.
+{id_rule}
 
 The user asked: "{question}"
 
@@ -744,64 +731,6 @@ Please respond politely:
 Keep your tone warm, professional, and encouraging. Do NOT fabricate data."""
 
         return f"""You are Neural Nexus — a sharp, knowledgeable assistant that answers questions from a knowledge graph.
-
-RULES:
-• Answer ONLY from the CONTEXT below. It is real data from the user's active knowledge graph.
-• CONVERSATION CONTINUITY: The user may refer to previous answers using "them", "it", "those", "he", "she", etc. Check the conversation history (previous messages) to resolve these references. Always answer in the context of the ongoing conversation.
-• Never say "the data doesn't contain" if it actually does — read carefully.
-• Never pad with boilerplate like "Certainly!", "Great question", "Executive Summary", "Key Findings", or "Key Takeaways".
-• NEVER use section headers (##, ###) unless the answer is genuinely multi-part.
-• Be direct. Answer first, then support with data.
-• PRIORITY: If the context contains "DATABASE FACTS", those are AUTHORITATIVE counts and complete lists queried directly from the graph database. For counting questions ("how many X?") or listing questions ("list all X"), ALWAYS use the DATABASE FACTS numbers — they are exact and complete. Other sources (semantic search, vector search) are approximate and may be incomplete.
-
-CONTEXT:
-{context}
-
-QUESTION: {question}
-
-RESPONSE STRUCTURE — always follow this pattern based on question type:
-
-─── PATTERN A: "Which X / List / What are all" questions ───
-1. **Opening sentence**: Give a direct answer (e.g. "Your data contains 3 herbs with anti-inflammatory phytochemicals.").
-2. **Table**: Show ALL relevant columns with every data point from the context.
-3. **Summary** (2-3 sentences): After the table, explain what this means in plain English — highlight any notable patterns, the most common items, or key takeaway from the data.
-
-─── PATTERN B: Simple fact / yes-no ───
-Answer in 1-2 sentences only. No table, no headers.
-
-─── PATTERN C: How / Why / Explain ───
-Short paragraphs, **bold** key terms. Max 4-5 sentences total.
-
-─── PATTERN D: Comparison / ranking ───
-Opening sentence → table with comparison columns → 1-2 sentence takeaway.
-
-─── PATTERN E: Algorithm / graph analysis ───
-Opening sentence → ranked table with score column → summary that DIRECTLY answers the user's question.
-If the CONTEXT contains GDS/algorithm results (look for sections labeled "Graph Algorithm" or "GDS"), you MUST follow this structure:
-
-STEP 1 — State the algorithm:
-Open with ONE sentence identifying which algorithm was used and what it mathematically measures. Use this reference:
-  - PageRank → measures global importance via link quality (score = probability of being visited)
-  - ArticleRank → improved PageRank for diverse degree distributions (score = adjusted importance)
-  - Betweenness Centrality → measures how often a node lies on shortest paths (score = fraction of shortest paths passing through)
-  - Closeness Centrality → measures how close a node is to all others (score = inverse of average distance)
-  - Degree Centrality → counts direct connections (score = fraction of possible connections)
-  - HITS → identifies hubs (link to many) and authorities (linked by many) (hub_score + auth_score)
-  - Louvain / Leiden → community detection (community_id = cluster assignment)
-  - WCC → weakly connected components (component_id = component assignment)
-  - K-Core → stable densely-connected core (coreness = minimum degree within core)
-  - Triangle Count → local clustering density (triangles = count of triangles through node)
-  - Node Similarity → shared connectivity patterns (similarity = Jaccard coefficient 0-1)
-  - Link Prediction → predicts missing connections (score = likelihood of future link)
-  - Topological Sort → linear ordering of nodes (position = order rank)
-
-STEP 2 — Ranked table:
-Present the results in a Markdown table with THESE EXACT columns:
-  | Rank | Name | Type | [Algorithm Score Column] |
-The score column name MUST match the algorithm used (e.g., "PageRank Score", "Betweenness Score", "Closeness Score", "Community ID", "Similarity Score", "Triangles", "Coreness").
-- Round decimal scores to 4-6 decimal places.
-- Include ALL results from the context, not just top 3.
-
 STEP 3 — Answer the question:
 Write 2-3 sentences that DIRECTLY answer the user's original question using the algorithm results.
 - Name the #1 result explicitly and explain WHY it ranked highest.
