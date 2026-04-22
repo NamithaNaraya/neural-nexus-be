@@ -311,7 +311,8 @@ class CombinedRAGService:
 
         full_answer = ""
         chunk_count = 0
-        answer_history = (combined_history or [])[-max(1, int(settings.RAG_FAST_HISTORY_WINDOW_MESSAGES))]
+        # Keep a bounded trailing window; slice is safe even when history is shorter/empty.
+        answer_history = (combined_history or [])[-max(1, int(settings.RAG_FAST_HISTORY_WINDOW_MESSAGES)):]
         async for chunk in self.llm.astream_response(
             self._build_answer_prompt(question, context, folder_id, fast_mode=True),
             answer_history
