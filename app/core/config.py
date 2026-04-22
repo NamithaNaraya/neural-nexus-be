@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     GRAPH_FOLDER_DEFAULT_LIMIT: int = 1000
     GRAPH_FOLDER_MAX_LIMIT: int = 10000
     GRAPH_LINK_LIMIT_MULTIPLIER: int = 2
+    GRAPH_LINK_HARD_MAX_LIMIT: int = 40000
     
     # === Feature Flags ===
     ENABLE_WEBSOCKET: bool = True

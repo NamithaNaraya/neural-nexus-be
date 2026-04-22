@@ -140,6 +140,12 @@ def _sanitize_limit(limit: int, default_limit: int, max_limit: int) -> int:
     return max(1, min(parsed, max_limit))
 
 
+def _safe_link_limit(node_limit: int) -> int:
+    """Compute a bounded relationship limit from node limit."""
+    requested = node_limit * max(1, settings.GRAPH_LINK_LIMIT_MULTIPLIER)
+    return min(requested, max(1, settings.GRAPH_LINK_HARD_MAX_LIMIT))
+
+
 async def check_folder_write_permission(folder_id: Optional[str], user_id: str) -> None:
     """
     Verify the user has write permission for the given folder.
@@ -359,6 +365,7 @@ async def get_folder_graph(
     current_user: dict = Depends(get_current_user),
     node_type: Optional[str] = Query(default=None),
     min_connections: int = Query(default=0),
+    offset: int = Query(default=0, ge=0),
     limit: int = Query(default=settings.GRAPH_FOLDER_DEFAULT_LIMIT, ge=1, le=settings.GRAPH_FOLDER_MAX_LIMIT),
     neo4j = Depends(get_neo4j),
     cache = Depends(get_cache_service),
@@ -369,7 +376,7 @@ async def get_folder_graph(
         default_limit=settings.GRAPH_FOLDER_DEFAULT_LIMIT,
         max_limit=settings.GRAPH_FOLDER_MAX_LIMIT,
     )
-    cache_key = f"folder_{folder_id}_{node_type}_{min_connections}_{safe_limit}"
+    cache_key = f"folder_{folder_id}_{node_type}_{min_connections}_{offset}_{safe_limit}"
     
     # TEMPORARY: Skip cache to ensure fresh data with link properties
     # Check cache
@@ -383,6 +390,7 @@ async def get_folder_graph(
         query_params = {
             "folder_id": folder_id,
             "min_connections": min_connections,
+            "offset": offset,
             "limit": safe_limit,
         }
         if node_type:
@@ -399,7 +407,8 @@ async def get_folder_graph(
         WITH n, count(DISTINCT r) as degree
         WHERE degree >= $min_connections
         RETURN n, degree
-        ORDER BY degree DESC
+        ORDER BY degree DESC, COALESCE(n.id, n.entity_id, elementId(n)) ASC
+        SKIP $offset
         LIMIT $limit
         """
         
@@ -459,7 +468,7 @@ async def get_folder_graph(
         
         links_result = await neo4j.execute_query(links_query, {
             "folder_id": folder_id,
-            "limit": safe_limit * max(1, settings.GRAPH_LINK_LIMIT_MULTIPLIER),
+            "limit": _safe_link_limit(safe_limit),
         })
         
         links = []
@@ -470,9 +479,6 @@ async def get_folder_graph(
             rel_type = record["rel_type"]
             if source_id in node_ids and target_id in node_ids:
                 serialized_props = serialize_neo4j_values(raw_props or {})
-                # DIAGNOSTIC: Log link properties for HAS_QUALITY relationships  
-                if rel_type == "HAS_QUALITY":
-                    logger.info(f"[LINK DIAG FOLDER] {rel_type}: {source_id[:8]}...->{target_id[:8]}... raw={raw_props} final={serialized_props}")
                 links.append(LinkResponse(
                     id=str(record["id"]),
                     source=source_id,
