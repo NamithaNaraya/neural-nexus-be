@@ -74,16 +74,25 @@ class EmbeddingService:
                 except Exception as e:
                     logger.warning(f"[EmbeddingService] Layer 1 (Vector) failed: {e}")
 
-            # ── Layer 2: Lexical Keyword Search (always runs) ──────────────
+            # ── Layer 2: Lexical Keyword Search (ALL properties) ──────────
             if terms:
                 try:
+                    # Search across ALL string properties dynamically — not just name/description.
+                    # This catches commonName, scientificName, synonyms, origin, family, etc.
+                    _SKIP_PROPS = ['id', 'embedding', 'folder_id', 'file_id', 'fastrp_embedding',
+                                   'created_at', 'updated_at', 'source_count']
                     lexical_query = """
                         MATCH (node:Entity)
                         WHERE node.name IS NOT NULL
                           AND ($folder_id IS NULL OR node.folder_id = $folder_id)
                           AND ANY(term IN $terms WHERE
                                 toLower(node.name) CONTAINS term
-                                OR toLower(coalesce(node.description, '')) CONTAINS term)
+                                OR toLower(coalesce(node.description, '')) CONTAINS term
+                                OR ANY(key IN keys(node) WHERE
+                                    NOT key IN $skip_props
+                                    AND toLower(toString(node[key])) CONTAINS term
+                                )
+                          )
                         RETURN node.name       AS name,
                                coalesce(node.description, node.text, '') AS text,
                                labels(node)    AS labels,
@@ -91,14 +100,14 @@ class EmbeddingService:
                                coalesce(node.id, elementId(node)) AS node_id
                         LIMIT 15
                     """
-                    res = await session.run(lexical_query, folder_id=folder_id, terms=terms)
+                    res = await session.run(lexical_query, folder_id=folder_id, terms=terms, skip_props=_SKIP_PROPS)
                     lex_data = await res.data()
                     for r in lex_data:
                         key = r["name"].lower()
                         if key not in seen_names:
                             all_results.append(r)
                             seen_names.add(key)
-                    logger.info(f"[EmbeddingService] Layer 2 (Lexical): {len(lex_data)} results")
+                    logger.info(f"[EmbeddingService] Layer 2 (Lexical All-Props): {len(lex_data)} results")
                 except Exception as e:
                     logger.warning(f"[EmbeddingService] Layer 2 (Lexical) failed: {e}")
 

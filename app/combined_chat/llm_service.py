@@ -184,7 +184,7 @@ class OllamaService(BaseLLMService):
         self.llm = ChatOllama(
             model=settings.OLLAMA_MODEL,
             base_url=settings.OLLAMA_BASE_URL,
-            temperature=0.05,
+            temperature=0.45,
             top_p=settings.OLLAMA_TOP_P,
             repeat_penalty=settings.OLLAMA_REPEAT_PENALTY,
             num_predict=settings.OLLAMA_NUM_PREDICT,

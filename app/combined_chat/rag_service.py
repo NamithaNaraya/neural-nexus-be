@@ -208,6 +208,52 @@ class CombinedRAGService:
     def _normalize_question(self, question: str) -> str:
         return re.sub(r"\s+", " ", question.lower().strip())
 
+    async def _expand_query_terms(self, question: str) -> List[str]:
+        """
+        Intent-aware query expansion using the LLM.
+        
+        Goes beyond simple synonyms — understands user INTENT and generates
+        database-appropriate search terms. Examples:
+          - "what helps with stress?" → ["anxiety", "adaptogen", "nervine", "calming", "anxiolytic"]
+          - "benefits of tulasi" → ["tulsi", "holy basil", "ocimum tenuiflorum", "sacred basil", "therapeutic uses"]
+          - "what is good for skin?" → ["dermatological", "skin care", "anti-inflammatory", "wound healing", "cosmetic"]
+        
+        Fast: ~5s timeout, non-streaming, fails gracefully.
+        """
+        try:
+            prompt = (
+                "You are a search query optimizer for a knowledge graph database. "
+                "The user asked a question but the database may use different terminology.\n\n"
+                "Your job:\n"
+                "1. Understand the user's INTENT (what they really want to know)\n"
+                "2. Generate search terms the DATABASE might use instead\n"
+                "3. Include: synonyms, scientific names, common names, related medical/technical terms, "
+                "alternate spellings, abbreviations, and conceptually related terms\n\n"
+                "RULES:\n"
+                "- Return ONLY a comma-separated list of search terms\n"
+                "- Include both the obvious synonyms AND the conceptual bridges\n"
+                "- Max 10 terms, no explanations, no numbering\n"
+                "- If the user uses a common name, include scientific name and vice versa\n"
+                "- If the user asks about effects/benefits/uses, include the medical/pharmacological terms\n\n"
+                f"User question: \"{question}\"\n\n"
+                "Search terms:"
+            )
+            response = await asyncio.wait_for(
+                self.llm.generate_response(prompt),
+                timeout=6.0,
+            )
+            raw = response.strip().lower()
+            if not raw or raw == "none" or "error" in raw:
+                return []
+            # Parse comma-separated terms
+            terms = [t.strip().strip('"\'.-') for t in raw.split(",") if t.strip() and len(t.strip()) > 1]
+            # Filter out noise and overly long terms
+            terms = [t for t in terms if 1 < len(t) < 60 and t != "none" and not t.startswith("search")][:10]
+            return terms
+        except Exception as e:
+            logger.debug(f"Intent-aware expansion failed (non-critical): {e}")
+            return []
+
     def _select_retrieval_mode(self, question: str, folder_id: Optional[str]) -> str:
         normalized = self._normalize_question(question)
         if normalized in self._greetings:
@@ -248,9 +294,18 @@ class CombinedRAGService:
         yield json.dumps({"type": "step", "id": 2, "status": "Searching relevant sources..."}) + "\n"
 
         normalized_question = self._normalize_question(question)
+
+        # ── Query Expansion: generate synonyms/alternate terms ──
+        # Handles: tulasi→tulsi, stress→anxiety, benefits→uses, etc.
+        expanded_terms = await self._expand_query_terms(question)
+        search_question = normalized_question
+        if expanded_terms:
+            search_question = f"{normalized_question} {' '.join(expanded_terms)}"
+            logger.info(f"🔍 Query expanded: {expanded_terms}")
+
         vector_task = asyncio.create_task(
             asyncio.wait_for(
-                self.vector_engine.vector_search(normalized_question, folder_id),
+                self.vector_engine.vector_search(search_question, folder_id),
                 timeout=_FAST_RETRIEVAL_TIMEOUT,
             )
         )
@@ -260,7 +315,7 @@ class CombinedRAGService:
             named_tasks.append((
                 "Focused Entity Scan",
                 asyncio.create_task(
-                    asyncio.wait_for(self._focused_entity_scan(normalized_question, folder_id), timeout=_FAST_RETRIEVAL_TIMEOUT)
+                    asyncio.wait_for(self._focused_entity_scan(search_question, folder_id), timeout=_FAST_RETRIEVAL_TIMEOUT)
                 ),
             ))
         if catalog_mode and folder_id:
@@ -300,6 +355,40 @@ class CombinedRAGService:
             fused.append(f"=== {name} ===\n{res_str}")
 
         context = "\n\n".join(fused)
+
+        # ── Intent-aware Re-retrieval: if context is thin, try again with LLM-rewritten query ──
+        if len(context.strip()) < 50 and folder_id:
+            logger.info("🔄 Thin context — attempting intent-aware re-retrieval...")
+            yield json.dumps({"type": "step", "id": 2, "status": "Refining search with intent analysis..."}) + "\n"
+            try:
+                rewrite_prompt = (
+                    f"The user asked: \"{question}\"\n"
+                    "No direct matches were found in the knowledge graph database.\n"
+                    "Think about what entities, concepts, or relationships the database MIGHT contain "
+                    "that are RELATED to this question.\n"
+                    "Generate 5-8 short search keywords that a knowledge graph database about "
+                    "herbs, plants, biomarkers, compounds, diseases, or similar topics would likely contain.\n"
+                    "Return ONLY a comma-separated list. No explanations."
+                )
+                rewrite_resp = await asyncio.wait_for(
+                    self.llm.generate_response(rewrite_prompt), timeout=6.0
+                )
+                rewrite_terms = [t.strip().strip('"\'') for t in rewrite_resp.split(",")
+                                if t.strip() and 1 < len(t.strip()) < 60][:8]
+                if rewrite_terms:
+                    rewrite_query = " ".join(rewrite_terms)
+                    logger.info(f"🔄 Re-retrieval query: {rewrite_query}")
+                    retry_result = await asyncio.wait_for(
+                        self._focused_entity_scan(rewrite_query, folder_id),
+                        timeout=_FAST_RETRIEVAL_TIMEOUT,
+                    )
+                    if retry_result and len(str(retry_result).strip()) > 50:
+                        fused.append(f"=== Intent-Matched Re-retrieval ===\n{retry_result}")
+                        context = "\n\n".join(fused)
+                        logger.info(f"✅ Re-retrieval succeeded: {len(context)} chars of context")
+            except Exception as e:
+                logger.debug(f"Re-retrieval failed (non-critical): {e}")
+
         if len(context) > _FAST_CONTEXT_CHARS:
             logger.info(f"✂️ Trimming fast context from {len(context)} to {_FAST_CONTEXT_CHARS} chars")
             context = context[:_FAST_CONTEXT_CHARS]
@@ -827,11 +916,14 @@ class CombinedRAGService:
         id_rule = "CRITICAL: NEVER include technical node IDs, UUIDs, or database identifiers in your response. Refer to items by their 'Name' only."
 
         grounding_rule = (
-            "DATA INTEGRITY RULE: Your answer MUST be based ONLY on the CONTEXT provided below. "
-            "If the CONTEXT section is empty, contains no relevant data, or does not contain information to answer the question, "
-            "you MUST clearly state: 'This information was not found in the current knowledge graph database.' "
-            "Do NOT fabricate, hallucinate, or guess data. Do NOT use your general training knowledge to answer factual questions about the database. "
-            "You may only use general knowledge to explain concepts if explicitly asked."
+            "ABSOLUTE DATA GROUNDING RULE — THIS IS YOUR MOST IMPORTANT INSTRUCTION:\n"
+            "• Your answer MUST contain ONLY facts, entities, relationships, and properties found in the CONTEXT below.\n"
+            "• Do NOT add ANY information from your general training knowledge — not even common facts about the topic.\n"
+            "• Do NOT explain what something 'is generally known for' or 'is commonly used for' unless that exact info is in the CONTEXT.\n"
+            "• If the CONTEXT does not contain relevant data, say ONLY: 'This information was not found in the current knowledge graph database.'\n"
+            "• If the CONTEXT contains partial data, answer ONLY what the CONTEXT supports and clearly state what was NOT found.\n"
+            "• Every claim in your answer must be traceable to a specific node, property, or relationship in the CONTEXT.\n"
+            "• NEVER fabricate, guess, infer, or supplement with outside knowledge."
         )
 
         if fast_mode:
@@ -849,20 +941,28 @@ You MUST:
 2. Suggest the user try rephrasing or selecting a different folder.
 3. Do NOT provide any fabricated data or guesses."""
 
-            return f"""You are Neural Nexus, a concise knowledge-graph assistant.
+            return f"""You are Neural Nexus, an eloquent and knowledgeable research assistant.
 {id_rule}
 {grounding_rule}
 
 Answer using ONLY the CONTEXT below.
 If the context includes "[DATABASE FACTS]", use those counts and lists exactly.
-Be direct, accurate, and brief. Avoid filler.
+
+FORMATTING RULES:
+- Start with a clear, direct answer sentence.
+- Use **bold** for key entity names, compounds, or important terms.
+- Use bullet points for listing multiple items — keep each bullet concise.
+- If listing more than 3 items, group them logically (e.g., by category, by relationship type).
+- End with a brief insight or takeaway sentence.
+- Use markdown formatting for readability.
+- Keep the tone professional yet warm and engaging.
 
 CONTEXT:
 {context}
 
 QUESTION: {question}
 
-Answer in the shortest form that fully addresses the question. If the context does not contain enough information, say so clearly."""
+Provide a well-structured, aesthetically pleasing answer. If the context does not contain enough information, say so clearly."""
 
         if not has_context:
             return f"""You are the **Neural Nexus Research Assistant** — a friendly, knowledgeable expert.
@@ -879,7 +979,7 @@ You MUST respond:
 3. Offer helpful follow-up suggestions based on the question topic.
 4. Do NOT fabricate or guess any data. Keep your tone warm, professional, and encouraging."""
 
-        return f"""You are Neural Nexus — a sharp, knowledgeable assistant that answers questions from a knowledge graph.
+        return f"""You are Neural Nexus — a sharp, knowledgeable research assistant that delivers beautifully formatted answers.
 {id_rule}
 {grounding_rule}
 
@@ -888,21 +988,17 @@ CONTEXT:
 
 QUESTION: {question}
 
-STEP 3 — Answer the question:
-Write 2-3 sentences that DIRECTLY answer the user's original question using the retrieved data.
-- Name the #1 result explicitly and explain WHY it ranked highest.
-- If there is a pattern (e.g., all top nodes are the same type, scores drop off sharply), mention it.
-- Connect the finding to the user's question — don't just describe the algorithm generically.
-
-TABLE RULES:
-- NEVER omit the score column — it is the mathematical evidence that supports your answer.
-- Column headers should be short and clear.
-- Always wrap the table with an opening sentence AND a closing summary.
-
-AFTER-TABLE SUMMARY RULES:
-- 2-3 sentences max.
-- Directly answer the user's question first, then mention any notable pattern.
-- Write in plain English — no jargon, no bullet points in the summary.
+FORMATTING & STYLE RULES:
+1. **Opening**: Start with 1-2 sentences that directly answer the question. Use **bold** for key findings.
+2. **Body**: Present the data in ONE of these formats (pick the best fit):
+   - Bullet list for enumerating items, properties, or connections
+   - Markdown table for comparing scores, rankings, or multi-attribute data
+   - Grouped sections with sub-headers for complex multi-part answers
+3. **Key entities** should be in **bold**, relationships in *italics*
+4. **Tables** (when used): include a score column, short headers, wrap with context sentences
+5. **Closing**: End with a brief insight, pattern observation, or actionable takeaway
+6. **Tone**: Professional, warm, and engaging — like a knowledgeable colleague explaining findings
+7. **Length**: Be thorough but not verbose. Quality over quantity.
 
 HONESTY: If context is truly incomplete for a specific sub-question, say so clearly in one sentence."""
 
@@ -1549,36 +1645,68 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
             return ""
 
         try:
+            _SKIP_PROPS = ['id', 'embedding', 'folder_id', 'file_id', 'fastrp_embedding',
+                           'created_at', 'updated_at', 'source_count']
+
             async with self.neo4j.session() as session:
-                # Step 1: Find direct keyword matches safely (parameterized).
+                # Step 1: Find keyword matches across ALL string properties (not just name).
+                # This catches commonName, scientificName, synonyms, origin, family, etc.
                 keywords = words[:6]
                 find_query = f"""
                     MATCH (n:{folder_label})
                     WHERE n.name IS NOT NULL
-                      AND any(kw IN $keywords WHERE toLower(n.name) CONTAINS kw)
+                      AND any(kw IN $keywords WHERE
+                          toLower(n.name) CONTAINS kw
+                          OR ANY(key IN keys(n) WHERE
+                              NOT key IN $skip_props
+                              AND toLower(toString(n[key])) CONTAINS kw
+                          )
+                      )
                     RETURN DISTINCT n.name AS name
                     LIMIT 8
                 """
-                res = await session.run(find_query, keywords=keywords)
+                res = await session.run(find_query, keywords=keywords, skip_props=_SKIP_PROPS)
                 found = await res.data()
 
-                # Step 1b: If nothing matched, do typo-tolerant fuzzy candidate lookup.
+                # Step 1b: If nothing matched, do typo-tolerant fuzzy candidate lookup
+                # against ALL string property values (not just name).
                 if not found:
                     names_query = f"""
                         MATCH (n:{folder_label})
                         WHERE n.name IS NOT NULL
-                        RETURN DISTINCT n.name AS name
+                        WITH n, n.name AS name,
+                             [key IN keys(n) WHERE NOT key IN $skip_props
+                              | toLower(toString(n[key]))] AS prop_values
+                        RETURN DISTINCT name, prop_values
                         LIMIT 4000
                     """
-                    names_res = await session.run(names_query)
-                    candidates = [str(row.get("name", "")).strip() for row in await names_res.data()]
-                    candidates_l = [c.lower() for c in candidates if c]
+                    names_res = await session.run(names_query, skip_props=_SKIP_PROPS)
+                    rows = await names_res.data()
+                    # Build a flat list of all searchable text per node
+                    candidates = []
+                    candidate_names = {}  # searchable_text → node name
+                    for row in rows:
+                        node_name = str(row.get("name", "")).strip()
+                        if not node_name:
+                            continue
+                        # Add the name itself
+                        candidates.append(node_name.lower())
+                        candidate_names[node_name.lower()] = node_name
+                        # Add all property values
+                        for pval in (row.get("prop_values") or []):
+                            pval_str = str(pval).strip().lower()
+                            if pval_str and len(pval_str) > 2:
+                                candidates.append(pval_str)
+                                candidate_names[pval_str] = node_name
+
                     fuzzy_hits = set()
                     for kw in keywords:
-                        for hit in difflib.get_close_matches(kw, candidates_l, n=5, cutoff=0.78):
-                            fuzzy_hits.add(hit)
+                        for hit in difflib.get_close_matches(kw, candidates, n=5, cutoff=0.65):
+                            matched_name = candidate_names.get(hit)
+                            if matched_name:
+                                fuzzy_hits.add(matched_name)
                     if fuzzy_hits:
-                        found = [{"name": c} for c in candidates if c.lower() in fuzzy_hits][:8]
+                        found = [{"name": n} for n in fuzzy_hits][:8]
 
                 if not found:
                     return ""
