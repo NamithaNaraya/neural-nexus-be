@@ -184,11 +184,13 @@ class OllamaService(BaseLLMService):
         self.llm = ChatOllama(
             model=settings.OLLAMA_MODEL,
             base_url=settings.OLLAMA_BASE_URL,
-            temperature=0.1,
+            temperature=0.05,
             top_p=settings.OLLAMA_TOP_P,
             repeat_penalty=settings.OLLAMA_REPEAT_PENALTY,
             num_predict=settings.OLLAMA_NUM_PREDICT,
             num_ctx=settings.OLLAMA_NUM_CTX,
+            repeat_last_n=128,
+            frequency_penalty=0.3,
         )
         self._timeout_seconds = max(10, settings.OLLAMA_CHAT_TIMEOUT_SECONDS)
         self._retry_attempts = max(1, settings.OLLAMA_RETRY_ATTEMPTS)
@@ -228,13 +230,31 @@ class OllamaService(BaseLLMService):
         return "Error: Ollama response timed out. Please try a shorter or more specific question."
 
     async def astream_response(self, prompt: str, history: Optional[List[Dict[str, str]]] = None):
-        """Streaming for Ollama."""
+        """Streaming for Ollama with token-level deduplication."""
         try:
             messages = self._build_messages(prompt, history)
+            # Sliding window dedup to catch model stuttering (e.g. "TheThe", "acid acid")
+            recent_window = ""  # last N chars of output
+            WINDOW_SIZE = 80
             async with asyncio.timeout(self._timeout_seconds):
                 async for chunk in self.llm.astream(messages):
                     if chunk and chunk.content:
-                        yield chunk.content
+                        token = chunk.content
+                        # Check for immediate token-level repetition:
+                        # If the recent window ends with this exact token, skip it
+                        if len(token.strip()) >= 2 and recent_window.endswith(token):
+                            logger.debug(f"Dedup: skipped repeated token '{token}'")
+                            continue
+                        # Check for word-level stutter at boundary:
+                        # e.g. window ends with "acid " and token is "acid"
+                        stripped = token.strip()
+                        if stripped and len(stripped) >= 3:
+                            tail = recent_window[-len(stripped)-2:].strip()
+                            if tail.endswith(stripped):
+                                logger.debug(f"Dedup: skipped word-stutter '{token}'")
+                                continue
+                        recent_window = (recent_window + token)[-WINDOW_SIZE:]
+                        yield token
         except asyncio.TimeoutError:
             logger.warning(f"Ollama streaming timed out after {self._timeout_seconds}s")
             yield "\n[Ollama timeout]: The response took too long. Try a more specific question."

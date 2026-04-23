@@ -325,7 +325,9 @@ class CombinedRAGService:
                 logger.warning(f"🌐 Integrated Web Search failed: {e}")
 
         thin_context = len(context.strip()) < 50
+        is_grounded = len(context.strip()) >= 50
         yield json.dumps({"type": "web_search_suggestion", "data": suggest_web_search, "emphasized": thin_context}) + "\n"
+        yield json.dumps({"type": "data_grounding", "data": {"grounded": is_grounded, "source_count": len(fused), "context_chars": len(context)}}) + "\n"
 
         yield json.dumps({"type": "step", "id": 3, "status": "Synthesizing answer..."}) + "\n"
 
@@ -724,14 +726,16 @@ class CombinedRAGService:
                 logger.warning(f"🌐 Integrated Web Search failed: {e}")
 
         thin_context = len(context.strip()) < 50
+        is_grounded = len(context.strip()) >= 50
         yield json.dumps({"type": "web_search_suggestion", "data": suggest_web_search, "emphasized": thin_context}) + "\n"
+        yield json.dumps({"type": "data_grounding", "data": {"grounded": is_grounded, "source_count": len(fused), "context_chars": len(context), "algorithm": algo}}) + "\n"
 
         # ── Step 3: Synthesize (STREAMING token-by-token) ──────
         yield json.dumps({"type": "step", "id": 3, "status": "Synthesizing research results..."}) + "\n"
 
         # Flush padding: small JSON chunks (<100 bytes) get buffered by TCP/proxy.
         # Adding space padding forces the buffer to flush each chunk immediately.
-        _FLUSH_PAD = " " * 256
+
 
         full_answer = ""
         chunk_count = 0
@@ -742,7 +746,7 @@ class CombinedRAGService:
             if chunk:
                 full_answer += chunk
                 chunk_count += 1
-                yield json.dumps({"type": "content", "data": chunk}) + _FLUSH_PAD + "\n"
+                yield json.dumps({"type": "content", "data": chunk}) + "\n"
         
         logger.info(f"📝 Streamed {chunk_count} content chunks")
 
@@ -822,21 +826,34 @@ class CombinedRAGService:
         # STRICT UI REQUIREMENT: NO TECHNICAL IDS
         id_rule = "CRITICAL: NEVER include technical node IDs, UUIDs, or database identifiers in your response. Refer to items by their 'Name' only."
 
+        grounding_rule = (
+            "DATA INTEGRITY RULE: Your answer MUST be based ONLY on the CONTEXT provided below. "
+            "If the CONTEXT section is empty, contains no relevant data, or does not contain information to answer the question, "
+            "you MUST clearly state: 'This information was not found in the current knowledge graph database.' "
+            "Do NOT fabricate, hallucinate, or guess data. Do NOT use your general training knowledge to answer factual questions about the database. "
+            "You may only use general knowledge to explain concepts if explicitly asked."
+        )
+
         if fast_mode:
             if not has_context:
                 return f"""You are Neural Nexus, a concise knowledge-graph assistant.
 {id_rule}
+{grounding_rule}
 
 The user asked: "{question}"
 
 No matching data was found in the active folder{f' ({folder_id})' if folder_id else ''}.
 
-Reply briefly, explain that you could not find a confident match, and suggest a clearer rephrase or another folder. Do not fabricate data."""
+You MUST:
+1. State clearly that no matching data was found in the database for this query.
+2. Suggest the user try rephrasing or selecting a different folder.
+3. Do NOT provide any fabricated data or guesses."""
 
             return f"""You are Neural Nexus, a concise knowledge-graph assistant.
 {id_rule}
+{grounding_rule}
 
-Answer using only the CONTEXT below.
+Answer using ONLY the CONTEXT below.
 If the context includes "[DATABASE FACTS]", use those counts and lists exactly.
 Be direct, accurate, and brief. Avoid filler.
 
@@ -845,26 +862,34 @@ CONTEXT:
 
 QUESTION: {question}
 
-Answer in the shortest form that fully addresses the question."""
+Answer in the shortest form that fully addresses the question. If the context does not contain enough information, say so clearly."""
 
         if not has_context:
             return f"""You are the **Neural Nexus Research Assistant** — a friendly, knowledgeable expert.
 {id_rule}
+{grounding_rule}
 
 The user asked: "{question}"
 
-Unfortunately, no matching data was found in the active folder{f' ({folder_id})' if folder_id else ''}.
+No matching data was found in the active folder{f' ({folder_id})' if folder_id else ''}.
 
-Please respond politely:
-1. Acknowledge that you searched but found no matching results for this specific query.
+You MUST respond:
+1. Clearly state that you searched the knowledge graph database but found NO matching results for this specific query.
 2. Suggest possible reasons (e.g., the data might be in a different folder, or the question might need rephrasing).
 3. Offer helpful follow-up suggestions based on the question topic.
-
-Keep your tone warm, professional, and encouraging. Do NOT fabricate data."""
+4. Do NOT fabricate or guess any data. Keep your tone warm, professional, and encouraging."""
 
         return f"""You are Neural Nexus — a sharp, knowledgeable assistant that answers questions from a knowledge graph.
+{id_rule}
+{grounding_rule}
+
+CONTEXT:
+{context}
+
+QUESTION: {question}
+
 STEP 3 — Answer the question:
-Write 2-3 sentences that DIRECTLY answer the user's original question using the algorithm results.
+Write 2-3 sentences that DIRECTLY answer the user's original question using the retrieved data.
 - Name the #1 result explicitly and explain WHY it ranked highest.
 - If there is a pattern (e.g., all top nodes are the same type, scores drop off sharply), mention it.
 - Connect the finding to the user's question — don't just describe the algorithm generically.
@@ -879,7 +904,7 @@ AFTER-TABLE SUMMARY RULES:
 - Directly answer the user's question first, then mention any notable pattern.
 - Write in plain English — no jargon, no bullet points in the summary.
 
-HONESTY: If context is truly incomplete for a specific sub-question, say it in one sentence only."""
+HONESTY: If context is truly incomplete for a specific sub-question, say so clearly in one sentence."""
 
 
 

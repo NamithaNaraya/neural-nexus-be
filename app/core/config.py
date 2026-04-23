@@ -43,10 +43,10 @@ class Settings(BaseSettings):
     OLLAMA_EMBED_MODEL: str = "mxbai-embed-large:latest"
     OLLAMA_CHAT_TIMEOUT_SECONDS: int = 90
     OLLAMA_RETRY_ATTEMPTS: int = 2
-    OLLAMA_NUM_PREDICT: int = 768
+    OLLAMA_NUM_PREDICT: int = 4096
     OLLAMA_NUM_CTX: int = 8192
     OLLAMA_TOP_P: float = 0.9
-    OLLAMA_REPEAT_PENALTY: float = 1.05
+    OLLAMA_REPEAT_PENALTY: float = 1.3
     RAG_FAST_ANSWER_CACHE_TTL_SECONDS: int = 120
     RAG_HISTORY_WINDOW_MESSAGES: int = 20
     RAG_FAST_HISTORY_WINDOW_MESSAGES: int = 8

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from app.core.security import get_current_user
@@ -193,3 +194,46 @@ async def web_search(
             logging.getLogger(__name__).warning(f"Failed to save web search to PostgreSQL: {e}")
 
     return result
+
+
+class GeneralAnswerRequest(BaseModel):
+    question: str
+    session_id: Optional[str] = None
+
+
+@router.post("/general-answer")
+async def general_answer(
+    request: GeneralAnswerRequest,
+    current_user: dict = Depends(get_current_user),
+    service: CombinedRAGService = Depends(get_rag_service),
+):
+    """
+    Generate an answer using ONLY the LLM's general knowledge (no RAG retrieval).
+    Used when the user clicks "Answer outside DB" after an initial no-data response.
+    """
+    import json
+
+    prompt = (
+        f"You are a knowledgeable assistant. The user asked a question that had no matching data "
+        f"in their knowledge graph database. They have now requested a general knowledge answer.\n\n"
+        f"Question: {request.question}\n\n"
+        f"Provide a helpful, accurate answer based on your general training knowledge. "
+        f"Start your response with: '⚠️ **General Knowledge Answer** (not from your database):\\n\\n' "
+        f"Then answer the question thoroughly but concisely."
+    )
+
+    async def stream_general():
+        async for chunk in service.llm.astream_response(prompt):
+            if chunk:
+                yield json.dumps({"type": "content", "data": chunk}) + "\n"
+        yield json.dumps({"type": "done"}) + "\n"
+
+    return StreamingResponse(
+        stream_general(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )

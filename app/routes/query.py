@@ -162,7 +162,7 @@ async def run_query(
 @router.get("/query/chat/history/{session_id}")
 async def get_chat_history(
     session_id: str,
-    limit: int = 10,  # 5 Q&A pairs
+    limit: int = 200,  # Default to full session history
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     db_session_id = _to_uuid(session_id)
@@ -265,7 +265,4 @@ async def delete_chat_session(
         )
         await session.commit()
 
-    if chat_delete_result.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Session not found")
-
-    return {"message": f"Session {session_id} deleted with related records"}
+    return {"message": f"Session {session_id} deleted", "rows_removed": chat_delete_result.rowcount}

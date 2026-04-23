@@ -191,12 +191,21 @@ async def websocket_endpoint(
                             try:
                                 parsed = json.loads(chunk)
                             except Exception:
-                                parsed = {"type": "content", "data": chunk}
-                            await manager.send_personal(
-                                {"type": "chat_chunk", "data": parsed, "request_id": request_id},
-                                user_id,
-                            )
-                    await manager.send_personal({"type": "chat_done", "request_id": request_id}, user_id)
+                                # Skip unparseable fragments — do NOT re-wrap as content
+                                # (this was the root cause of word doubling)
+                                continue
+                            try:
+                                await websocket.send_text(json.dumps(
+                                    {"type": "chat_chunk", "data": parsed, "request_id": request_id}
+                                ))
+                            except Exception:
+                                break
+                    try:
+                        await websocket.send_text(json.dumps(
+                            {"type": "chat_done", "request_id": request_id}
+                        ))
+                    except Exception:
+                        pass
                 except Exception as stream_err:
                     logger.error(f"WebSocket chat_stream error: {stream_err}")
                     await manager.send_personal(
