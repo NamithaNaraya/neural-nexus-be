@@ -266,25 +266,49 @@ class CombinedRAGService:
         Returns the original question if it's already self-contained.
         """
         normalized = question.lower().strip()
+        words_list = normalized.split()
+        word_count = len(words_list)
 
         # Quick check: does this question likely need resolution?
-        # Look for pronouns, vague references, or very short questions
         needs_resolution = False
-        vague_markers = [
+
+        # If the question contains a specific entity name (capitalized word ≥ 4 chars),
+        # it's self-contained — no resolution needed.
+        original_words = question.strip().split()
+        has_named_entity = any(
+            w[0].isupper() and len(w) >= 4 and w.lower() not in {
+                "what", "which", "where", "when", "who", "that", "this", "name",
+                "list", "show", "find", "tell", "give", "does", "have", "they",
+            }
+            for w in original_words
+        )
+        if has_named_entity:
+            return question
+
+        # Pronoun-only / very short questions (≤ 4 words)
+        short_vague_markers = [
             "they", "them", "those", "these", "that", "this", "it",
-            "its", "their", "the same", "above", "previous",
-            "more", "else", "also", "what about", "how about",
-            "tell me more", "explain", "elaborate", "go on",
-            "and ", "but ", "why", "how",
+            "its", "their", "the same",
         ]
-        # Very short questions or questions with pronouns likely need context
-        if len(normalized.split()) <= 5:
-            for marker in vague_markers:
+        if word_count <= 4:
+            for marker in short_vague_markers:
                 if marker in normalized:
                     needs_resolution = True
                     break
-        # Questions starting with "and" or "but" are almost always follow-ups
-        if normalized.startswith(("and ", "but ", "also ")):
+
+        # Explicit back-references in any length question
+        back_references = [
+            "the above", "mentioned above", "above uses", "above benefits",
+            "previous", "mentioned earlier", "tell me more", "elaborate on",
+            "go on", "what about",
+        ]
+        for ref in back_references:
+            if ref in normalized:
+                needs_resolution = True
+                break
+
+        # Questions starting with conjunctions are follow-ups
+        if normalized.startswith(("and ", "but ", "also ", "or ")):
             needs_resolution = True
 
         if not needs_resolution:
@@ -1000,10 +1024,11 @@ class CombinedRAGService:
             "• Your answer MUST contain ONLY facts, entities, relationships, and properties found in the CONTEXT below.\n"
             "• Do NOT add ANY information from your general training knowledge — not even common facts about the topic.\n"
             "• Do NOT explain what something 'is generally known for' or 'is commonly used for' unless that exact info is in the CONTEXT.\n"
-            "• If the CONTEXT does not contain relevant data, say ONLY: 'This information was not found in the current knowledge graph database.'\n"
-            "• If the CONTEXT contains partial data, answer ONLY what the CONTEXT supports and clearly state what was NOT found.\n"
+            "• If the CONTEXT is empty or has NO relevant data at all, say ONLY: 'This information was not found in the current knowledge graph database.'\n"
+            "• If the CONTEXT DOES contain relevant data, present it CONFIDENTLY. Do NOT add disclaimers like 'not found' or 'limited context' when you already have data to present.\n"
             "• Every claim in your answer must be traceable to a specific node, property, or relationship in the CONTEXT.\n"
-            "• NEVER fabricate, guess, infer, or supplement with outside knowledge."
+            "• NEVER fabricate, guess, infer, or supplement with outside knowledge.\n"
+            "• NEVER end an answer with 'This information was not found' if you already listed relevant data above."
         )
 
         if fast_mode:
@@ -1739,7 +1764,10 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
                           toLower(n.name) CONTAINS kw
                           OR ANY(key IN keys(n) WHERE
                               NOT key IN $skip_props
-                              AND toLower(toString(n[key])) CONTAINS kw
+                              AND (
+                                  (n[key] IS :: STRING AND toLower(n[key]) CONTAINS kw)
+                                  OR (n[key] IS :: LIST AND ANY(item IN n[key] WHERE item IS :: STRING AND toLower(item) CONTAINS kw))
+                              )
                           )
                       )
                     RETURN DISTINCT n.name AS name
@@ -1756,7 +1784,8 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
                         WHERE n.name IS NOT NULL
                         WITH n, n.name AS name,
                              [key IN keys(n) WHERE NOT key IN $skip_props
-                              | toLower(toString(n[key]))] AS prop_values
+                              AND n[key] IS :: STRING
+                              | toLower(n[key])] AS prop_values
                         RETURN DISTINCT name, prop_values
                         LIMIT 4000
                     """

@@ -90,7 +90,10 @@ class EmbeddingService:
                                 OR toLower(coalesce(node.description, '')) CONTAINS term
                                 OR ANY(key IN keys(node) WHERE
                                     NOT key IN $skip_props
-                                    AND toLower(toString(node[key])) CONTAINS term
+                                    AND (
+                                        (node[key] IS :: STRING AND toLower(node[key]) CONTAINS term)
+                                        OR (node[key] IS :: LIST AND ANY(item IN node[key] WHERE item IS :: STRING AND toLower(item) CONTAINS term))
+                                    )
                                 )
                           )
                         RETURN node.name       AS name,
