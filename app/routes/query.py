@@ -253,10 +253,19 @@ async def delete_chat_session(
 ) -> Dict[str, str]:
     db_session_id = _to_uuid(session_id)
     async with get_postgres_session() as session:
-        await session.execute(
+        chat_delete_result = await session.execute(
             text("DELETE FROM neural_nexus.chat_history WHERE session_id = :session_id AND user_id = :user_id"),
             {"session_id": db_session_id, "user_id": current_user['id']}
         )
+        # Cascade-like cleanup for other session-scoped records.
+        # Keep this constrained by user_id to avoid cross-user data changes.
+        await session.execute(
+            text("DELETE FROM neural_nexus.encounters WHERE session_id = :session_id AND user_id = :user_id"),
+            {"session_id": db_session_id, "user_id": current_user['id']}
+        )
         await session.commit()
-        
-    return {"message": f"Session {session_id} deleted"}
+
+    if chat_delete_result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    return {"message": f"Session {session_id} deleted with related records"}
