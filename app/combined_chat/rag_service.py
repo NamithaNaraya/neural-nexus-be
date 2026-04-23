@@ -254,6 +254,76 @@ class CombinedRAGService:
             logger.debug(f"Intent-aware expansion failed (non-critical): {e}")
             return []
 
+    async def _resolve_followup(self, question: str, history: List[Dict[str, str]]) -> str:
+        """
+        Resolve follow-up questions using conversation history.
+
+        Detects ambiguous questions like:
+          - "what are they?" → "what are the major uses of tulasi?"
+          - "tell me more" → "tell me more about the therapeutic uses of tulasi"
+          - "and the side effects?" → "what are the side effects of tulasi?"
+
+        Returns the original question if it's already self-contained.
+        """
+        normalized = question.lower().strip()
+
+        # Quick check: does this question likely need resolution?
+        # Look for pronouns, vague references, or very short questions
+        needs_resolution = False
+        vague_markers = [
+            "they", "them", "those", "these", "that", "this", "it",
+            "its", "their", "the same", "above", "previous",
+            "more", "else", "also", "what about", "how about",
+            "tell me more", "explain", "elaborate", "go on",
+            "and ", "but ", "why", "how",
+        ]
+        # Very short questions or questions with pronouns likely need context
+        if len(normalized.split()) <= 5:
+            for marker in vague_markers:
+                if marker in normalized:
+                    needs_resolution = True
+                    break
+        # Questions starting with "and" or "but" are almost always follow-ups
+        if normalized.startswith(("and ", "but ", "also ")):
+            needs_resolution = True
+
+        if not needs_resolution:
+            return question
+
+        # Build a compact history summary (last 4 messages)
+        recent = history[-4:]
+        history_text = "\n".join(
+            f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content', '')[:200]}"
+            for m in recent
+        )
+
+        try:
+            prompt = (
+                "You are a question resolver. Given the conversation history and a follow-up question, "
+                "rewrite the follow-up into a COMPLETE, SELF-CONTAINED question.\n\n"
+                "RULES:\n"
+                "- Replace all pronouns (they, it, those, etc.) with the actual entities from the conversation\n"
+                "- Make the question understandable WITHOUT any conversation history\n"
+                "- Keep it concise — just the rewritten question, nothing else\n"
+                "- If the question is ALREADY self-contained, return it EXACTLY as-is\n"
+                "- Do NOT add extra context or explanation\n\n"
+                f"CONVERSATION:\n{history_text}\n\n"
+                f"FOLLOW-UP QUESTION: {question}\n\n"
+                "REWRITTEN QUESTION:"
+            )
+            response = await asyncio.wait_for(
+                self.llm.generate_response(prompt),
+                timeout=5.0,
+            )
+            rewritten = response.strip().strip('"\'')
+            # Sanity check: don't accept empty or absurdly long rewrites
+            if rewritten and 3 < len(rewritten) < 300:
+                return rewritten
+            return question
+        except Exception as e:
+            logger.debug(f"Follow-up resolution failed (non-critical): {e}")
+            return question
+
     def _select_retrieval_mode(self, question: str, folder_id: Optional[str]) -> str:
         normalized = self._normalize_question(question)
         if normalized in self._greetings:
@@ -504,7 +574,15 @@ class CombinedRAGService:
             yield json.dumps({"type": "step", "id": 4, "status": "Done"}) + "\n"
             return
 
-        retrieval_mode = self._select_retrieval_mode(question, folder_id)
+        # ── Follow-up Resolution: rewrite ambiguous questions using conversation context ──
+        # Handles: "what are they?", "tell me more", "explain that", "and the side effects?"
+        resolved_question = question
+        if combined_history and len(combined_history) >= 2:
+            resolved_question = await self._resolve_followup(question, combined_history)
+            if resolved_question != question:
+                logger.info(f"🔗 Follow-up resolved: '{question}' → '{resolved_question}'")
+
+        retrieval_mode = self._select_retrieval_mode(resolved_question, folder_id)
         logger.info(f"⚡ Retrieval mode selected: {retrieval_mode}")
         if retrieval_mode in {"fast", "catalog"}:
             if not web_search:
@@ -530,7 +608,7 @@ class CombinedRAGService:
                     )
                     return
             async for chunk in self._stream_fast_answer(
-                question=question,
+                question=resolved_question,
                 folder_id=folder_id,
                 file_id=file_id,
                 combined_history=combined_history,
@@ -543,7 +621,9 @@ class CombinedRAGService:
             return
 
         # Determine fallback dynamic depth
-        fallback_depth = await self._get_dynamic_depth(folder_id, question)
+        fallback_depth = await self._get_dynamic_depth(folder_id, resolved_question)
+        # Use resolved question for all retrieval in the deep path
+        question = resolved_question
 
         # ══════════════════════════════════════════════════════════
         #  MASSIVE PARALLEL LAUNCH: Fire EVERYTHING at once
