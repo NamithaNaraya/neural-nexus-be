@@ -88,7 +88,7 @@ class GeminiService(BaseLLMService):
             return f"Error: {str(e)}"
 
     async def astream_response(self, prompt: str, history: Optional[List[Dict[str, str]]] = None):
-        """True streaming using native google-genai SDK with sub-chunking."""
+        """True streaming using native google-genai SDK."""
         client = self._get_native_client()
         if client:
             try:
@@ -125,16 +125,7 @@ class GeminiService(BaseLLMService):
                             config=config,
                         ):
                             if chunk.text:
-                                # Split large chunks into ~8-word sub-chunks
-                                words = chunk.text.split(' ')
-                                sub_chunk = []
-                                for w in words:
-                                    sub_chunk.append(w)
-                                    if len(sub_chunk) >= 8:
-                                        chunk_queue.put(' '.join(sub_chunk) + ' ')
-                                        sub_chunk = []
-                                if sub_chunk:
-                                    chunk_queue.put(' '.join(sub_chunk))
+                                chunk_queue.put(chunk.text)
                     except Exception as e:
                         error_holder[0] = e
                     finally:
@@ -237,25 +228,13 @@ class OllamaService(BaseLLMService):
         return "Error: Ollama response timed out. Please try a shorter or more specific question."
 
     async def astream_response(self, prompt: str, history: Optional[List[Dict[str, str]]] = None):
-        """Streaming for Ollama with the same sub-chunking logic for word-by-word feel."""
+        """Streaming for Ollama."""
         try:
             messages = self._build_messages(prompt, history)
             async with asyncio.timeout(self._timeout_seconds):
                 async for chunk in self.llm.astream(messages):
                     if chunk and chunk.content:
-                        # Keep chunk streaming smooth while reducing UI render churn.
-                        if len(chunk.content.split(" ")) > 24:
-                            words = chunk.content.split(" ")
-                            sub_chunk = []
-                            for w in words:
-                                sub_chunk.append(w)
-                                if len(sub_chunk) >= 10:
-                                    yield " ".join(sub_chunk) + " "
-                                    sub_chunk = []
-                            if sub_chunk:
-                                yield " ".join(sub_chunk)
-                        else:
-                            yield chunk.content
+                        yield chunk.content
         except asyncio.TimeoutError:
             logger.warning(f"Ollama streaming timed out after {self._timeout_seconds}s")
             yield "\n[Ollama timeout]: The response took too long. Try a more specific question."

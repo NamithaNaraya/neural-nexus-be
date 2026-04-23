@@ -16,6 +16,7 @@ Key improvements in v4:
 import logging
 import asyncio
 import re
+import difflib
 from typing import List, Dict, Any, Optional
 from app.combined_chat.llm_service import get_llm_service
 from app.combined_chat.embedding_service import EmbeddingService
@@ -176,20 +177,31 @@ class CombinedRAGService:
             logger.warning(f"Failed to persist fast chat history: {e}")
 
         try:
-            from app.core.database import SessionLocal
-            from app.models.chat import ChatSession, ChatMessage
-            from sqlalchemy import select
+            from sqlalchemy import text as sa_text
+            from app.db.connections import get_postgres_session
 
-            async with SessionLocal() as db:
-                session_obj = None
-                if session_id:
-                    stmt = select(ChatSession).where(ChatSession.id == session_id)
-                    session_obj = (await db.execute(stmt)).scalar_one_or_none()
-                if session_obj:
-                    session_obj.updated_at = time.time()
-                    db.add(ChatMessage(session_id=session_obj.id, role="user", content=question))
-                    db.add(ChatMessage(session_id=session_obj.id, role="assistant", content=answer))
-                    await db.commit()
+            db_session_id = str(session_id or uuid.uuid4())
+            try:
+                db_session_id = str(uuid.UUID(db_session_id))
+            except Exception:
+                db_session_id = str(uuid.uuid5(uuid.NAMESPACE_OID, db_session_id))
+
+            async with get_postgres_session() as session:
+                await session.execute(
+                    sa_text("""
+                        INSERT INTO neural_nexus.chat_history (user_id, session_id, role, message)
+                        VALUES (:user_id, :session_id, 'user', :message)
+                    """),
+                    {"user_id": user_id, "session_id": db_session_id, "message": question}
+                )
+                await session.execute(
+                    sa_text("""
+                        INSERT INTO neural_nexus.chat_history (user_id, session_id, role, message)
+                        VALUES (:user_id, :session_id, 'assistant', :message)
+                    """),
+                    {"user_id": user_id, "session_id": db_session_id, "message": answer}
+                )
+                await session.commit()
         except Exception as e:
             logger.warning(f"Failed to persist fast chat session: {e}")
 
@@ -235,14 +247,22 @@ class CombinedRAGService:
     ):
         yield json.dumps({"type": "step", "id": 2, "status": "Searching relevant sources..."}) + "\n"
 
+        normalized_question = self._normalize_question(question)
         vector_task = asyncio.create_task(
             asyncio.wait_for(
-                self.vector_engine.vector_search(question, folder_id),
+                self.vector_engine.vector_search(normalized_question, folder_id),
                 timeout=_FAST_RETRIEVAL_TIMEOUT,
             )
         )
 
         named_tasks: List[tuple] = [("Semantic Search", vector_task)]
+        if folder_id:
+            named_tasks.append((
+                "Focused Entity Scan",
+                asyncio.create_task(
+                    asyncio.wait_for(self._focused_entity_scan(normalized_question, folder_id), timeout=_FAST_RETRIEVAL_TIMEOUT)
+                ),
+            ))
         if catalog_mode and folder_id:
             named_tasks.append((
                 "Database Facts",
@@ -1505,18 +1525,35 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
 
         try:
             async with self.neo4j.session() as session:
-                # Step 1: Find matching entities by fuzzy name matching
-                kw_conditions = " OR ".join(
-                    f"toLower(n.name) CONTAINS '{kw}'" for kw in words[:6]
-                )
+                # Step 1: Find direct keyword matches safely (parameterized).
+                keywords = words[:6]
                 find_query = f"""
                     MATCH (n:{folder_label})
-                    WHERE ({kw_conditions}) AND n.name IS NOT NULL
+                    WHERE n.name IS NOT NULL
+                      AND any(kw IN $keywords WHERE toLower(n.name) CONTAINS kw)
                     RETURN DISTINCT n.name AS name
-                    LIMIT 5
+                    LIMIT 8
                 """
-                res = await session.run(find_query)
+                res = await session.run(find_query, keywords=keywords)
                 found = await res.data()
+
+                # Step 1b: If nothing matched, do typo-tolerant fuzzy candidate lookup.
+                if not found:
+                    names_query = f"""
+                        MATCH (n:{folder_label})
+                        WHERE n.name IS NOT NULL
+                        RETURN DISTINCT n.name AS name
+                        LIMIT 4000
+                    """
+                    names_res = await session.run(names_query)
+                    candidates = [str(row.get("name", "")).strip() for row in await names_res.data()]
+                    candidates_l = [c.lower() for c in candidates if c]
+                    fuzzy_hits = set()
+                    for kw in keywords:
+                        for hit in difflib.get_close_matches(kw, candidates_l, n=5, cutoff=0.78):
+                            fuzzy_hits.add(hit)
+                    if fuzzy_hits:
+                        found = [{"name": c} for c in candidates if c.lower() in fuzzy_hits][:8]
 
                 if not found:
                     return ""
