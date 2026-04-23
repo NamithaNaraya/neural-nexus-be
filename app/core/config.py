@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     EMBEDDING_PROVIDER: str = "ollama"  # "ollama" or "gemini"
     
     # Ollama (used for embeddings)
-    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_BASE_URL: str = "http://10.10.20.225:11434"
     OLLAMA_MODEL: str = "llama3:latest"
     OLLAMA_EMBED_MODEL: str = "mxbai-embed-large:latest"
     OLLAMA_CHAT_TIMEOUT_SECONDS: int = 90
