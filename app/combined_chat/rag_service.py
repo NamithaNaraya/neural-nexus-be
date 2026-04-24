@@ -574,16 +574,9 @@ class CombinedRAGService:
 
         full_answer = ""
         chunk_count = 0
-        # SMART HISTORY: Only pass history if the question is a follow-up.
-        # If it's a new topic, clear history to prevent LLM confusion.
-        is_new_topic = self._detect_topic_change(question, combined_history)
-        if is_new_topic:
-            answer_history = []  # Don't poison the LLM with irrelevant context
-            logger.info("🧹 New topic detected — history cleared for synthesis")
-        else:
-            answer_history = (combined_history or [])[-max(1, int(settings.RAG_FAST_HISTORY_WINDOW_MESSAGES)):]
+        answer_history = (combined_history or [])[-max(1, int(settings.RAG_FAST_HISTORY_WINDOW_MESSAGES)):]
         async for chunk in self.llm.astream_response(
-            self._build_answer_prompt(question, context, folder_id, fast_mode=True),
+            self._build_answer_prompt(question, context, folder_id, fast_mode=True, history=answer_history),
             answer_history
         ):
             if chunk:
@@ -996,14 +989,9 @@ class CombinedRAGService:
 
         full_answer = ""
         chunk_count = 0
-        # SMART HISTORY: detect topic changes in deep path too
-        is_new_topic = self._detect_topic_change(question, combined_history)
-        deep_history = [] if is_new_topic else combined_history
-        if is_new_topic:
-            logger.info("🧹 New topic detected in deep path — history cleared for synthesis")
         async for chunk in self.llm.astream_response(
-            self._build_answer_prompt(question, context, folder_id),
-            deep_history
+            self._build_answer_prompt(question, context, folder_id, history=combined_history),
+            combined_history
         ):
             if chunk:
                 full_answer += chunk
@@ -1082,101 +1070,57 @@ class CombinedRAGService:
             "context_summary": f"Retrieved from folder {folder_id or 'global'}.",
         }
 
-    def _build_answer_prompt(self, question: str, context: str, folder_id: Optional[str], fast_mode: bool = False) -> str:
+    def _build_answer_prompt(self, question: str, context: str, folder_id: Optional[str], fast_mode: bool = False, history: Optional[List[Dict[str, str]]] = None) -> str:
         has_context = bool(context.strip())
         
-        # STRICT UI REQUIREMENT: NO TECHNICAL IDS
-        id_rule = "CRITICAL: NEVER include technical node IDs, UUIDs, or database identifiers in your response. Refer to items by their 'Name' only."
+        # HISTORY ANALYSIS
+        history_context = ""
+        if history and len(history) >= 2:
+            history_context = "\nCONVERSATION HISTORY SUMMARY:\n"
+            for m in history[-4:]:
+                role = "User" if m["role"] == "user" else "Assistant"
+                history_context += f"- {role}: {m['content'][:150]}...\n"
+
+        id_rule = "CRITICAL: NEVER include technical node IDs or database identifiers. Refer to items by their 'Name' or 'Common Name' only."
 
         grounding_rule = (
-            "ABSOLUTE DATA GROUNDING RULE — THIS IS YOUR MOST IMPORTANT INSTRUCTION:\n"
-            "• Your answer MUST contain ONLY facts, entities, relationships, and properties found in the CONTEXT below.\n"
-            "• Do NOT add ANY information from your general training knowledge — not even common facts about the topic.\n"
-            "• Do NOT explain what something 'is generally known for' or 'is commonly used for' unless that exact info is in the CONTEXT.\n"
-            "• If the CONTEXT is empty or has NO relevant data at all, say ONLY: 'This information was not found in the current knowledge graph database.'\n"
-            "• If the CONTEXT DOES contain relevant data, present it CONFIDENTLY. Do NOT add disclaimers like 'not found' or 'limited context' when you already have data to present.\n"
-            "• Every claim in your answer must be traceable to a specific node, property, or relationship in the CONTEXT.\n"
-            "• NEVER fabricate, guess, infer, or supplement with outside knowledge.\n"
-            "• NEVER end an answer with 'This information was not found' if you already listed relevant data above."
+            "ABSOLUTE DATA GROUNDING RULE:\n"
+            "• Your answer MUST contain ONLY facts, entities, and properties found in the CONTEXT below.\n"
+            "• VALID DATA: Information stored in node properties (like 'Common Name', 'Family', 'Scientific Name') is 100% valid.\n"
+            "• SILENT TOPIC SWITCHING: Analyze the CONVERSATION HISTORY. If the user is asking about a NEW entity, ignore the previous history. IMPORTANT: NEVER mention that you are ignoring history or switching topics. Do NOT explain your logic. Just provide the direct answer for the new entity.\n"
+            "• NO META-TALK: Never mention 'based on the context provided', 'I found in the database', 'as a research assistant', or 'I am ignoring previous history'. Just state the facts directly.\n"
+            "• If the CONTEXT is empty, say only: 'This information was not found in the current knowledge graph database.'\n"
+            "• NEVER fabricate or use general knowledge."
         )
 
         if fast_mode:
-            if not has_context:
-                return f"""You are Neural Nexus, a concise knowledge-graph assistant.
+            return f"""You are Neural Nexus, a sharp research assistant.
 {id_rule}
 {grounding_rule}
+{history_context}
 
-The user asked: "{question}"
-
-No matching data was found in the active folder{f' ({folder_id})' if folder_id else ''}.
-
-You MUST:
-1. State clearly that no matching data was found in the database for this query.
-2. Suggest the user try rephrasing or selecting a different folder.
-3. Do NOT provide any fabricated data or guesses."""
-
-            return f"""You are Neural Nexus, an eloquent and knowledgeable research assistant.
-{id_rule}
-{grounding_rule}
-
-CRITICAL INSTRUCTION: Answer ONLY the QUESTION below using ONLY the CONTEXT below.
-Do NOT reference, repeat, or mix in information from any previous conversation turns.
-Treat each question as INDEPENDENT — answer it fresh using only the provided CONTEXT.
-If the context includes "[DATABASE FACTS]", use those counts and lists exactly.
-
-FORMATTING RULES:
-- Start with a clear, direct answer to the SPECIFIC question asked.
-- Use **bold** for key entity names, compounds, or important terms.
-- Use bullet points for listing multiple items — keep each bullet concise.
-- If listing more than 3 items, group them logically (e.g., by category, by relationship type).
-- End with a brief insight or takeaway sentence.
-- Use markdown formatting for readability.
-- Keep the tone professional yet warm and engaging.
+Analyze the HISTORY only for follow-up relevance. Do NOT mention history or your analysis of it. Jump directly into the answer using the CONTEXT.
 
 CONTEXT:
 {context}
 
 QUESTION: {question}
 
-Provide a well-structured answer to the SPECIFIC question above. Do NOT mix in information from unrelated topics."""
+Provide a direct, concise answer. No meta-commentary about the history or your logic."""
 
-        if not has_context:
-            return f"""You are the **Neural Nexus Research Assistant** — a friendly, knowledgeable expert.
+        return f"""You are Neural Nexus — a sharp research assistant.
 {id_rule}
 {grounding_rule}
+{history_context}
 
-The user asked: "{question}"
-
-No matching data was found in the active folder{f' ({folder_id})' if folder_id else ''}.
-
-You MUST respond:
-1. Clearly state that you searched the knowledge graph database but found NO matching results for this specific query.
-2. Suggest possible reasons (e.g., the data might be in a different folder, or the question might need rephrasing).
-3. Offer helpful follow-up suggestions based on the question topic.
-4. Do NOT fabricate or guess any data. Keep your tone warm, professional, and encouraging."""
-
-        return f"""You are Neural Nexus — a sharp, knowledgeable research assistant that delivers beautifully formatted answers.
-{id_rule}
-{grounding_rule}
+Analyze the HISTORY silently. If the topic has changed, answer fresh using the NEW context. NEVER mention history analysis to the user.
 
 CONTEXT:
 {context}
 
 QUESTION: {question}
 
-FORMATTING & STYLE RULES:
-1. **Opening**: Start with 1-2 sentences that directly answer the question. Use **bold** for key findings.
-2. **Body**: Present the data in ONE of these formats (pick the best fit):
-   - Bullet list for enumerating items, properties, or connections
-   - Markdown table for comparing scores, rankings, or multi-attribute data
-   - Grouped sections with sub-headers for complex multi-part answers
-3. **Key entities** should be in **bold**, relationships in *italics*
-4. **Tables** (when used): include a score column, short headers, wrap with context sentences
-5. **Closing**: End with a brief insight, pattern observation, or actionable takeaway
-6. **Tone**: Professional, warm, and engaging — like a knowledgeable colleague explaining findings
-7. **Length**: Be thorough but not verbose. Quality over quantity.
-
-HONESTY: If context is truly incomplete for a specific sub-question, say so clearly in one sentence."""
+FORMATTING: Use bold for entity names, bullet points for lists. Provide a direct, professional answer without meta-talk."""
 
 
 
@@ -1893,28 +1837,31 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
                 entity_names = [r["name"] for r in found]
                 logger.info(f"🎯 Focused scan: found entities {entity_names} from question keywords")
 
-                # Step 2: Exhaustive 4-hop neighborhood scan (undirected, no limit)
-                # This follows ALL relationship chains from the found entities
+                # Step 2: Extract ALL properties from the root entities AND their 4-hop neighborhood
                 scan_query = f"""
                     MATCH (root:{folder_label})
                     WHERE root.name IN $names
-                    MATCH path = (root)-[*1..4]-(connected:{folder_label})
+                    
+                    // Get all properties of the root entities themselves
+                    WITH root, 
+                         apoc.map.fromPairs([k in keys(root) WHERE NOT k IN $skip_props | [k, root[k]]]) as root_props
+                    
+                    // Then find connections
+                    OPTIONAL MATCH path = (root)-[*1..4]-(connected:{folder_label})
                     WHERE connected.name IS NOT NULL AND connected <> root
-                    WITH root, connected,
-                         [r IN relationships(path) | type(r)] AS rel_chain,
-                         [nd IN nodes(path) | nd.name] AS node_chain,
-                         length(path) AS hops
+                    
                     RETURN DISTINCT
                         root.name AS from_entity,
+                        root_props,
                         connected.name AS to_entity,
                         connected.type AS to_type,
-                        rel_chain,
-                        node_chain,
-                        hops
+                        [r IN relationships(path) | type(r)] AS rel_chain,
+                        [nd IN nodes(path) | nd.name] AS node_chain,
+                        length(path) AS hops
                     ORDER BY hops, from_entity, to_type
                     LIMIT 300
                 """
-                res2 = await session.run(scan_query, names=entity_names)
+                res2 = await session.run(scan_query, names=entity_names, skip_props=_SKIP_PROPS)
                 paths = await res2.data()
 
                 if not paths:
@@ -1923,25 +1870,29 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
                 # Format as structured context
                 lines = [f"[FOCUSED ENTITY SCAN — Complete neighborhood for: {', '.join(entity_names)}]:"]
                 by_entity: dict = {}
+                by_entity: dict = {}
                 for p in paths:
                     root = p["from_entity"]
-                    chain_str = " → ".join(
-                        f"({p['node_chain'][i]})-[{p['rel_chain'][i]}]"
-                        for i in range(min(len(p['node_chain'])-1, len(p['rel_chain'])))
-                    ) + f" → ({p['to_entity']})"
-
                     if root not in by_entity:
-                        by_entity[root] = []
-                    by_entity[root].append(f"    {chain_str}")
+                        # Include root's own properties first
+                        props = p.get("root_props") or {}
+                        prop_str = ", ".join([f"{k}: {v}" for k, v in props.items() if v])
+                        by_entity[root] = [f"  Attributes of {root}: {prop_str}"] if prop_str else []
+                    
+                    if p.get("to_entity"):
+                        chain_str = " → ".join(
+                            f"({p['node_chain'][i]})-[{p['rel_chain'][i]}]"
+                            for i in range(min(len(p['node_chain'])-1, len(p['rel_chain'])))
+                        ) + f" → ({p['to_entity']})"
+                        by_entity[root].append(f"    {chain_str}")
 
-                for entity, chains in by_entity.items():
-                    lines.append(f"  From '{entity}' ({len(chains)} paths):")
-                    # Show all unique paths
-                    unique_chains = list(dict.fromkeys(chains))  # deduplicate preserving order
-                    for c in unique_chains[:60]:
-                        lines.append(c)
+                for entity, items in by_entity.items():
+                    lines.append(f"  Entity '{entity}':")
+                    unique_items = list(dict.fromkeys(items))
+                    for item in unique_items[:60]:
+                        lines.append(item)
 
-                logger.info(f"🎯 Focused scan: {len(paths)} paths from {len(entity_names)} entities")
+                logger.info(f"🎯 Focused scan: {len(paths)} items from {len(entity_names)} entities")
                 return "\n".join(lines)
 
         except Exception as e:
