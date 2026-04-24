@@ -406,6 +406,44 @@ class CombinedRAGService:
         
         return False
 
+    def _detect_topic_change(self, question: str, history: Optional[List[Dict[str, str]]]) -> bool:
+        """
+        Detect if the user's question is about a NEW topic.
+        If True, history is cleared to prevent 'meta-talk' and confusion.
+        """
+        if not history or len(history) < 2:
+            return False
+        
+        normalized = question.lower().strip()
+        
+        # Continuation markers: if these are present, it's a follow-up
+        if any(m in normalized for m in ["it", "they", "them", "those", "these", "that", "this", "its", "their", "more", "also", "and", "but"]):
+            return False
+
+        # Get entities from last answer
+        last_answer = ""
+        for m in reversed(history):
+            if m["role"] == "assistant":
+                last_answer = m["content"].lower()
+                break
+        
+        if not last_answer:
+            return False
+
+        # Extract keywords (words > 3 chars, not common verbs/articles)
+        stopwords = {"what", "which", "where", "when", "how", "does", "plant", "family", "name", "common", "scientific"}
+        q_words = {w.strip("?,.!") for w in normalized.split() if len(w) > 3 and w not in stopwords}
+        
+        if not q_words: return False # Default to keeping history if question is too short
+        
+        # If ZERO overlap between question keywords and last answer, it's a new topic
+        overlap = sum(1 for kw in q_words if kw in last_answer)
+        if overlap == 0:
+            logger.info(f"🔄 Topic switch detected: {q_words} not in last answer. Clearing history.")
+            return True
+            
+        return False
+
     def _select_retrieval_mode(self, question: str, folder_id: Optional[str]) -> str:
         normalized = self._normalize_question(question)
         if normalized in self._greetings:
@@ -574,9 +612,14 @@ class CombinedRAGService:
 
         full_answer = ""
         chunk_count = 0
-        answer_history = (combined_history or [])[-max(1, int(settings.RAG_FAST_HISTORY_WINDOW_MESSAGES)):]
+        
+        # CODE-BASED PRUNING: Don't let the LLM decide.
+        # If it's a new topic, give it zero history.
+        is_new_topic = self._detect_topic_change(question, combined_history)
+        answer_history = [] if is_new_topic else (combined_history or [])[-max(1, int(settings.RAG_FAST_HISTORY_WINDOW_MESSAGES)):]
+        
         async for chunk in self.llm.astream_response(
-            self._build_answer_prompt(question, context, folder_id, fast_mode=True, history=answer_history),
+            self._build_answer_prompt(question, context, folder_id, fast_mode=True),
             answer_history
         ):
             if chunk:
@@ -989,9 +1032,14 @@ class CombinedRAGService:
 
         full_answer = ""
         chunk_count = 0
+        
+        # Deep path pruning
+        is_new_topic = self._detect_topic_change(question, combined_history)
+        deep_history = [] if is_new_topic else combined_history
+        
         async for chunk in self.llm.astream_response(
-            self._build_answer_prompt(question, context, folder_id, history=combined_history),
-            combined_history
+            self._build_answer_prompt(question, context, folder_id),
+            deep_history
         ):
             if chunk:
                 full_answer += chunk
@@ -1070,57 +1118,26 @@ class CombinedRAGService:
             "context_summary": f"Retrieved from folder {folder_id or 'global'}.",
         }
 
-    def _build_answer_prompt(self, question: str, context: str, folder_id: Optional[str], fast_mode: bool = False, history: Optional[List[Dict[str, str]]] = None) -> str:
-        has_context = bool(context.strip())
-        
-        # HISTORY ANALYSIS
-        history_context = ""
-        if history and len(history) >= 2:
-            history_context = "\nCONVERSATION HISTORY SUMMARY:\n"
-            for m in history[-4:]:
-                role = "User" if m["role"] == "user" else "Assistant"
-                history_context += f"- {role}: {m['content'][:150]}...\n"
-
-        id_rule = "CRITICAL: NEVER include technical node IDs or database identifiers. Refer to items by their 'Name' or 'Common Name' only."
-
+    def _build_answer_prompt(self, question: str, context: str, folder_id: Optional[str], fast_mode: bool = False) -> str:
+        id_rule = "CRITICAL: NEVER include technical node IDs. Use 'Name' or 'Common Name' only."
         grounding_rule = (
-            "ABSOLUTE DATA GROUNDING RULE:\n"
-            "• Your answer MUST contain ONLY facts, entities, and properties found in the CONTEXT below.\n"
-            "• VALID DATA: Information stored in node properties (like 'Common Name', 'Family', 'Scientific Name') is 100% valid.\n"
-            "• SILENT TOPIC SWITCHING: Analyze the CONVERSATION HISTORY. If the user is asking about a NEW entity, ignore the previous history. IMPORTANT: NEVER mention that you are ignoring history or switching topics. Do NOT explain your logic. Just provide the direct answer for the new entity.\n"
-            "• NO META-TALK: Never mention 'based on the context provided', 'I found in the database', 'as a research assistant', or 'I am ignoring previous history'. Just state the facts directly.\n"
-            "• If the CONTEXT is empty, say only: 'This information was not found in the current knowledge graph database.'\n"
-            "• NEVER fabricate or use general knowledge."
+            "• Use ONLY the CONTEXT below.\n"
+            "• If info is in a node property (like 'Common Name'), it is FACT.\n"
+            "• NO PREAMBLE. No 'Based on context'. No 'I found'.\n"
+            "• If no info, say: 'This information was not found in the database.'\n"
+            "• DIRECT ANSWERS ONLY."
         )
 
-        if fast_mode:
-            return f"""You are Neural Nexus, a sharp research assistant.
+        return f"""You are Neural Nexus. Answer the QUESTION using ONLY the CONTEXT.
 {id_rule}
 {grounding_rule}
-{history_context}
-
-Analyze the HISTORY only for follow-up relevance. Do NOT mention history or your analysis of it. Jump directly into the answer using the CONTEXT.
 
 CONTEXT:
 {context}
 
 QUESTION: {question}
 
-Provide a direct, concise answer. No meta-commentary about the history or your logic."""
-
-        return f"""You are Neural Nexus — a sharp research assistant.
-{id_rule}
-{grounding_rule}
-{history_context}
-
-Analyze the HISTORY silently. If the topic has changed, answer fresh using the NEW context. NEVER mention history analysis to the user.
-
-CONTEXT:
-{context}
-
-QUESTION: {question}
-
-FORMATTING: Use bold for entity names, bullet points for lists. Provide a direct, professional answer without meta-talk."""
+DIRECT ANSWER:"""
 
 
 
