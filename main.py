@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
-from app.routes import health, auth, folders, files, upload, graph, query, analytics, sse, websocket, deletion, dashboard, reasoning, browse, analytics_chat, herb
+from app.routes import health, auth, folders, files, upload, graph, query, analytics, sse, websocket, deletion, dashboard, reasoning, browse, analytics_chat, herb, stt
 from app.combined_chat import router as combined_chat_router
 from app.routes import weights as weight_routes
 from app.routes.ml import ml_routes
@@ -107,6 +107,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"❌ LLM initialization check failed: {e}")
 
+    # === STT Model Pre-load ===
+    try:
+        from app.services.stt_service import get_stt_service
+        stt = get_stt_service()
+        # Triggering _get_model() in a thread so it doesn't block startup
+        asyncio.create_task(asyncio.to_thread(stt._get_model))
+        logger.info("🎙️ STT Engine initializing in background...")
+    except Exception as e:
+        logger.error(f"❌ STT initialization failed: {e}")
+
     logger.info("🧠 Neural Nexus Backend is ready!")
     
     yield
@@ -189,6 +199,7 @@ app.include_router(browse.router, prefix="/api/v1/browse", tags=["Browse"])
 app.include_router(ml_routes.router, prefix="/api/v1/ml", tags=["Machine Learning"])
 app.include_router(analytics_chat.router, prefix="/api/v1/analytics-chat", tags=["Analytic Chat"])
 app.include_router(combined_chat_router.router, prefix="/api/v1/combined-chat", tags=["Combined Chat"])
+app.include_router(stt.router, prefix="/api/v1/stt", tags=["Speech to Text"])
 app.include_router(herb.router, prefix="/api/v1/graph", tags=["Herb Domain"])
 app.include_router(weight_routes.router, prefix="/api/v1/weights", tags=["Weight Config"])
 
