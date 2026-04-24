@@ -348,6 +348,64 @@ class CombinedRAGService:
             logger.debug(f"Follow-up resolution failed (non-critical): {e}")
             return question
 
+    def _detect_topic_change(self, question: str, history: Optional[List[Dict[str, str]]]) -> bool:
+        """
+        Detect if the user's question is about a DIFFERENT topic than the conversation history.
+        
+        Returns True if the question is about a new topic (history should NOT be passed to LLM).
+        Returns False if the question is likely a follow-up (history SHOULD be passed).
+        """
+        if not history or len(history) < 2:
+            return False
+        
+        normalized = question.lower().strip()
+        words = normalized.split()
+        
+        # If the question uses pronouns or follow-up markers, it's a continuation
+        follow_up_markers = {
+            "they", "them", "those", "these", "that", "this", "it",
+            "its", "their", "the same", "above", "previous",
+            "tell me more", "elaborate", "go on", "what about",
+            "and ", "but ", "also ", "or ",
+        }
+        for marker in follow_up_markers:
+            if marker in normalized:
+                return False
+        
+        # Extract significant words from the question (potential entity names)
+        stopwords = {
+            "what", "which", "where", "when", "who", "how", "why", "does",
+            "is", "are", "was", "were", "the", "and", "for", "with",
+            "from", "have", "has", "been", "being", "into", "about",
+            "commonly", "known", "called", "used", "belong", "belongs",
+            "plant", "family", "name", "common", "scientific",
+            "list", "show", "find", "tell", "give", "many", "much",
+        }
+        q_keywords = {w.strip("?,.'\"!") for w in words
+                      if len(w.strip("?,.'\"!")) > 3 and w.strip("?,.'\"!").lower() not in stopwords}
+        
+        if not q_keywords:
+            return False
+        
+        # Check if any of these keywords appeared in the last assistant answer
+        last_assistant = ""
+        for m in reversed(history):
+            if m.get("role") == "assistant":
+                last_assistant = m.get("content", "").lower()
+                break
+        
+        if not last_assistant:
+            return False
+        
+        # If NONE of the question's key entities appear in the last answer,
+        # the user has switched topics
+        overlap = sum(1 for kw in q_keywords if kw in last_assistant)
+        if overlap == 0:
+            logger.info(f"🔄 Topic change detected: question keywords {q_keywords} not in last answer")
+            return True
+        
+        return False
+
     def _select_retrieval_mode(self, question: str, folder_id: Optional[str]) -> str:
         normalized = self._normalize_question(question)
         if normalized in self._greetings:
@@ -516,8 +574,14 @@ class CombinedRAGService:
 
         full_answer = ""
         chunk_count = 0
-        # Keep a bounded trailing window; slice is safe even when history is shorter/empty.
-        answer_history = (combined_history or [])[-max(1, int(settings.RAG_FAST_HISTORY_WINDOW_MESSAGES)):]
+        # SMART HISTORY: Only pass history if the question is a follow-up.
+        # If it's a new topic, clear history to prevent LLM confusion.
+        is_new_topic = self._detect_topic_change(question, combined_history)
+        if is_new_topic:
+            answer_history = []  # Don't poison the LLM with irrelevant context
+            logger.info("🧹 New topic detected — history cleared for synthesis")
+        else:
+            answer_history = (combined_history or [])[-max(1, int(settings.RAG_FAST_HISTORY_WINDOW_MESSAGES)):]
         async for chunk in self.llm.astream_response(
             self._build_answer_prompt(question, context, folder_id, fast_mode=True),
             answer_history
@@ -932,9 +996,14 @@ class CombinedRAGService:
 
         full_answer = ""
         chunk_count = 0
+        # SMART HISTORY: detect topic changes in deep path too
+        is_new_topic = self._detect_topic_change(question, combined_history)
+        deep_history = [] if is_new_topic else combined_history
+        if is_new_topic:
+            logger.info("🧹 New topic detected in deep path — history cleared for synthesis")
         async for chunk in self.llm.astream_response(
             self._build_answer_prompt(question, context, folder_id),
-            combined_history
+            deep_history
         ):
             if chunk:
                 full_answer += chunk
@@ -1050,11 +1119,13 @@ You MUST:
 {id_rule}
 {grounding_rule}
 
-Answer using ONLY the CONTEXT below.
+CRITICAL INSTRUCTION: Answer ONLY the QUESTION below using ONLY the CONTEXT below.
+Do NOT reference, repeat, or mix in information from any previous conversation turns.
+Treat each question as INDEPENDENT — answer it fresh using only the provided CONTEXT.
 If the context includes "[DATABASE FACTS]", use those counts and lists exactly.
 
 FORMATTING RULES:
-- Start with a clear, direct answer sentence.
+- Start with a clear, direct answer to the SPECIFIC question asked.
 - Use **bold** for key entity names, compounds, or important terms.
 - Use bullet points for listing multiple items — keep each bullet concise.
 - If listing more than 3 items, group them logically (e.g., by category, by relationship type).
@@ -1067,7 +1138,7 @@ CONTEXT:
 
 QUESTION: {question}
 
-Provide a well-structured, aesthetically pleasing answer. If the context does not contain enough information, say so clearly."""
+Provide a well-structured answer to the SPECIFIC question above. Do NOT mix in information from unrelated topics."""
 
         if not has_context:
             return f"""You are the **Neural Nexus Research Assistant** — a friendly, knowledgeable expert.
