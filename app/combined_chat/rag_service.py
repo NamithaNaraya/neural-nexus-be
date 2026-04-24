@@ -65,6 +65,7 @@ class CombinedRAGService:
         self._schema_expiry: float = 0
         self._schema_version: int = 1
         self._chain_depth_cache: Dict[str, int] = {}  # folder_id -> max chain depth
+        self._folder_name_sample_cache: Dict[str, List[str]] = {}
         self._greetings = {"hi", "hello", "hey", "hola", "greetings", "good morning", "good afternoon", "good evening"}
 
     def invalidate_schema_cache(self):
@@ -117,7 +118,7 @@ class CombinedRAGService:
                 folder_id,
                 user_id,
                 catalog_mode,
-                combined_history=combined_history,
+                combined_history=answer_history,
             )
             value = await self.redis.get(key)
             if value:
@@ -145,7 +146,7 @@ class CombinedRAGService:
                 folder_id,
                 user_id,
                 catalog_mode,
-                combined_history=combined_history,
+                combined_history=answer_history,
             )
             await self.redis.set(key, answer, ex=ttl)
         except Exception as e:
@@ -206,9 +207,159 @@ class CombinedRAGService:
             logger.warning(f"Failed to persist fast chat session: {e}")
 
     def _normalize_question(self, question: str) -> str:
-        return re.sub(r"\s+", " ", question.lower().strip())
+        cleaned = re.sub(r"[^\w\s-]", " ", (question or "").lower())
+        return re.sub(r"\s+", " ", cleaned).strip()
 
-    async def _expand_query_terms(self, question: str) -> List[str]:
+    def _extract_keywords(self, question: str) -> List[str]:
+        stopwords = {
+            "what", "which", "where", "when", "who", "whom", "whose", "why", "how",
+            "is", "are", "was", "were", "be", "been", "being", "do", "does", "did",
+            "can", "could", "should", "would", "tell", "show", "list", "find", "give",
+            "about", "with", "from", "into", "than", "then", "that", "this", "those",
+            "these", "them", "they", "their", "there", "have", "has", "had", "your",
+            "please", "explain", "describe", "good", "best", "more", "also",
+        }
+        keywords = []
+        seen = set()
+        for token in self._normalize_question(question).split():
+            if len(token) < 3 or token in stopwords or token in seen:
+                continue
+            seen.add(token)
+            keywords.append(token)
+        return keywords[:12]
+
+    def _token_variants(self, token: str) -> List[str]:
+        cleaned = self._normalize_question(token)
+        if not cleaned:
+            return []
+        variants = [cleaned]
+        if cleaned.endswith("ies") and len(cleaned) > 4:
+            variants.append(cleaned[:-3] + "y")
+        elif cleaned.endswith("s") and len(cleaned) > 4:
+            variants.append(cleaned[:-1])
+        else:
+            variants.append(cleaned + "s")
+        return [value for value in dict.fromkeys(v for v in variants if len(v) > 2)]
+
+    async def _get_folder_name_samples(self, folder_id: Optional[str], limit: int = 250) -> List[str]:
+        if not folder_id:
+            return []
+        cache_key = f"{folder_id}:{limit}"
+        if cache_key in self._folder_name_sample_cache:
+            return self._folder_name_sample_cache[cache_key]
+        try:
+            async with self.neo4j.session() as session:
+                result = await session.run(
+                    """
+                    MATCH (n)
+                    WHERE n.name IS NOT NULL
+                      AND n.folder_id = $folder_id
+                    RETURN DISTINCT n.name AS name
+                    ORDER BY coalesce(n.source_count, 0) DESC, n.name
+                    LIMIT $limit
+                    """,
+                    folder_id=folder_id,
+                    limit=limit,
+                )
+                rows = await result.data()
+                samples = [str(row["name"]) for row in rows if row.get("name")]
+                self._folder_name_sample_cache[cache_key] = samples
+                return samples
+        except Exception as e:
+            logger.debug(f"Folder sample fetch failed for query planning: {e}")
+            return []
+
+    async def _build_query_plan(self, question: str, folder_id: Optional[str]) -> Dict[str, Any]:
+        normalized = self._normalize_question(question)
+        keywords = self._extract_keywords(question)
+        expanded_terms: List[str] = []
+        exact_names: List[str] = []
+
+        for keyword in keywords:
+            expanded_terms.extend(self._token_variants(keyword))
+
+        folder_names = await self._get_folder_name_samples(folder_id)
+        normalized_to_name = {self._normalize_question(name): name for name in folder_names}
+        for keyword in keywords:
+            matches = difflib.get_close_matches(keyword, list(normalized_to_name.keys()), n=5, cutoff=0.82)
+            for match in matches:
+                original_name = normalized_to_name.get(match)
+                if original_name:
+                    exact_names.append(original_name)
+                    expanded_terms.append(match)
+
+        expanded_terms = [
+            term for term in dict.fromkeys(term for term in expanded_terms if term and term != normalized)
+            if len(term) > 2
+        ][:10]
+        exact_names = list(dict.fromkeys(name for name in exact_names if name.strip()))[:6]
+        search_parts = [normalized] + expanded_terms + [self._normalize_question(name) for name in exact_names]
+
+        return {
+            "normalized_question": normalized,
+            "keywords": keywords,
+            "expanded_terms": expanded_terms,
+            "exact_names": exact_names,
+            "search_text": " ".join(part for part in search_parts if part).strip() or normalized,
+        }
+
+    def _select_relevant_history(
+        self,
+        question: str,
+        history: Optional[List[Dict[str, str]]],
+        limit: int = 6,
+    ) -> List[Dict[str, str]]:
+        if not history:
+            return []
+        if self._detect_topic_change(question, history):
+            return []
+
+        keywords = set(self._extract_keywords(question))
+        if not keywords:
+            return history[-limit:]
+
+        scored: List[tuple[int, int, Dict[str, str]]] = []
+        total = len(history)
+        for index, message in enumerate(history):
+            content = self._normalize_question(str(message.get("content", "")))
+            overlap = sum(1 for keyword in keywords if keyword in content)
+            recency_bonus = total - index
+            if overlap > 0 or message.get("role") == "assistant":
+                scored.append((overlap, recency_bonus, message))
+
+        if not scored:
+            return history[-2:]
+
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        selected = [item[2] for item in scored[:limit]]
+        ordered = [message for message in history if message in selected]
+        return ordered[-limit:]
+
+    def _estimate_grounding_score(self, context: str, source_count: int) -> float:
+        context_chars = len((context or "").strip())
+        if context_chars <= 0 or source_count <= 0:
+            return 0.0
+        char_score = min(context_chars / 4000.0, 1.0)
+        source_score = min(source_count / 6.0, 1.0)
+        return round((char_score * 0.65) + (source_score * 0.35), 3)
+
+    def _pack_context(self, sections: List[str], max_chars: int) -> str:
+        packed: List[str] = []
+        used = 0
+        for section in sections:
+            if not section:
+                continue
+            remaining = max_chars - used
+            if remaining <= 0:
+                break
+            piece = section
+            if len(piece) > remaining:
+                piece = piece[: max(0, remaining - 15)].rstrip() + "\n[...truncated]"
+            packed.append(piece)
+            used += len(piece) + 2
+        return "\n\n".join(packed)
+
+    async def _expand_query_terms(self, question: str, folder_id: Optional[str] = None) -> List[str]:
         """
         Intent-aware query expansion using the LLM.
         
@@ -220,6 +371,10 @@ class CombinedRAGService:
         
         Fast: ~5s timeout, non-streaming, fails gracefully.
         """
+        query_plan = await self._build_query_plan(question, folder_id)
+        if query_plan["expanded_terms"]:
+            return query_plan["expanded_terms"]
+
         try:
             prompt = (
                 "You are a search query optimizer for a knowledge graph database. "
@@ -240,7 +395,7 @@ class CombinedRAGService:
             )
             response = await asyncio.wait_for(
                 self.llm.generate_response(prompt),
-                timeout=6.0,
+                timeout=3.0,
             )
             raw = response.strip().lower()
             if not raw or raw == "none" or "error" in raw:
@@ -248,7 +403,7 @@ class CombinedRAGService:
             # Parse comma-separated terms
             terms = [t.strip().strip('"\'.-') for t in raw.split(",") if t.strip() and len(t.strip()) > 1]
             # Filter out noise and overly long terms
-            terms = [t for t in terms if 1 < len(t) < 60 and t != "none" and not t.startswith("search")][:10]
+            terms = [t for t in terms if 1 < len(t) < 60 and t != "none" and not t.startswith("search")][:8]
             return terms
         except Exception as e:
             logger.debug(f"Intent-aware expansion failed (non-critical): {e}")
@@ -444,6 +599,45 @@ class CombinedRAGService:
             
         return False
 
+    def _detect_topic_change(self, question: str, history: Optional[List[Dict[str, str]]]) -> bool:
+        """
+        Final topic-change gate used by answer synthesis.
+        Clears history only when the new question has no meaningful overlap
+        with the latest assistant answer and does not look like a follow-up.
+        """
+        if not history or len(history) < 2:
+            return False
+
+        normalized = self._normalize_question(question)
+        if any(
+            marker in normalized
+            for marker in [
+                "it", "they", "them", "those", "these", "that", "this",
+                "its", "their", "more", "also", "and", "but", "previous", "above",
+            ]
+        ):
+            return False
+
+        last_answer = ""
+        for message in reversed(history):
+            if message.get("role") == "assistant":
+                last_answer = self._normalize_question(str(message.get("content", "")))
+                break
+
+        if not last_answer:
+            return False
+
+        q_words = set(self._extract_keywords(question))
+        if not q_words:
+            return False
+
+        overlap = sum(1 for keyword in q_words if keyword in last_answer)
+        if overlap == 0:
+            logger.info(f"Topic switch detected; clearing unrelated history for keywords: {sorted(q_words)}")
+            return True
+
+        return False
+
     def _select_retrieval_mode(self, question: str, folder_id: Optional[str]) -> str:
         normalized = self._normalize_question(question)
         if normalized in self._greetings:
@@ -483,19 +677,30 @@ class CombinedRAGService:
     ):
         yield json.dumps({"type": "step", "id": 2, "status": "Searching relevant sources..."}) + "\n"
 
-        normalized_question = self._normalize_question(question)
+        query_plan = await self._build_query_plan(question, folder_id)
 
         # ── Query Expansion: generate synonyms/alternate terms ──
         # Handles: tulasi→tulsi, stress→anxiety, benefits→uses, etc.
-        expanded_terms = await self._expand_query_terms(question)
-        search_question = normalized_question
-        if expanded_terms:
-            search_question = f"{normalized_question} {' '.join(expanded_terms)}"
+        expanded_terms = query_plan["expanded_terms"]
+        exact_names = query_plan["exact_names"]
+        search_question = query_plan["search_text"]
+        answer_history = self._select_relevant_history(
+            question,
+            combined_history,
+            limit=max(1, int(settings.RAG_FAST_HISTORY_WINDOW_MESSAGES)),
+        )
+        if expanded_terms or exact_names:
+            logger.info(f"Fast query plan | expanded={expanded_terms} | exact={exact_names}")
             logger.info(f"🔍 Query expanded: {expanded_terms}")
 
         vector_task = asyncio.create_task(
             asyncio.wait_for(
-                self.vector_engine.vector_search(search_question, folder_id),
+                self.vector_engine.vector_search(
+                    search_question,
+                    folder_id,
+                    expanded_terms=expanded_terms,
+                    exact_names=exact_names,
+                ),
                 timeout=_FAST_RETRIEVAL_TIMEOUT,
             )
         )
@@ -505,7 +710,10 @@ class CombinedRAGService:
             named_tasks.append((
                 "Focused Entity Scan",
                 asyncio.create_task(
-                    asyncio.wait_for(self._focused_entity_scan(search_question, folder_id), timeout=_FAST_RETRIEVAL_TIMEOUT)
+                    asyncio.wait_for(
+                        self._focused_entity_scan(search_question, folder_id, exact_names=exact_names),
+                        timeout=_FAST_RETRIEVAL_TIMEOUT,
+                    )
                 ),
             ))
         if catalog_mode and folder_id:
@@ -544,37 +752,24 @@ class CombinedRAGService:
                 res_str = str(result)
             fused.append(f"=== {name} ===\n{res_str}")
 
-        context = "\n\n".join(fused)
+        context = self._pack_context(fused, _FAST_CONTEXT_CHARS)
 
         # ── Intent-aware Re-retrieval: if context is thin, try again with LLM-rewritten query ──
         if len(context.strip()) < 50 and folder_id:
             logger.info("🔄 Thin context — attempting intent-aware re-retrieval...")
             yield json.dumps({"type": "step", "id": 2, "status": "Refining search with intent analysis..."}) + "\n"
             try:
-                rewrite_prompt = (
-                    f"The user asked: \"{question}\"\n"
-                    "No direct matches were found in the knowledge graph database.\n"
-                    "Think about what entities, concepts, or relationships the database MIGHT contain "
-                    "that are RELATED to this question.\n"
-                    "Generate 5-8 short search keywords that a knowledge graph database about "
-                    "herbs, plants, biomarkers, compounds, diseases, or similar topics would likely contain.\n"
-                    "Return ONLY a comma-separated list. No explanations."
-                )
-                rewrite_resp = await asyncio.wait_for(
-                    self.llm.generate_response(rewrite_prompt), timeout=6.0
-                )
-                rewrite_terms = [t.strip().strip('"\'') for t in rewrite_resp.split(",")
-                                if t.strip() and 1 < len(t.strip()) < 60][:8]
+                rewrite_terms = await self._expand_query_terms(question, folder_id)
                 if rewrite_terms:
                     rewrite_query = " ".join(rewrite_terms)
                     logger.info(f"🔄 Re-retrieval query: {rewrite_query}")
                     retry_result = await asyncio.wait_for(
-                        self._focused_entity_scan(rewrite_query, folder_id),
+                        self._focused_entity_scan(rewrite_query, folder_id, exact_names=exact_names),
                         timeout=_FAST_RETRIEVAL_TIMEOUT,
                     )
                     if retry_result and len(str(retry_result).strip()) > 50:
                         fused.append(f"=== Intent-Matched Re-retrieval ===\n{retry_result}")
-                        context = "\n\n".join(fused)
+                        context = self._pack_context(fused, _FAST_CONTEXT_CHARS)
                         logger.info(f"✅ Re-retrieval succeeded: {len(context)} chars of context")
             except Exception as e:
                 logger.debug(f"Re-retrieval failed (non-critical): {e}")
@@ -604,19 +799,15 @@ class CombinedRAGService:
                 logger.warning(f"🌐 Integrated Web Search failed: {e}")
 
         thin_context = len(context.strip()) < 50
-        is_grounded = len(context.strip()) >= 50
+        grounding_score = self._estimate_grounding_score(context, len(fused))
+        is_grounded = grounding_score >= 0.2
         yield json.dumps({"type": "web_search_suggestion", "data": suggest_web_search, "emphasized": thin_context}) + "\n"
-        yield json.dumps({"type": "data_grounding", "data": {"grounded": is_grounded, "source_count": len(fused), "context_chars": len(context)}}) + "\n"
+        yield json.dumps({"type": "data_grounding", "data": {"grounded": is_grounded, "score": grounding_score, "source_count": len(fused), "context_chars": len(context)}}) + "\n"
 
         yield json.dumps({"type": "step", "id": 3, "status": "Synthesizing answer..."}) + "\n"
 
         full_answer = ""
         chunk_count = 0
-        
-        # CODE-BASED PRUNING: Don't let the LLM decide.
-        # If it's a new topic, give it zero history.
-        is_new_topic = self._detect_topic_change(question, combined_history)
-        answer_history = [] if is_new_topic else (combined_history or [])[-max(1, int(settings.RAG_FAST_HISTORY_WINDOW_MESSAGES)):]
         
         async for chunk in self.llm.astream_response(
             self._build_answer_prompt(question, context, folder_id, fast_mode=True),
@@ -685,6 +876,7 @@ class CombinedRAGService:
             if msg_str not in seen_msgs and msg.get('content', '').strip():
                 seen_msgs.add(msg_str)
                 combined_history.append(msg)
+        relevant_history = self._select_relevant_history(question, combined_history)
 
         # ── Fast-path: Greeting ────────────────────────────────
         clean_q = question.lower().strip().strip("?!.")
@@ -706,16 +898,17 @@ class CombinedRAGService:
             if resolved_question != question:
                 logger.info(f"🔗 Follow-up resolved: '{question}' → '{resolved_question}'")
 
+        relevant_history = self._select_relevant_history(resolved_question, combined_history)
         retrieval_mode = self._select_retrieval_mode(resolved_question, folder_id)
         logger.info(f"⚡ Retrieval mode selected: {retrieval_mode}")
         if retrieval_mode in {"fast", "catalog"}:
             if not web_search:
                 cached_answer = await self._get_cached_fast_answer(
-                    question=question,
+                    question=resolved_question,
                     folder_id=folder_id,
                     user_id=user_id,
                     catalog_mode=(retrieval_mode == "catalog"),
-                    combined_history=combined_history,
+                    combined_history=relevant_history,
                 )
                 if cached_answer:
                     yield json.dumps({"type": "step", "id": 2, "status": "Using cached response..."}) + "\n"
@@ -735,7 +928,7 @@ class CombinedRAGService:
                 question=resolved_question,
                 folder_id=folder_id,
                 file_id=file_id,
-                combined_history=combined_history,
+                combined_history=relevant_history,
                 user_id=user_id,
                 session_id=session_id,
                 web_search=web_search,
@@ -758,6 +951,10 @@ class CombinedRAGService:
         # ══════════════════════════════════════════════════════════
 
         # LLM tasks (fire and forget — will be awaited later)
+        deep_query_plan = await self._build_query_plan(question, folder_id)
+        deep_search_question = deep_query_plan["search_text"] or question
+        deep_exact_names = deep_query_plan["exact_names"]
+
         expansion_task = asyncio.create_task(
             asyncio.wait_for(
                 self._expand_query(question, folder_id),
@@ -769,7 +966,12 @@ class CombinedRAGService:
         # Retrieval branches that DON'T need expansion or orchestration
         # (start immediately with raw question for speed)
         vector_task = asyncio.create_task(
-            self.vector_engine.vector_search(question, folder_id)
+            self.vector_engine.vector_search(
+                deep_search_question,
+                folder_id,
+                expanded_terms=deep_query_plan["expanded_terms"],
+                exact_names=deep_exact_names,
+            )
         )
         fastrp_task = asyncio.create_task(
             asyncio.wait_for(
@@ -791,7 +993,7 @@ class CombinedRAGService:
         )
         entity_scan_task = asyncio.create_task(
             asyncio.wait_for(
-                self._focused_entity_scan(question, folder_id),
+                self._focused_entity_scan(deep_search_question, folder_id, exact_names=deep_exact_names),
                 timeout=6
             )
         )
@@ -838,7 +1040,7 @@ class CombinedRAGService:
         # ── Orchestration (in parallel with retrieval) ──────────
         orchestration_task = asyncio.create_task(
             asyncio.wait_for(
-                self._orchestrate_retrieval(question, schema, folder_id or "global", combined_history),
+                self._orchestrate_retrieval(question, schema, folder_id or "global", relevant_history),
                 timeout=_ORCH_TIMEOUT
             )
         )
@@ -969,7 +1171,7 @@ class CombinedRAGService:
                 res_str = str(result)
             fused.append(f"=== {name} ===\n{res_str}")
 
-        context = "\n\n".join(fused)
+        context = self._pack_context(fused, _MAX_CONTEXT_CHARS)
 
         # ── Safety net: if context is empty, try a direct neighbor query ─
         if not context.strip() and folder_id:
@@ -977,7 +1179,7 @@ class CombinedRAGService:
             safety_ctx = await self._folder_neighbor_context(folder_id)
             if safety_ctx:
                 fused.append(f"=== Folder Overview ===\n{safety_ctx}")
-                context = "\n\n".join(fused)
+                context = self._pack_context(fused, _MAX_CONTEXT_CHARS)
 
         # ── Cap context to prevent slow synthesis (source-aware) ──
         if len(context) > _MAX_CONTEXT_CHARS:
@@ -1019,9 +1221,10 @@ class CombinedRAGService:
                 logger.warning(f"🌐 Integrated Web Search failed: {e}")
 
         thin_context = len(context.strip()) < 50
-        is_grounded = len(context.strip()) >= 50
+        grounding_score = self._estimate_grounding_score(context, len(fused))
+        is_grounded = grounding_score >= 0.2
         yield json.dumps({"type": "web_search_suggestion", "data": suggest_web_search, "emphasized": thin_context}) + "\n"
-        yield json.dumps({"type": "data_grounding", "data": {"grounded": is_grounded, "source_count": len(fused), "context_chars": len(context), "algorithm": algo}}) + "\n"
+        yield json.dumps({"type": "data_grounding", "data": {"grounded": is_grounded, "score": grounding_score, "source_count": len(fused), "context_chars": len(context), "algorithm": algo}}) + "\n"
 
         # ── Step 3: Synthesize (STREAMING token-by-token) ──────
         yield json.dumps({"type": "step", "id": 3, "status": "Synthesizing research results..."}) + "\n"
@@ -1033,9 +1236,7 @@ class CombinedRAGService:
         full_answer = ""
         chunk_count = 0
         
-        # Deep path pruning
-        is_new_topic = self._detect_topic_change(question, combined_history)
-        deep_history = [] if is_new_topic else combined_history
+        deep_history = relevant_history
         
         async for chunk in self.llm.astream_response(
             self._build_answer_prompt(question, context, folder_id),
@@ -1750,7 +1951,12 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
     #  Focused Entity Scan (exhaustive neighborhood for mentioned entities)
     # ────────────────────────────────────────────────────────────
 
-    async def _focused_entity_scan(self, question: str, folder_id: Optional[str]) -> str:
+    async def _focused_entity_scan(
+        self,
+        question: str,
+        folder_id: Optional[str],
+        exact_names: Optional[List[str]] = None,
+    ) -> str:
         """
         When the question mentions a specific entity (e.g. 'Tamarind', 'Aspirin'),
         finds that entity and exhaustively traverses ALL its connections up to 4 hops.
@@ -1778,7 +1984,7 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
         words = [w.strip("?,.'\"!").lower() for w in question.split()
                  if len(w.strip("?,.'\"!")) > 3 and w.strip("?,.'\"!").lower() not in stopwords]
 
-        if not words:
+        if not words and not exact_names:
             return ""
 
         try:
@@ -1788,11 +1994,13 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
             async with self.neo4j.session() as session:
                 # Step 1: Find keyword matches across ALL string properties (not just name).
                 # This catches commonName, scientificName, synonyms, origin, family, etc.
-                keywords = words[:6]
+                keywords = list(dict.fromkeys(words[:6] + [self._normalize_question(name) for name in (exact_names or [])]))[:8]
                 find_query = f"""
                     MATCH (n:{folder_label})
                     WHERE n.name IS NOT NULL
-                      AND any(kw IN $keywords WHERE
+                      AND (
+                          toLower(n.name) IN $exact_names
+                          OR any(kw IN $keywords WHERE
                           toLower(n.name) CONTAINS kw
                           OR toLower(coalesce(n.description, '')) CONTAINS kw
                           OR toLower(coalesce(n.commonName, '')) CONTAINS kw
@@ -1801,11 +2009,17 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
                           OR toLower(coalesce(n.origin, '')) CONTAINS kw
                           OR toLower(coalesce(n.text, '')) CONTAINS kw
                           OR toLower(coalesce(toString(n.type), '')) CONTAINS kw
+                          )
                       )
                     RETURN DISTINCT n.name AS name
                     LIMIT 8
                 """
-                res = await session.run(find_query, keywords=keywords, skip_props=_SKIP_PROPS)
+                res = await session.run(
+                    find_query,
+                    keywords=keywords,
+                    exact_names=[self._normalize_question(name) for name in (exact_names or [])[:8]],
+                    skip_props=_SKIP_PROPS,
+                )
                 found = await res.data()
 
                 # Step 1b: If nothing matched, do typo-tolerant fuzzy candidate lookup
