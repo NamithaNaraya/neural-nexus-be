@@ -79,8 +79,6 @@ class EmbeddingService:
                 try:
                     # Search across ALL string properties dynamically — not just name/description.
                     # This catches commonName, scientificName, synonyms, origin, family, etc.
-                    _SKIP_PROPS = ['id', 'embedding', 'folder_id', 'file_id', 'fastrp_embedding',
-                                   'created_at', 'updated_at', 'source_count']
                     lexical_query = """
                         MATCH (node:Entity)
                         WHERE node.name IS NOT NULL
@@ -88,13 +86,12 @@ class EmbeddingService:
                           AND ANY(term IN $terms WHERE
                                 toLower(node.name) CONTAINS term
                                 OR toLower(coalesce(node.description, '')) CONTAINS term
-                                OR ANY(key IN keys(node) WHERE
-                                    NOT key IN $skip_props
-                                    AND (
-                                        (node[key] IS :: STRING AND toLower(node[key]) CONTAINS term)
-                                        OR (node[key] IS :: LIST AND ANY(item IN node[key] WHERE item IS :: STRING AND toLower(item) CONTAINS term))
-                                    )
-                                )
+                                OR toLower(coalesce(node.text, '')) CONTAINS term
+                                OR toLower(coalesce(node.commonName, '')) CONTAINS term
+                                OR toLower(coalesce(node.scientificName, '')) CONTAINS term
+                                OR toLower(coalesce(node.family, '')) CONTAINS term
+                                OR toLower(coalesce(node.origin, '')) CONTAINS term
+                                OR toLower(coalesce(toString(node.type), '')) CONTAINS term
                           )
                         RETURN node.name       AS name,
                                coalesce(node.description, node.text, '') AS text,
@@ -103,7 +100,7 @@ class EmbeddingService:
                                coalesce(node.id, elementId(node)) AS node_id
                         LIMIT 15
                     """
-                    res = await session.run(lexical_query, folder_id=folder_id, terms=terms, skip_props=_SKIP_PROPS)
+                    res = await session.run(lexical_query, folder_id=folder_id, terms=terms)
                     lex_data = await res.data()
                     for r in lex_data:
                         key = r["name"].lower()

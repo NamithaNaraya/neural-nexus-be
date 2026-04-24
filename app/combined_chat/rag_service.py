@@ -1762,13 +1762,13 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
                     WHERE n.name IS NOT NULL
                       AND any(kw IN $keywords WHERE
                           toLower(n.name) CONTAINS kw
-                          OR ANY(key IN keys(n) WHERE
-                              NOT key IN $skip_props
-                              AND (
-                                  (n[key] IS :: STRING AND toLower(n[key]) CONTAINS kw)
-                                  OR (n[key] IS :: LIST AND ANY(item IN n[key] WHERE item IS :: STRING AND toLower(item) CONTAINS kw))
-                              )
-                          )
+                          OR toLower(coalesce(n.description, '')) CONTAINS kw
+                          OR toLower(coalesce(n.commonName, '')) CONTAINS kw
+                          OR toLower(coalesce(n.scientificName, '')) CONTAINS kw
+                          OR toLower(coalesce(n.family, '')) CONTAINS kw
+                          OR toLower(coalesce(n.origin, '')) CONTAINS kw
+                          OR toLower(coalesce(n.text, '')) CONTAINS kw
+                          OR toLower(coalesce(toString(n.type), '')) CONTAINS kw
                       )
                     RETURN DISTINCT n.name AS name
                     LIMIT 8
@@ -1783,9 +1783,8 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
                         MATCH (n:{folder_label})
                         WHERE n.name IS NOT NULL
                         WITH n, n.name AS name,
-                             [key IN keys(n) WHERE NOT key IN $skip_props
-                              AND n[key] IS :: STRING
-                              | toLower(n[key])] AS prop_values
+                             [val IN [n.description, n.commonName, n.scientificName, n.family, n.origin, n.text, toString(n.type)]
+                              WHERE val IS NOT NULL | toLower(toString(val))] AS prop_values
                         RETURN DISTINCT name, prop_values
                         LIMIT 4000
                     """
