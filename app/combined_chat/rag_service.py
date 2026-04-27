@@ -117,7 +117,7 @@ class CombinedRAGService:
                 folder_id,
                 user_id,
                 catalog_mode,
-                combined_history=answer_history,
+                combined_history=combined_history,
             )
             value = await self.redis.get(key)
             if value:
@@ -145,7 +145,7 @@ class CombinedRAGService:
                 folder_id,
                 user_id,
                 catalog_mode,
-                combined_history=answer_history,
+                combined_history=combined_history,
             )
             await self.redis.set(key, answer, ex=ttl)
         except Exception as e:
@@ -367,7 +367,31 @@ class CombinedRAGService:
             logger.debug(f"Intent-aware expansion failed (non-critical): {e}")
             return []
 
-    async def _resolve_followup(self, question: str, history: List[Dict[str, str]]) -> str:
+    def _clean_history(self, history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """
+        Strip legacy persona branding and robotic disclaimers from history 
+        to prevent the LLM from copying the 'robotic' style of previous messages.
+        """
+        if not history:
+            return []
+            
+        cleaned = []
+        for msg in history:
+            content = msg.get("content", "")
+            if not content:
+                cleaned.append(msg)
+                continue
+            
+            # Strip persona junk
+            content = re.sub(r"\(?Remember that I['m]* Neural Nexus.*?\)?", "", content, flags=re.IGNORECASE)
+            content = re.sub(r"\(?I have analyzed only the current conversation history.*?\)?", "", content, flags=re.IGNORECASE)
+            content = re.sub(r"highly intelligent research assistant", "", content, flags=re.IGNORECASE)
+            content = re.sub(r"Neural Nexus", "", content, flags=re.IGNORECASE)
+            
+            cleaned.append({**msg, "content": content.strip()})
+        return cleaned
+
+    async def _resolve_followup(self, question: str, history: List[Dict[str, str]], folder_id: Optional[str]) -> str:
         """
         Resolve follow-up questions using conversation history.
 
@@ -439,6 +463,40 @@ class CombinedRAGService:
             logger.debug(f"Follow-up resolution failed (non-critical): {e}")
             return question
 
+    def _get_heuristic_intent(self, question: str) -> dict:
+        """
+        Fallback logic to detect intent when LLM fails or times out.
+        Ensures we don't 'skip' algorithms for questions that clearly need them.
+        """
+        q = question.lower()
+        use_gds = False
+        gds_algo = None
+        
+        # Heuristic rules for GDS (PageRank, Louvain, etc.)
+        if any(w in q for w in ["influence", "impact", "important", "popular", "rank", "top", "influence", "significant"]):
+            use_gds = True
+            gds_algo = "pagerank"
+        elif any(w in q for w in ["community", "group", "cluster", "neighborhood", "related", "family", "collection"]):
+            use_gds = True
+            gds_algo = "louvain"
+        elif any(w in q for w in ["bridge", "connect", "between", "gatekeeper", "bottleneck"]):
+            use_gds = True
+            gds_algo = "betweenness"
+        elif any(w in q for w in ["central", "center", "fastest", "reach", "closest"]):
+            use_gds = True
+            gds_algo = "closeness"
+
+        return {
+            "is_greeting": q.strip().strip("?!.") in {"hi", "hello", "hey", "hola", "greetings"},
+            "is_new_topic": False,
+            "entities": self._extract_keywords(question),
+            "retrieval_mode": "deep" if use_gds or "?" in q else "fast",
+            "use_gds": use_gds,
+            "gds_algo": gds_algo,
+            "resolved_question": question,
+            "research_strategy": f"Heuristic Fallback ({gds_algo if use_gds else 'Direct'})"
+        }
+
     async def _analyze_query_intent(
         self,
         question: str,
@@ -469,9 +527,12 @@ class CombinedRAGService:
             "3. entities: Extract ONLY the technical entities (plants, chemicals, names) present in the CURRENT question.\n"
             "4. resolved_question: If the question uses pronouns (it, they) or is a partial sentence, rewrite it to be self-contained using history. If it is already a full question about a new subject, keep it EXACTLY as is.\n"
             "5. retrieval_mode:\n"
-            "   - 'catalog': counting, listing all of a type, or broad enumeration.\n"
-            "   - 'deep': relationships, multi-hop paths, 'why/how' questions.\n"
-            "   - 'fast': direct factual property lookups.\n\n"
+            "   - 'catalog': counting, listing all of a type.\n"
+            "   - 'deep': relationships, multi-hop paths, 'influence', 'why/how' questions.\n"
+            "   - 'fast': direct factual property lookups.\n"
+            "6. use_gds: bool (True if the question asks about influence, importance, communities, or clusters)\n"
+            "7. gds_algo: 'pagerank'|'louvain'|'betweenness'|'closeness'|null\n"
+            "8. research_strategy: A 3-5 word summary of the plan.\n\n"
             "CONVERSATION HISTORY:\n"
             f"{history_text or '[No history]'}\n\n"
             f"USER QUESTION: {question}\n\n"
@@ -481,25 +542,22 @@ class CombinedRAGService:
             "  \"is_new_topic\": bool,\n"
             "  \"entities\": [\"entity1\", \"entity2\"],\n"
             "  \"retrieval_mode\": \"fast\"|\"deep\"|\"catalog\",\n"
-            "  \"resolved_question\": \"rewritten question\"\n"
+            "  \"resolved_question\": \"rewritten question\",\n"
+            "  \"use_gds\": bool,\n"
+            "  \"gds_algo\": \"algo_name\"|null,\n"
+            "  \"research_strategy\": \"string\"\n"
             "}"
         )
 
         try:
-            # Short timeout for intent analysis to keep it snappy
-            result = await asyncio.wait_for(self.llm.generate_json(prompt), timeout=4.0)
+            # Increased timeout for intent analysis (Ollama can be slow on some hardware)
+            result = await asyncio.wait_for(self.llm.generate_json(prompt), timeout=12.0)
             if not isinstance(result, dict) or "retrieval_mode" not in result:
                 raise ValueError("Invalid intent analysis response")
             return result
         except Exception as e:
-            logger.warning(f"Intent analysis failed: {e}. Falling back to default.")
-            return {
-                "is_greeting": question.lower().strip().strip("?!.") in {"hi", "hello", "hey"},
-                "is_new_topic": False,
-                "entities": self._extract_keywords(question),
-                "retrieval_mode": "fast",
-                "resolved_question": question
-            }
+            logger.warning(f"Intent analysis failed: {repr(e)}. Using heuristic fallback.")
+            return self._get_heuristic_intent(question)
 
     async def _stream_fast_answer(
         self,
@@ -710,8 +768,11 @@ class CombinedRAGService:
             if msg_str not in seen_msgs and msg.get('content', '').strip():
                 seen_msgs.add(msg_str)
                 combined_history.append(msg)
+        # Clean history of persona junk before analysis
+        cleaned_history = self._clean_history(combined_history)
+
         # ── Step 1: Agentic Intent Analysis ──────────────────
-        intent = await self._analyze_query_intent(question, combined_history, folder_id)
+        intent = await self._analyze_query_intent(question, cleaned_history, folder_id)
         
         # ── Greetings ────────────────────────────────────────
         if intent.get("is_greeting"):
@@ -886,24 +947,25 @@ class CombinedRAGService:
             raw_outputs = [asyncio.TimeoutError()] * len(tasks)
 
         # ── Check if orchestration finished while retrieval was running ──
-        # Give it 1 more second grace if it's still running
+        # Give it a generous 4-second grace period if it's still running
+        # (user wants to wait for algorithms rather than falling back too early)
         if not orchestration_task.done():
             try:
-                await asyncio.wait_for(asyncio.shield(orchestration_task), timeout=1.0)
+                await asyncio.wait_for(asyncio.shield(orchestration_task), timeout=4.0)
             except (asyncio.TimeoutError, Exception):
                 pass
 
         if orchestration_task.done() and not orchestration_task.cancelled():
             try:
                 orch_result = orchestration_task.result()
-                intent = orch_result if isinstance(orch_result, dict) else {"use_cypher": False, "cypher_query": None, "use_gds": False, "gds_algo": None, "research_strategy": "Fallback"}
+                intent = orch_result if isinstance(orch_result, dict) else self._get_heuristic_intent(question)
             except Exception as e:
-                logger.warning(f"⏱️ Orchestration failed: {e}")
-                intent = {"use_cypher": False, "cypher_query": None, "use_gds": False, "gds_algo": None, "research_strategy": "Timeout Fallback"}
+                logger.warning(f"Orchestration failed: {e}")
+                intent = self._get_heuristic_intent(question)
         else:
-            logger.info("⏱️ Orchestration still running — skipping Cypher/GDS to save time")
+            logger.info("⏱️ Orchestration timed out even after grace period — using heuristic fallback")
             orchestration_task.cancel()
-            intent = {"use_cypher": False, "cypher_query": None, "use_gds": False, "gds_algo": None, "research_strategy": "Fast Fallback"}
+            intent = self._get_heuristic_intent(question)
 
         logger.info(f"🧠 Research Intent: {intent.get('research_strategy', 'Standard')}")
         if intent.get("cypher_query"):
@@ -960,10 +1022,12 @@ class CombinedRAGService:
             if not result:
                 continue
             if isinstance(result, list):
-                res_str = json.dumps(result[:30], default=str)
                 if name.startswith("Graph Algorithm"):
                     current_algo = algo if algo else "analytics"
+                    res_str = f"ALGORITHM: {current_algo}\nRESULTS:\n" + json.dumps(result[:30], default=str)
                     yield json.dumps({"type": "gds_results", "data": {"algorithm": current_algo, "results": result}}) + "\n"
+                else:
+                    res_str = json.dumps(result[:30], default=str)
             else:
                 res_str = str(result)
             fused.append(f"=== {name} ===\n{res_str}")
@@ -977,10 +1041,12 @@ class CombinedRAGService:
             if not result:
                 continue
             if isinstance(result, list):
-                res_str = json.dumps(result[:30], default=str)
                 if name.startswith("Graph Algorithm"):
                     current_algo = algo if algo else "analytics"
+                    res_str = f"ALGORITHM: {current_algo}\nRESULTS:\n" + json.dumps(result[:30], default=str)
                     yield json.dumps({"type": "gds_results", "data": {"algorithm": current_algo, "results": result}}) + "\n"
+                else:
+                    res_str = json.dumps(result[:30], default=str)
             else:
                 res_str = str(result)
             fused.append(f"=== {name} ===\n{res_str}")
@@ -1050,7 +1116,7 @@ class CombinedRAGService:
         full_answer = ""
         chunk_count = 0
         
-        deep_history = relevant_history
+        deep_history = self._clean_history(relevant_history)
         
         async for chunk in self.llm.astream_response(
             self._build_answer_prompt(question, context, folder_id),
@@ -1134,21 +1200,23 @@ class CombinedRAGService:
         }
 
     def _build_answer_prompt(self, question: str, context: str, folder_id: Optional[str], fast_mode: bool = False) -> str:
-        id_rule = "CRITICAL: NEVER include technical node IDs or database identifiers. Use only Names."
+        id_rule = "CRITICAL: NEVER include technical node IDs, internal hash identifiers, or database keys (like 'node ID' or '456:789'). Use ONLY human-readable Names."
+        gds_rule = "ALGORITHM EXPLANATION: If the context contains 'ALGORITHM' results (like PageRank, Betweenness), you MUST explicitly state the algorithm name in your response (e.g., 'According to the PageRank algorithm...') and explain the scores and relevance."
         style_rule = (
             "• Provide a helpful, natural response in neat, complete sentences.\n"
             "• Be thorough but concise. Do not use 'and others...' or 'and more...' if the information is present in the context.\n"
-            "• NO PREAMBLE. Do not say 'Based on the context' or 'I found'. Just answer naturally.\n"
-            "• NO META-TALK. Do not mention your internal analysis, topic switching, or the provided history.\n"
+            "• NO PREAMBLE. Do not say 'Based on the context', 'I found', or 'As an AI'. Just answer naturally.\n"
+            "• NO ROBOTIC DISCLAIMERS. Never mention internal processes like 'I have analyzed conversation history' or 'switching topics'.\n"
+            "• JUSTIFY YOUR ANSWER. Explain *why* the answer is correct based on the graph relationships or algorithm scores found in the context.\n"
             "• STICK TO THE SUBJECT. If the question is about 'Moringa', do not talk about 'Basil' even if it is in the context/history.\n"
             "• If no information is found in the CONTEXT for the SPECIFIC subject requested, say: 'This information was not found in the database.'\n"
             "• Avoid technical jargon unless it is part of the data."
         )
 
-        return f"""You are Neural Nexus, a highly intelligent research assistant.
-Answer the QUESTION using ONLY the facts provided in the CONTEXT.
+        return f"""Answer the QUESTION using the facts provided in the CONTEXT.
 
 {id_rule}
+{gds_rule}
 {style_rule}
 
 CONTEXT:
@@ -1288,46 +1356,26 @@ SOP:
    Example: MATCH (n:{folder_label}) WHERE (n:Student_{folder_label} OR toLower(n.type) = 'student') RETURN count(n)
    This is CRITICAL because some nodes use labels while others use the `type` property.
 
-GDS ALGORITHM SELECTION — set `use_gds: true` and pick the right `gds_algo` ONLY when the question genuinely needs graph-algorithmic analysis:
+— GDS ALGORITHM SELECTION GUIDE —
+Pick the right `gds_algo` based on the user's question:
 
-INTELLIGENT GDS DECISION GUIDE:
-- DO NOT use GDS for simple lookups, listings, counting, or direct relationship queries. These are handled perfectly by Cypher alone.
-  Examples that do NOT need GDS: "How many students?", "List all herbs", "What is X connected to?", "What are the properties of Y?"
-- DO use GDS when the question requires mathematical graph analysis that Cypher alone cannot provide accurately:
-  • Ranking by structural importance (not just counting connections — PageRank considers the quality of connections, not just quantity)
-  • Finding hidden communities or clusters that are not obvious from labels
-  • Measuring similarity between nodes based on neighborhood overlap
-  • Finding bridges/bottlenecks in the network
-  • Predicting missing connections
-  Examples that NEED GDS: "Which is the most important hub?", "Find natural clusters", "What nodes are structurally similar?", "Which node is the biggest bottleneck?", "Rank all herbs by influence"
-- GDS and Cypher are NOT mutually exclusive. You can set BOTH `use_cypher: true` AND `use_gds: true` when the question benefits from both direct data AND algorithmic analysis.
-- Be ACCURATE: only trigger GDS when the algorithm genuinely adds insight the Cypher query cannot.
+1. CENTRALITY (Who/What is most important/influential?)
+   • "pagerank": REQUIRED for questions about "influence", "highest impact", "most important", "top ranked", "popularity", "best overall". It measures structural importance across the entire graph.
+   • "articlerank": Use for "authoritative" nodes or "prestige" in sparse/diverse graphs.
+   • "betweenness": Use for "bridges", "bottlenecks", "gatekeepers", "connecting different groups".
+   • "closeness": Use for "easiest to reach", "central access point", "closest to all others".
+   • "degree": Use for "most connected", "most active", "hubs" (direct count of links).
+   • "hits": Use for "hubs" (pointing to many authorities) vs "authorities" (pointed to by many hubs).
 
-— CENTRALITY (Who/What is most important?) —
-• "pagerank": Influence, importance, popularity, "best", "most central", ranking, "most important".
-• "articlerank": Like PageRank but better for diverse graphs. "Most authoritative".
-• "betweenness": Bridges, bottlenecks, connecting groups, flow control.
-• "closeness": Reachability, "closest to all others", central access point.
-• "degree": Most connections, "most active", "most linked", "most connected", "hub".
-• "hits": Hubs vs authorities. "Which are hubs" vs "which are authorities".
+2. COMMUNITY DETECTION (How is the data naturally grouped?)
+   • "louvain": Use for "natural clusters", "who belongs together", "communities", "groups".
+   • "leiden": Higher quality version of Louvain.
+   • "wcc": Use for "islands", "isolated parts", "disconnected groups".
+   • "kcore": Use for "tightly-knit core", "inner circle", "resilience".
 
-— COMMUNITY DETECTION (How is the data grouped?) —
-• "louvain": Communities, clusters, groups, "who belongs together", "natural cluster".
-• "leiden": Same as louvain but higher quality. "Better clustering".
-• "wcc": Islands, disconnected parts, "isolated groups".
-• "kcore": Core structure, "tight-knit core", inner circle vs periphery.
-• "triangle_count": Local density, "tight clusters", "tightly-knit groups".
-
-— SIMILARITY —
-• "similarity": "What is similar to X", "which nodes share neighbors", "most similar", Jaccard.
-
-— LINK PREDICTION (What connections are missing?) —
-• "link_prediction_common": Predict missing links by shared neighbors.
-• "link_prediction_adamic": Advanced link prediction weighted by rare connections.
-• "link_prediction_resource": Flow-based link prediction.
-
-— TOPOLOGY —
-• "topological_sort": Logical sequence, dependency order, timeline for DAGs.
+3. SIMILARITY & LINKS
+   • "similarity": Use for "what is similar to X", "most like", "shared neighbors".
+   • "link_prediction": Use for "what is missing", "hidden connections", "potential links".
 
 Question: {question}
 
