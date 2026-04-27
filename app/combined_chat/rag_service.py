@@ -66,7 +66,6 @@ class CombinedRAGService:
         self._schema_version: int = 1
         self._chain_depth_cache: Dict[str, int] = {}  # folder_id -> max chain depth
         self._folder_name_sample_cache: Dict[str, List[str]] = {}
-        self._greetings = {"hi", "hello", "hey", "hola", "greetings", "good morning", "good afternoon", "good evening"}
 
     def invalidate_schema_cache(self):
         """
@@ -211,22 +210,13 @@ class CombinedRAGService:
         return re.sub(r"\s+", " ", cleaned).strip()
 
     def _extract_keywords(self, question: str) -> List[str]:
-        stopwords = {
-            "what", "which", "where", "when", "who", "whom", "whose", "why", "how",
-            "is", "are", "was", "were", "be", "been", "being", "do", "does", "did",
-            "can", "could", "should", "would", "tell", "show", "list", "find", "give",
-            "about", "with", "from", "into", "than", "then", "that", "this", "those",
-            "these", "them", "they", "their", "there", "have", "has", "had", "your",
-            "please", "explain", "describe", "good", "best", "more", "also",
-        }
-        keywords = []
-        seen = set()
-        for token in self._normalize_question(question).split():
-            if len(token) < 3 or token in stopwords or token in seen:
-                continue
-            seen.add(token)
-            keywords.append(token)
-        return keywords[:12]
+        """
+        Extract meaningful keywords from a question.
+        Fallback to simple regex if intent analysis isn't available.
+        """
+        cleaned = re.sub(r"[^\w\s-]", " ", (question or "").lower())
+        tokens = [t for t in cleaned.split() if len(t) > 3]
+        return tokens[:10]
 
     def _token_variants(self, token: str) -> List[str]:
         cleaned = self._normalize_question(token)
@@ -302,38 +292,6 @@ class CombinedRAGService:
             "exact_names": exact_names,
             "search_text": " ".join(part for part in search_parts if part).strip() or normalized,
         }
-
-    def _select_relevant_history(
-        self,
-        question: str,
-        history: Optional[List[Dict[str, str]]],
-        limit: int = 6,
-    ) -> List[Dict[str, str]]:
-        if not history:
-            return []
-        if self._detect_topic_change(question, history):
-            return []
-
-        keywords = set(self._extract_keywords(question))
-        if not keywords:
-            return history[-limit:]
-
-        scored: List[tuple[int, int, Dict[str, str]]] = []
-        total = len(history)
-        for index, message in enumerate(history):
-            content = self._normalize_question(str(message.get("content", "")))
-            overlap = sum(1 for keyword in keywords if keyword in content)
-            recency_bonus = total - index
-            if overlap > 0 or message.get("role") == "assistant":
-                scored.append((overlap, recency_bonus, message))
-
-        if not scored:
-            return history[-2:]
-
-        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        selected = [item[2] for item in scored[:limit]]
-        ordered = [message for message in history if message in selected]
-        return ordered[-limit:]
 
     def _estimate_grounding_score(self, context: str, source_count: int) -> float:
         context_chars = len((context or "").strip())
@@ -440,31 +398,9 @@ class CombinedRAGService:
         if has_named_entity:
             return question
 
-        # Pronoun-only / very short questions (≤ 4 words)
-        short_vague_markers = [
-            "they", "them", "those", "these", "that", "this", "it",
-            "its", "their", "the same",
-        ]
-        if word_count <= 4:
-            for marker in short_vague_markers:
-                if marker in normalized:
-                    needs_resolution = True
-                    break
-
-        # Explicit back-references in any length question
-        back_references = [
-            "the above", "mentioned above", "above uses", "above benefits",
-            "previous", "mentioned earlier", "tell me more", "elaborate on",
-            "go on", "what about",
-        ]
-        for ref in back_references:
-            if ref in normalized:
-                needs_resolution = True
-                break
-
-        # Questions starting with conjunctions are follow-ups
-        if normalized.startswith(("and ", "but ", "also ", "or ")):
-            needs_resolution = True
+        # We now rely on LLM-based resolution in _analyze_query_intent,
+        # but keep this for standalone calls if needed, just simplified.
+        needs_resolution = any(word in normalized for word in ["it", "they", "them", "those", "these", "that", "this", "its", "their", "more", "also", "above", "previous"])
 
         if not needs_resolution:
             return question
@@ -503,166 +439,67 @@ class CombinedRAGService:
             logger.debug(f"Follow-up resolution failed (non-critical): {e}")
             return question
 
-    def _detect_topic_change(self, question: str, history: Optional[List[Dict[str, str]]]) -> bool:
+    async def _analyze_query_intent(
+        self,
+        question: str,
+        history: Optional[List[Dict[str, str]]] = None,
+        folder_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
-        Detect if the user's question is about a DIFFERENT topic than the conversation history.
-        
-        Returns True if the question is about a new topic (history should NOT be passed to LLM).
-        Returns False if the question is likely a follow-up (history SHOULD be passed).
+        Unified query analysis using the LLM's intelligence instead of hardcoded rules.
+        Determines:
+        1. is_greeting: True if it's just 'hi', 'how are you', etc.
+        2. is_new_topic: True if the user is switching topics (ignore history).
+        3. retrieval_mode: "fast", "deep", or "catalog".
+        4. entities: List of key entities/terms to search for.
+        5. resolved_question: A self-contained version of the question.
         """
-        if not history or len(history) < 2:
-            return False
-        
-        normalized = question.lower().strip()
-        words = normalized.split()
-        
-        # If the question uses pronouns or follow-up markers, it's a continuation
-        follow_up_markers = {
-            "they", "them", "those", "these", "that", "this", "it",
-            "its", "their", "the same", "above", "previous",
-            "tell me more", "elaborate", "go on", "what about",
-            "and ", "but ", "also ", "or ",
-        }
-        for marker in follow_up_markers:
-            if marker in normalized:
-                return False
-        
-        # Extract significant words from the question (potential entity names)
-        stopwords = {
-            "what", "which", "where", "when", "who", "how", "why", "does",
-            "is", "are", "was", "were", "the", "and", "for", "with",
-            "from", "have", "has", "been", "being", "into", "about",
-            "commonly", "known", "called", "used", "belong", "belongs",
-            "plant", "family", "name", "common", "scientific",
-            "list", "show", "find", "tell", "give", "many", "much",
-        }
-        q_keywords = {w.strip("?,.'\"!") for w in words
-                      if len(w.strip("?,.'\"!")) > 3 and w.strip("?,.'\"!").lower() not in stopwords}
-        
-        if not q_keywords:
-            return False
-        
-        # Check if any of these keywords appeared in the last assistant answer
-        last_assistant = ""
-        for m in reversed(history):
-            if m.get("role") == "assistant":
-                last_assistant = m.get("content", "").lower()
-                break
-        
-        if not last_assistant:
-            return False
-        
-        # If NONE of the question's key entities appear in the last answer,
-        # the user has switched topics
-        overlap = sum(1 for kw in q_keywords if kw in last_assistant)
-        if overlap == 0:
-            logger.info(f"🔄 Topic change detected: question keywords {q_keywords} not in last answer")
-            return True
-        
-        return False
+        history_text = ""
+        if history:
+            history_text = "\n".join([f"{m['role']}: {m['content'][:200]}" for m in history[-3:]])
 
-    def _detect_topic_change(self, question: str, history: Optional[List[Dict[str, str]]]) -> bool:
-        """
-        Detect if the user's question is about a NEW topic.
-        If True, history is cleared to prevent 'meta-talk' and confusion.
-        """
-        if not history or len(history) < 2:
-            return False
-        
-        normalized = question.lower().strip()
-        
-        # Continuation markers: if these are present, it's a follow-up
-        if any(m in normalized for m in ["it", "they", "them", "those", "these", "that", "this", "its", "their", "more", "also", "and", "but"]):
-            return False
-
-        # Get entities from last answer
-        last_answer = ""
-        for m in reversed(history):
-            if m["role"] == "assistant":
-                last_answer = m["content"].lower()
-                break
-        
-        if not last_answer:
-            return False
-
-        # Extract keywords (words > 3 chars, not common verbs/articles)
-        stopwords = {"what", "which", "where", "when", "how", "does", "plant", "family", "name", "common", "scientific"}
-        q_words = {w.strip("?,.!") for w in normalized.split() if len(w) > 3 and w not in stopwords}
-        
-        if not q_words: return False # Default to keeping history if question is too short
-        
-        # If ZERO overlap between question keywords and last answer, it's a new topic
-        overlap = sum(1 for kw in q_words if kw in last_answer)
-        if overlap == 0:
-            logger.info(f"🔄 Topic switch detected: {q_words} not in last answer. Clearing history.")
-            return True
-            
-        return False
-
-    def _detect_topic_change(self, question: str, history: Optional[List[Dict[str, str]]]) -> bool:
-        """
-        Final topic-change gate used by answer synthesis.
-        Clears history only when the new question has no meaningful overlap
-        with the latest assistant answer and does not look like a follow-up.
-        """
-        if not history or len(history) < 2:
-            return False
-
-        normalized = self._normalize_question(question)
-        if any(
-            marker in normalized
-            for marker in [
-                "it", "they", "them", "those", "these", "that", "this",
-                "its", "their", "more", "also", "and", "but", "previous", "above",
-            ]
-        ):
-            return False
-
-        last_answer = ""
-        for message in reversed(history):
-            if message.get("role") == "assistant":
-                last_answer = self._normalize_question(str(message.get("content", "")))
-                break
-
-        if not last_answer:
-            return False
-
-        q_words = set(self._extract_keywords(question))
-        if not q_words:
-            return False
-
-        overlap = sum(1 for keyword in q_words if keyword in last_answer)
-        if overlap == 0:
-            logger.info(f"Topic switch detected; clearing unrelated history for keywords: {sorted(q_words)}")
-            return True
-
-        return False
-
-    def _select_retrieval_mode(self, question: str, folder_id: Optional[str]) -> str:
-        normalized = self._normalize_question(question)
-        if normalized in self._greetings:
-            return "greeting"
-
-        deep_phrases = (
-            "connected to", "connection", "connections", "relationship", "relationships",
-            "path ", "paths", "chain", "travers", "bridge", "bottleneck", "cluster",
-            "community", "communities", "central", "influence", "important", "rank",
-            "ranking", "similar", "similarity", "predict", "missing link", "algorithm",
-            "pagerank", "articlerank", "betweenness", "closeness", "degree centrality",
-            "hits", "louvain", "leiden", "wcc", "kcore", "triangle", "topological",
-            "multi-hop", "multihop", "why is", "why are", "how is", "how are",
+        prompt = (
+            "You are a research query analyst for a Knowledge Graph RAG system.\n"
+            "Analyze the following user question in the context of the conversation history.\n\n"
+            "YOUR TASKS:\n"
+            "1. is_greeting: Is this a greeting (hi, hello) or a pleasantry (how are you, thanks)?\n"
+            "2. is_new_topic: Is the user asking about a DIFFERENT entity or subject than the last assistant response? \n"
+            "   - YES: If the last turn was about 'Basil' and now they ask about 'Moringa'.\n"
+            "   - NO: If they are asking for details, follow-ups, or more info about the SAME subject.\n"
+            "3. entities: Extract ONLY the technical entities (plants, chemicals, names) present in the CURRENT question.\n"
+            "4. resolved_question: If the question uses pronouns (it, they) or is a partial sentence, rewrite it to be self-contained using history. If it is already a full question about a new subject, keep it EXACTLY as is.\n"
+            "5. retrieval_mode:\n"
+            "   - 'catalog': counting, listing all of a type, or broad enumeration.\n"
+            "   - 'deep': relationships, multi-hop paths, 'why/how' questions.\n"
+            "   - 'fast': direct factual property lookups.\n\n"
+            "CONVERSATION HISTORY:\n"
+            f"{history_text or '[No history]'}\n\n"
+            f"USER QUESTION: {question}\n\n"
+            "Return ONLY a JSON object with this exact structure:\n"
+            "{\n"
+            "  \"is_greeting\": bool,\n"
+            "  \"is_new_topic\": bool,\n"
+            "  \"entities\": [\"entity1\", \"entity2\"],\n"
+            "  \"retrieval_mode\": \"fast\"|\"deep\"|\"catalog\",\n"
+            "  \"resolved_question\": \"rewritten question\"\n"
+            "}"
         )
-        if any(phrase in normalized for phrase in deep_phrases):
-            return "deep"
 
-        catalog_phrases = (
-            "how many", "count ", "counts ", "list all", "what are all", "what are the",
-            "which are all", "show all", "give all", "all of the", "total number", "number of",
-        )
-        if folder_id and any(phrase in normalized for phrase in catalog_phrases):
-            return "catalog"
-
-        return "fast"
+        try:
+            # Short timeout for intent analysis to keep it snappy
+            result = await asyncio.wait_for(self.llm.generate_json(prompt), timeout=4.0)
+            if not isinstance(result, dict) or "retrieval_mode" not in result:
+                raise ValueError("Invalid intent analysis response")
+            return result
+        except Exception as e:
+            logger.warning(f"Intent analysis failed: {e}. Falling back to default.")
+            return {
+                "is_greeting": question.lower().strip().strip("?!.") in {"hi", "hello", "hey"},
+                "is_new_topic": False,
+                "entities": self._extract_keywords(question),
+                "retrieval_mode": "fast",
+                "resolved_question": question
+            }
 
     async def _stream_fast_answer(
         self,
@@ -674,6 +511,7 @@ class CombinedRAGService:
         session_id: Optional[str],
         web_search: bool,
         catalog_mode: bool = False,
+        entities: List[str] = None,
     ):
         yield json.dumps({"type": "step", "id": 2, "status": "Searching relevant sources..."}) + "\n"
 
@@ -684,11 +522,7 @@ class CombinedRAGService:
         expanded_terms = query_plan["expanded_terms"]
         exact_names = query_plan["exact_names"]
         search_question = query_plan["search_text"]
-        answer_history = self._select_relevant_history(
-            question,
-            combined_history,
-            limit=max(1, int(settings.RAG_FAST_HISTORY_WINDOW_MESSAGES)),
-        )
+        answer_history = combined_history or []
         if expanded_terms or exact_names:
             logger.info(f"Fast query plan | expanded={expanded_terms} | exact={exact_names}")
             logger.info(f"🔍 Query expanded: {expanded_terms}")
@@ -711,7 +545,7 @@ class CombinedRAGService:
                 "Focused Entity Scan",
                 asyncio.create_task(
                     asyncio.wait_for(
-                        self._focused_entity_scan(search_question, folder_id, exact_names=exact_names),
+                        self._focused_entity_scan(search_question, folder_id, exact_names=exact_names, entities=entities),
                         timeout=_FAST_RETRIEVAL_TIMEOUT,
                     )
                 ),
@@ -876,54 +710,33 @@ class CombinedRAGService:
             if msg_str not in seen_msgs and msg.get('content', '').strip():
                 seen_msgs.add(msg_str)
                 combined_history.append(msg)
-        relevant_history = self._select_relevant_history(question, combined_history)
-
-        # ── Fast-path: Greeting ────────────────────────────────
-        clean_q = question.lower().strip().strip("?!.")
-        if clean_q in self._greetings:
-            ans = (
-                "Hello! 👋 I'm your Neural Nexus research assistant. "
-                "I'm ready to explore the data in your active folder. "
-                "What would you like to know?"
-            )
+        # ── Step 1: Agentic Intent Analysis ──────────────────
+        intent = await self._analyze_query_intent(question, combined_history, folder_id)
+        
+        # ── Greetings ────────────────────────────────────────
+        if intent.get("is_greeting"):
+            ans = "Hello! 👋 I'm your Neural Nexus research assistant. How can I help you explore your data today?"
             yield json.dumps({"type": "content", "data": ans}) + "\n"
             yield json.dumps({"type": "step", "id": 4, "status": "Done"}) + "\n"
             return
 
-        # ── Follow-up Resolution: rewrite ambiguous questions using conversation context ──
-        # Handles: "what are they?", "tell me more", "explain that", "and the side effects?"
-        resolved_question = question
-        if combined_history and len(combined_history) >= 2:
-            resolved_question = await self._resolve_followup(question, combined_history)
-            if resolved_question != question:
-                logger.info(f"🔗 Follow-up resolved: '{question}' → '{resolved_question}'")
+        # ── Topic Switch ─────────────────────────────────────
+        if intent.get("is_new_topic"):
+            logger.info("🔄 Topic switch detected via intent analysis. Clearing history context.")
+            relevant_history = []
+        else:
+            # Select relevant history window
+            history_window = max(1, int(settings.RAG_HISTORY_WINDOW_MESSAGES))
+            relevant_history = combined_history[-history_window:]
 
-        relevant_history = self._select_relevant_history(resolved_question, combined_history)
-        retrieval_mode = self._select_retrieval_mode(resolved_question, folder_id)
-        logger.info(f"⚡ Retrieval mode selected: {retrieval_mode}")
+        resolved_question = intent.get("resolved_question", question)
+        retrieval_mode = intent.get("retrieval_mode", "fast")
+        entities = intent.get("entities", [])
+        
+        logger.info(f"⚡ Intent: mode={retrieval_mode}, topic_switch={intent.get('is_new_topic')}, entities={entities}")
+        logger.info(f"⚡ Resolved Question: {resolved_question}")
+
         if retrieval_mode in {"fast", "catalog"}:
-            if not web_search:
-                cached_answer = await self._get_cached_fast_answer(
-                    question=resolved_question,
-                    folder_id=folder_id,
-                    user_id=user_id,
-                    catalog_mode=(retrieval_mode == "catalog"),
-                    combined_history=relevant_history,
-                )
-                if cached_answer:
-                    yield json.dumps({"type": "step", "id": 2, "status": "Using cached response..."}) + "\n"
-                    yield json.dumps({"type": "web_search_suggestion", "data": False, "emphasized": False}) + "\n"
-                    yield json.dumps({"type": "step", "id": 3, "status": "Finalizing answer..."}) + "\n"
-                    yield json.dumps({"type": "content", "data": cached_answer}) + "\n"
-                    yield json.dumps({"type": "step", "id": 4, "status": "Research completed."}) + "\n"
-                    await self._persist_fast_history(
-                        question=question,
-                        answer=cached_answer,
-                        user_id=user_id,
-                        folder_id=folder_id,
-                        session_id=session_id,
-                    )
-                    return
             async for chunk in self._stream_fast_answer(
                 question=resolved_question,
                 folder_id=folder_id,
@@ -933,13 +746,14 @@ class CombinedRAGService:
                 session_id=session_id,
                 web_search=web_search,
                 catalog_mode=(retrieval_mode == "catalog"),
+                entities=entities,
             ):
                 yield chunk
             return
 
+        # ── Deep Path ────────────────────────────────────────
         # Determine fallback dynamic depth
         fallback_depth = await self._get_dynamic_depth(folder_id, resolved_question)
-        # Use resolved question for all retrieval in the deep path
         question = resolved_question
 
         # ══════════════════════════════════════════════════════════
@@ -993,7 +807,7 @@ class CombinedRAGService:
         )
         entity_scan_task = asyncio.create_task(
             asyncio.wait_for(
-                self._focused_entity_scan(deep_search_question, folder_id, exact_names=deep_exact_names),
+                self._focused_entity_scan(deep_search_question, folder_id, exact_names=deep_exact_names, entities=entities),
                 timeout=6
             )
         )
@@ -1026,7 +840,7 @@ class CombinedRAGService:
         # Launch expansion-dependent branches NOW (they run in parallel with already-running branches)
         property_task = asyncio.create_task(
             asyncio.wait_for(
-                self._property_search(question, folder_id, expanded_terms, fallback_depth),
+                self._property_search(question, folder_id, expanded_terms, fallback_depth, entities=entities),
                 timeout=6
             )
         )
@@ -1320,18 +1134,22 @@ class CombinedRAGService:
         }
 
     def _build_answer_prompt(self, question: str, context: str, folder_id: Optional[str], fast_mode: bool = False) -> str:
-        id_rule = "CRITICAL: NEVER include technical node IDs. Use 'Name' or 'Common Name' only."
-        grounding_rule = (
-            "• Use ONLY the CONTEXT below.\n"
-            "• If info is in a node property (like 'Common Name'), it is FACT.\n"
-            "• NO PREAMBLE. No 'Based on context'. No 'I found'.\n"
-            "• If no info, say: 'This information was not found in the database.'\n"
-            "• DIRECT ANSWERS ONLY."
+        id_rule = "CRITICAL: NEVER include technical node IDs or database identifiers. Use only Names."
+        style_rule = (
+            "• Provide a helpful, natural response in neat, complete sentences.\n"
+            "• Be thorough but concise. Do not use 'and others...' or 'and more...' if the information is present in the context.\n"
+            "• NO PREAMBLE. Do not say 'Based on the context' or 'I found'. Just answer naturally.\n"
+            "• NO META-TALK. Do not mention your internal analysis, topic switching, or the provided history.\n"
+            "• STICK TO THE SUBJECT. If the question is about 'Moringa', do not talk about 'Basil' even if it is in the context/history.\n"
+            "• If no information is found in the CONTEXT for the SPECIFIC subject requested, say: 'This information was not found in the database.'\n"
+            "• Avoid technical jargon unless it is part of the data."
         )
 
-        return f"""You are Neural Nexus. Answer the QUESTION using ONLY the CONTEXT.
+        return f"""You are Neural Nexus, a highly intelligent research assistant.
+Answer the QUESTION using ONLY the facts provided in the CONTEXT.
+
 {id_rule}
-{grounding_rule}
+{style_rule}
 
 CONTEXT:
 {context}
@@ -1956,35 +1774,20 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
         question: str,
         folder_id: Optional[str],
         exact_names: Optional[List[str]] = None,
+        entities: Optional[List[str]] = None,
     ) -> str:
         """
-        When the question mentions a specific entity (e.g. 'Tamarind', 'Aspirin'),
-        finds that entity and exhaustively traverses ALL its connections up to 4 hops.
-
-        Unlike semantic search (top-K limited) or multi-hop (random scan),
-        this is TARGETED: it starts from the mentioned entity and follows
-        EVERY relationship chain in BOTH directions with NO result limit.
-
-        This ensures questions like "What plant parts of Tamarind..." get
-        ALL plant parts AND all their connections (phytoconstituents, biomarkers, etc.)
+        Focused scan starting from identified entities.
         """
         if not folder_id:
             return ""
 
         folder_label = f"F_{folder_id.replace('-', '_')}"
 
-        # Extract potential entity names from question (words > 3 chars, not stopwords)
-        stopwords = {"what", "which", "where", "when", "that", "this", "those",
-                      "there", "their", "them", "they", "with", "from", "have",
-                      "does", "about", "along", "mention", "used", "medicinally",
-                      "contains", "contain", "plant", "parts", "list", "give",
-                      "show", "find", "tell", "many", "much", "most", "more",
-                      "some", "other", "also", "been", "being", "into", "each",
-                      "only", "your", "very", "just"}
-        words = [w.strip("?,.'\"!").lower() for w in question.split()
-                 if len(w.strip("?,.'\"!")) > 3 and w.strip("?,.'\"!").lower() not in stopwords]
-
-        if not words and not exact_names:
+        # Use entities from intent analysis if available, otherwise fallback to simple split
+        target_entities = entities or [w.strip("?,.'\"!").lower() for w in question.split() if len(w) > 3]
+        
+        if not target_entities and not exact_names:
             return ""
 
         try:
@@ -1994,7 +1797,7 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
             async with self.neo4j.session() as session:
                 # Step 1: Find keyword matches across ALL string properties (not just name).
                 # This catches commonName, scientificName, synonyms, origin, family, etc.
-                keywords = list(dict.fromkeys(words[:6] + [self._normalize_question(name) for name in (exact_names or [])]))[:8]
+                keywords = list(dict.fromkeys(target_entities[:6] + [self._normalize_question(name) for name in (exact_names or [])]))[:8]
                 find_query = f"""
                     MATCH (n:{folder_label})
                     WHERE n.name IS NOT NULL
@@ -2198,40 +2001,17 @@ Example: ["stress physiological", "anxiety disorder", "cortisol"]"""
     #  Property-Aware Node Search (parallel branch)
     # ────────────────────────────────────────────────────────────
 
-    async def _property_search(self, question: str, folder_id: Optional[str], expanded_terms: List[str] = None, max_depth: int = 6) -> str:
+    async def _property_search(self, question: str, folder_id: Optional[str], expanded_terms: List[str] = None, max_depth: int = 6, entities: List[str] = None) -> str:
         """
-        Fetches ALL properties of nodes that match any keyword from the question
-        OR any expanded term from LLM query expansion.
-
-        Enhanced with:
-        - LLM-expanded search terms (e.g. "stress" → also searches "stress physiological")
-        - Fuzzy partial matching across ALL property values
-        - Multi-word phrase matching for compound node names
-
-        Domain-agnostic: works for herbs, drugs, people, companies — any dataset.
+        Property search using identified keywords/entities.
         """
         if not folder_id:
             return ""
 
         folder_label = f"F_{folder_id.replace('-', '_')}"
 
-        # Extract meaningful keywords from the question (skip stopwords)
-        stopwords = {"what", "is", "are", "the", "a", "an", "of", "for", "in",
-                     "to", "and", "or", "with", "how", "which", "where", "does",
-                     "do", "its", "their", "can", "has", "have", "give", "me",
-                     "tell", "show", "find", "list", "get", "name", "names",
-                     "help", "helps", "that", "this", "about", "from", "all",
-                     "any", "been", "being", "but", "by", "could", "each",
-                     "had", "into", "may", "might", "more", "most", "much",
-                     "not", "only", "other", "our", "out", "own", "should",
-                     "some", "such", "than", "them", "then", "there", "these",
-                     "those", "through", "under", "very", "was", "were",
-                     "will", "would", "your"}
-        keywords = [
-            w.strip("?,.").lower()
-            for w in question.split()
-            if len(w.strip("?,.")) > 2 and w.strip("?,.").lower() not in stopwords
-        ]
+        # Use identified entities if available
+        keywords = entities or [w.strip("?,.").lower() for w in question.split() if len(w) > 3]
 
         # Merge with LLM-expanded terms (the crucial enhancement)
         if expanded_terms:
