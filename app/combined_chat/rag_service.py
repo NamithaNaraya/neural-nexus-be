@@ -463,10 +463,10 @@ class CombinedRAGService:
             logger.debug(f"Follow-up resolution failed (non-critical): {e}")
             return question
 
-    def _get_heuristic_intent(self, question: str) -> dict:
+    def _get_heuristic_intent(self, question: str, history: Optional[List[Dict[str, str]]] = None) -> dict:
         """
         Fallback logic to detect intent when LLM fails or times out.
-        Ensures we don't 'skip' algorithms for questions that clearly need them.
+        Now includes basic topic-switch detection to prevent context poisoning.
         """
         q = question.lower()
         use_gds = False
@@ -479,17 +479,23 @@ class CombinedRAGService:
         elif any(w in q for w in ["community", "group", "cluster", "neighborhood", "related", "family", "collection"]):
             use_gds = True
             gds_algo = "louvain"
-        elif any(w in q for w in ["bridge", "connect", "between", "gatekeeper", "bottleneck"]):
-            use_gds = True
-            gds_algo = "betweenness"
-        elif any(w in q for w in ["central", "center", "fastest", "reach", "closest"]):
-            use_gds = True
-            gds_algo = "closeness"
+        
+        # Simple Topic Switch Detection
+        is_new_topic = False
+        current_entities = set(self._extract_keywords(question))
+        if history and current_entities:
+            # Check last few messages for topic overlap
+            last_content = " ".join([m.get("content", "").lower() for m in history[-3:]])
+            last_entities = set(self._extract_keywords(last_content))
+            
+            # If we have new specific entities and they don't appear in recent history, it's a new topic.
+            if last_entities and not (current_entities & last_entities):
+                is_new_topic = True
 
         return {
             "is_greeting": q.strip().strip("?!.") in {"hi", "hello", "hey", "hola", "greetings"},
-            "is_new_topic": False,
-            "entities": self._extract_keywords(question),
+            "is_new_topic": is_new_topic,
+            "entities": list(current_entities),
             "retrieval_mode": "deep" if use_gds or "?" in q else "fast",
             "use_gds": use_gds,
             "gds_algo": gds_algo,
@@ -557,7 +563,7 @@ class CombinedRAGService:
             return result
         except Exception as e:
             logger.warning(f"Intent analysis failed: {repr(e)}. Using heuristic fallback.")
-            return self._get_heuristic_intent(question)
+            return self._get_heuristic_intent(question, history)
 
     async def _stream_fast_answer(
         self,
@@ -1222,12 +1228,12 @@ class CombinedRAGService:
         gds_rule = "ALGORITHM EXPLANATION: If the context contains 'ALGORITHM' results (like PageRank, Betweenness), you MUST explicitly state the algorithm name in your response (e.g., 'According to the PageRank algorithm...') and explain the scores and relevance."
         style_rule = (
             "• Provide a helpful, natural response in neat, complete sentences. Reference the subject of the question in your answer.\n"
-            "• AVOID ONE-WORD ANSWERS. Even for simple facts, provide context. (e.g., instead of 'Leaves', say 'The plant parts of Tamarind used medicinally are the leaves.')\n"
-            "• Be thorough but concise. Do not use 'and others...' or 'and more...' if the information is present in the context.\n"
-            "• NO PREAMBLE. Do not say 'Based on the context', 'I found', or 'As an AI'. Just answer naturally.\n"
+            "• AVOID ONE-WORD ANSWERS. Even for simple facts, provide context. (e.g., instead of 'Leaves', say 'The plant parts of Moringa oleifera containing Rutin are the leaves.')\n"
+            "• NO PREAMBLE AND NO SIGN-OFF. Never say 'Based on the context', 'I hope you like my response', 'Let me know if you have more questions', or any variation of 'Happy to help'. STOP immediately after the answer.\n"
+            "• NO ROBOTIC LABELS. Never use phrases like 'This answer is justified because...' or 'According to the context...'. Just state the facts as part of your natural explanation.\n"
             "• NO ROBOTIC DISCLAIMERS. Never mention internal processes like 'I have analyzed conversation history' or 'switching topics'.\n"
-            "• JUSTIFY YOUR ANSWER. Explain *why* the answer is correct based on the graph relationships or algorithm scores found in the context.\n"
-            "• STICK TO THE SUBJECT. If the question is about 'Moringa', do not talk about 'Basil' even if it is in the context/history.\n"
+            "• INTEGRATED JUSTIFICATION. Weave the reason why the answer is correct (the connections found in the graph) into your explanation naturally, rather than as a separate 'justification' section.\n"
+            "• STICK TO THE SUBJECT. If the question is about 'Moringa', do not talk about 'Basil' or list other herbs unless explicitly asked to compare them.\n"
             "• If no information is found in the CONTEXT for the SPECIFIC subject requested, say: 'This information was not found in the database.'\n"
             "• Avoid technical jargon unless it is part of the data."
         )

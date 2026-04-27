@@ -110,25 +110,9 @@ async def run_query(
             scope=request.scope,
         )
         
-        # 3. Store new interaction in PostgreSQL
-        async with get_postgres_session() as session:
-            # Store User question
-            await session.execute(
-                text("""
-                    INSERT INTO neural_nexus.chat_history (user_id, session_id, role, message)
-                    VALUES (:user_id, :session_id, 'user', :message)
-                """),
-                {"user_id": current_user['id'], "session_id": session_id, "message": request.question}
-            )
-            # Store Assistant answer
-            await session.execute(
-                text("""
-                    INSERT INTO neural_nexus.chat_history (user_id, session_id, role, message)
-                    VALUES (:user_id, :session_id, 'assistant', :message)
-                """),
-                {"user_id": current_user['id'], "session_id": session_id, "message": result.get("answer", "")}
-            )
-            await session.commit()
+        # 3. Persistence is now handled internally by CombinedRAGService
+        # during the streaming/synthesis phase to ensure metadata (algorithm results,
+        # grounding scores, etc.) are captured accurately in the 'citations' column.
         
         return QueryResponse(
             answer=result.get("answer", "No answer generated"),
