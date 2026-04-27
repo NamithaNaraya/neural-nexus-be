@@ -1144,6 +1144,7 @@ class CombinedRAGService:
             # Pack metadata into citations for persistent UI state (Algorithm Insights, etc.)
             metadata = {
                 "algorithm": algo,
+                "folder_id": folder_id,
                 "gds_results": results if 'results' in locals() else None,
                 "grounding": {
                     "score": grounding_score,
@@ -1220,7 +1221,8 @@ class CombinedRAGService:
         id_rule = "CRITICAL: NEVER include technical node IDs, internal hash identifiers, or database keys (like 'node ID' or '456:789'). Use ONLY human-readable Names."
         gds_rule = "ALGORITHM EXPLANATION: If the context contains 'ALGORITHM' results (like PageRank, Betweenness), you MUST explicitly state the algorithm name in your response (e.g., 'According to the PageRank algorithm...') and explain the scores and relevance."
         style_rule = (
-            "• Provide a helpful, natural response in neat, complete sentences.\n"
+            "• Provide a helpful, natural response in neat, complete sentences. Reference the subject of the question in your answer.\n"
+            "• AVOID ONE-WORD ANSWERS. Even for simple facts, provide context. (e.g., instead of 'Leaves', say 'The plant parts of Tamarind used medicinally are the leaves.')\n"
             "• Be thorough but concise. Do not use 'and others...' or 'and more...' if the information is present in the context.\n"
             "• NO PREAMBLE. Do not say 'Based on the context', 'I found', or 'As an AI'. Just answer naturally.\n"
             "• NO ROBOTIC DISCLAIMERS. Never mention internal processes like 'I have analyzed conversation history' or 'switching topics'.\n"

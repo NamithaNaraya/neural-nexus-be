@@ -168,19 +168,25 @@ async def get_chat_history(
     db_session_id = _to_uuid(session_id)
     
     async with get_postgres_session() as session:
+        # Use a subquery to get the latest messages first, then sort them chronologically 
+        # using 'id' as a tie-breaker for identical timestamps.
         result = await session.execute(
             text("""
                 SELECT role, message, citations, timestamp
-                FROM neural_nexus.chat_history
-                WHERE session_id = :session_id AND user_id = :user_id
-                ORDER BY timestamp DESC
-                LIMIT :limit
+                FROM (
+                    SELECT id, role, message, citations, timestamp
+                    FROM neural_nexus.chat_history
+                    WHERE session_id = :session_id AND user_id = :user_id
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT :limit
+                ) sub
+                ORDER BY timestamp ASC, id ASC
             """),
             {"session_id": db_session_id, "user_id": current_user['id'], "limit": limit}
         )
         raw_msgs = result.mappings().all()
         messages = []
-        for r in reversed(raw_msgs):
+        for r in raw_msgs: # No longer need reversed() because the subquery outer sort handles it
             msg = dict(r)
             citations = msg.get("citations")
             if isinstance(citations, dict):
@@ -223,11 +229,17 @@ async def list_chat_sessions_v2(
                         session_id, 
                         message as last_message, 
                         timestamp as last_activity,
+                        citations,
                         ROW_NUMBER() OVER(PARTITION BY session_id ORDER BY timestamp DESC) as rn
                     FROM neural_nexus.chat_history
                     WHERE user_id = :user_id
                 )
-                SELECT lm.session_id, lm.last_message, lm.last_activity, ss.message_count
+                SELECT 
+                    lm.session_id, 
+                    lm.last_message, 
+                    lm.last_activity, 
+                    ss.message_count,
+                    lm.citations->>'folder_id' as folder_id
                 FROM latest_messages lm
                 JOIN session_stats ss ON lm.session_id = ss.session_id
                 WHERE lm.rn = 1
