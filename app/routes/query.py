@@ -178,7 +178,20 @@ async def get_chat_history(
             """),
             {"session_id": db_session_id, "user_id": current_user['id'], "limit": limit}
         )
-        messages = [dict(r) for r in reversed(result.mappings().all())]
+        raw_msgs = result.mappings().all()
+        messages = []
+        for r in reversed(raw_msgs):
+            msg = dict(r)
+            citations = msg.get("citations")
+            if isinstance(citations, dict):
+                # Unpack GDS/Algorithm metadata into root for frontend compatibility
+                if "algorithm" in citations:
+                    msg["algorithm"] = citations["algorithm"]
+                if "gds_results" in citations:
+                    msg["results"] = citations["gds_results"]
+                if "grounding" in citations:
+                    msg["dataGrounding"] = citations["grounding"]
+            messages.append(msg)
         
         return {
             "session_id": session_id,
@@ -250,7 +263,7 @@ async def list_chat_sessions(
 async def delete_chat_session(
     session_id: str,
     current_user: dict = Depends(get_current_user),
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     db_session_id = _to_uuid(session_id)
     async with get_postgres_session() as session:
         chat_delete_result = await session.execute(

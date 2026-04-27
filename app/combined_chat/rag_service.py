@@ -1141,6 +1141,18 @@ class CombinedRAGService:
             except (ValueError, TypeError):
                 db_session_id = str(uuid.uuid5(uuid.NAMESPACE_OID, db_session_id))
 
+            # Pack metadata into citations for persistent UI state (Algorithm Insights, etc.)
+            metadata = {
+                "algorithm": algo,
+                "gds_results": results if 'results' in locals() else None,
+                "grounding": {
+                    "score": grounding_score,
+                    "is_grounded": is_grounded,
+                    "source_count": len(fused)
+                }
+            }
+            citations_json = json.dumps(metadata)
+
             async with get_postgres_session() as session:
                 await session.execute(
                     sa_text("""
@@ -1151,10 +1163,15 @@ class CombinedRAGService:
                 )
                 await session.execute(
                     sa_text("""
-                        INSERT INTO neural_nexus.chat_history (user_id, session_id, role, message)
-                        VALUES (:user_id, :session_id, 'assistant', :message)
+                        INSERT INTO neural_nexus.chat_history (user_id, session_id, role, message, citations)
+                        VALUES (:user_id, :session_id, 'assistant', :message, CAST(:citations AS JSONB))
                     """),
-                    {"user_id": user_id, "session_id": db_session_id, "message": full_answer}
+                    {
+                        "user_id": user_id, 
+                        "session_id": db_session_id, 
+                        "message": full_answer,
+                        "citations": citations_json
+                    }
                 )
                 await session.commit()
             logger.info(f"💾 Saved chat to PostgreSQL (session: {db_session_id})")
