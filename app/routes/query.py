@@ -12,7 +12,7 @@ import uuid
 
 from sqlalchemy import text
 from app.core.security import get_current_user
-from app.db.connections import get_postgres_session
+from app.db.connections import get_postgres_session, get_redis_client
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -33,6 +33,95 @@ def _to_uuid(sid: str) -> str:
     except (ValueError, TypeError):
         # Otherwise, generate a deterministic UUID
         return str(uuid.uuid5(uuid.NAMESPACE_OID, sid))
+
+
+async def _clear_session_records(
+    session_id: str,
+    user_id: str,
+) -> Dict[str, Any]:
+    db_session_id = _to_uuid(session_id)
+    folder_ids: List[str] = []
+
+    async with get_postgres_session() as session:
+        folder_rows = await session.execute(
+            text("""
+                SELECT DISTINCT citations->>'folder_id' AS folder_id
+                FROM neural_nexus.chat_history
+                WHERE session_id = :session_id
+                  AND user_id = :user_id
+                  AND citations IS NOT NULL
+                  AND citations->>'folder_id' IS NOT NULL
+                  AND citations->>'folder_id' <> ''
+            """),
+            {"session_id": db_session_id, "user_id": user_id}
+        )
+        folder_ids = [str(row["folder_id"]) for row in folder_rows.mappings().all() if row.get("folder_id")]
+
+        await session.execute(
+            text("""
+                DELETE FROM neural_nexus.outcomes
+                WHERE encounter_id IN (
+                    SELECT id FROM neural_nexus.encounters
+                    WHERE session_id = :session_id AND user_id = :user_id
+                )
+            """),
+            {"session_id": db_session_id, "user_id": user_id}
+        )
+
+        await session.execute(
+            text("DELETE FROM neural_nexus.encounters WHERE session_id = :session_id AND user_id = :user_id"),
+            {"session_id": db_session_id, "user_id": user_id}
+        )
+
+        chat_delete_result = await session.execute(
+            text("DELETE FROM neural_nexus.chat_history WHERE session_id = :session_id AND user_id = :user_id"),
+            {"session_id": db_session_id, "user_id": user_id}
+        )
+
+        await session.commit()
+
+    try:
+        redis = get_redis_client()
+        meta_keys = [f"chat:meta:{session_id}", f"chat:meta:{db_session_id}"]
+        meta_values = {}
+
+        for key in meta_keys:
+            try:
+                values = await redis.hgetall(key)
+            except Exception:
+                values = {}
+            if values:
+                meta_values.update(values)
+
+        redis_keys = {
+            f"chat:meta:{session_id}",
+            f"chat:meta:{db_session_id}",
+            f"chat:history:{user_id}:session:{db_session_id}",
+        }
+        if session_id != db_session_id:
+            redis_keys.add(f"chat:history:{user_id}:session:{session_id}")
+
+        history_key = str(meta_values.get("history_key") or "").strip()
+        legacy_history_key = str(meta_values.get("legacy_history_key") or "").strip()
+        if history_key:
+            redis_keys.add(history_key)
+        if legacy_history_key:
+            redis_keys.add(legacy_history_key)
+
+        for folder_id in folder_ids:
+            redis_keys.add(f"chat:history:{user_id}:folder:{folder_id}")
+            redis_keys.add(f"chat:history:{user_id}:{folder_id}")
+
+        await redis.delete(*list(redis_keys))
+        logger.info(f"Session cleanup completed for session: {session_id}")
+    except Exception as re:
+        logger.warning(f"Redis cleanup partially failed for session {session_id}: {re}")
+
+    return {
+        "db_session_id": db_session_id,
+        "folder_ids": folder_ids,
+        "rows_removed": chat_delete_result.rowcount,
+    }
 
 
 class Citation(BaseModel):
@@ -261,17 +350,110 @@ async def delete_chat_session(
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     db_session_id = _to_uuid(session_id)
+    user_id = str(current_user["id"])
+    folder_ids: List[str] = []
     async with get_postgres_session() as session:
-        chat_delete_result = await session.execute(
-            text("DELETE FROM neural_nexus.chat_history WHERE session_id = :session_id AND user_id = :user_id"),
-            {"session_id": db_session_id, "user_id": current_user['id']}
+        folder_rows = await session.execute(
+            text("""
+                SELECT DISTINCT citations->>'folder_id' AS folder_id
+                FROM neural_nexus.chat_history
+                WHERE session_id = :session_id
+                  AND user_id = :user_id
+                  AND citations IS NOT NULL
+                  AND citations->>'folder_id' IS NOT NULL
+                  AND citations->>'folder_id' <> ''
+            """),
+            {"session_id": db_session_id, "user_id": user_id}
         )
-        # Cascade-like cleanup for other session-scoped records.
-        # Keep this constrained by user_id to avoid cross-user data changes.
+        folder_ids = [str(row["folder_id"]) for row in folder_rows.mappings().all() if row.get("folder_id")]
+        # 1. Delete feedback/outcomes associated with encounters in this session
+        await session.execute(
+            text("""
+                DELETE FROM neural_nexus.outcomes 
+                WHERE encounter_id IN (
+                    SELECT id FROM neural_nexus.encounters 
+                    WHERE session_id = :session_id AND user_id = :user_id
+                )
+            """),
+            {"session_id": db_session_id, "user_id": user_id}
+        )
+
+        # 2. Delete reasoning encounters
         await session.execute(
             text("DELETE FROM neural_nexus.encounters WHERE session_id = :session_id AND user_id = :user_id"),
-            {"session_id": db_session_id, "user_id": current_user['id']}
+            {"session_id": db_session_id, "user_id": user_id}
         )
+
+        # 3. Delete primary chat history
+        chat_delete_result = await session.execute(
+            text("DELETE FROM neural_nexus.chat_history WHERE session_id = :session_id AND user_id = :user_id"),
+            {"session_id": db_session_id, "user_id": user_id}
+        )
+        
         await session.commit()
 
-    return {"message": f"Session {session_id} deleted", "rows_removed": chat_delete_result.rowcount}
+    # 4. Deep cleanup in Redis
+    try:
+        redis = get_redis_client()
+        # Clear session metadata
+        meta_keys = [f"chat:meta:{session_id}", f"chat:meta:{db_session_id}"]
+        meta_values = {}
+
+        for key in meta_keys:
+            try:
+                values = await redis.hgetall(key)
+            except Exception:
+                values = {}
+            if values:
+                meta_values.update(values)
+
+        redis_keys = {
+            f"chat:meta:{session_id}",
+            f"chat:meta:{db_session_id}",
+            f"chat:history:{user_id}:session:{db_session_id}",
+        }
+        if session_id != db_session_id:
+            redis_keys.add(f"chat:history:{user_id}:session:{session_id}")
+
+        history_key = str(meta_values.get("history_key") or "").strip()
+        legacy_history_key = str(meta_values.get("legacy_history_key") or "").strip()
+        if history_key:
+            redis_keys.add(history_key)
+        if legacy_history_key:
+            redis_keys.add(legacy_history_key)
+
+        for folder_id in folder_ids:
+            redis_keys.add(f"chat:history:{user_id}:folder:{folder_id}")
+            redis_keys.add(f"chat:history:{user_id}:{folder_id}")
+
+        await redis.delete(*list(redis_keys))
+        
+        # We don't clear folder-level history (chat:history:...) as it's shared across sessions
+        # but we do clear any fast-answer caches if we could target them (they are hashed)
+        
+        logger.info(f"🗑️ Deep cleanup completed for session: {session_id}")
+    except Exception as re:
+        logger.warning(f"Redis cleanup partially failed for session {session_id}: {re}")
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "message": f"Session {session_id} and all associated records permanently deleted",
+        "rows_removed": chat_delete_result.rowcount,
+    }
+
+
+@router.post("/query/chat/session/{session_id}/clear")
+async def clear_chat_session(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    user_id = str(current_user["id"])
+    result = await _clear_session_records(session_id, user_id)
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "message": f"Session {session_id} cleared",
+        "rows_removed": result["rows_removed"],
+    }

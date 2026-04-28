@@ -67,6 +67,27 @@ class CombinedRAGService:
         self._chain_depth_cache: Dict[str, int] = {}  # folder_id -> max chain depth
         self._folder_name_sample_cache: Dict[str, List[str]] = {}
 
+    def _normalize_session_id(self, session_id: Optional[str]) -> Optional[str]:
+        raw = str(session_id or "").strip()
+        if not raw:
+            return None
+        try:
+            return str(uuid.UUID(raw))
+        except Exception:
+            return str(uuid.uuid5(uuid.NAMESPACE_OID, raw))
+
+    def _folder_history_key(self, user_id: str, folder_id: Optional[str]) -> str:
+        return f"chat:history:{user_id}:folder:{folder_id or 'global'}"
+
+    def _legacy_folder_history_key(self, user_id: str, folder_id: Optional[str]) -> str:
+        return f"chat:history:{user_id}:{folder_id or 'global'}"
+
+    def _session_history_key(self, user_id: str, session_id: Optional[str]) -> Optional[str]:
+        normalized_session_id = self._normalize_session_id(session_id)
+        if not normalized_session_id:
+            return None
+        return f"chat:history:{user_id}:session:{normalized_session_id}"
+
     def invalidate_schema_cache(self):
         """
         Clear the in-memory schema cache so the next query fetches fresh schema.
@@ -160,16 +181,19 @@ class CombinedRAGService:
         session_id: Optional[str],
     ) -> None:
         try:
-            history_key = f"chat:history:{user_id}:{folder_id or 'global'}"
+            history_key = self._session_history_key(user_id, session_id) or self._folder_history_key(user_id, folder_id)
+            normalized_session_id = self._normalize_session_id(session_id)
             await self.redis.rpush(history_key, json.dumps({"role": "user", "content": question}))
             await self.redis.rpush(history_key, json.dumps({"role": "assistant", "content": answer}))
             await self.redis.ltrim(history_key, -20, -1)
 
-            if session_id:
+            if normalized_session_id:
                 await self.redis.hset(
-                    f"chat:meta:{session_id}",
+                    f"chat:meta:{normalized_session_id}",
                     mapping={
                         "folder_id": folder_id or "",
+                        "history_key": history_key,
+                        "legacy_history_key": self._legacy_folder_history_key(user_id, folder_id),
                         "updated_at": str(int(time.time())),
                     },
                 )
@@ -577,6 +601,7 @@ class CombinedRAGService:
         catalog_mode: bool = False,
         entities: List[str] = None,
     ):
+        t_start_fast = time.time()
         yield json.dumps({"type": "step", "id": 2, "status": "Searching relevant sources..."}) + "\n"
 
         query_plan = await self._build_query_plan(question, folder_id)
@@ -702,6 +727,7 @@ class CombinedRAGService:
         yield json.dumps({"type": "web_search_suggestion", "data": suggest_web_search, "emphasized": thin_context}) + "\n"
         yield json.dumps({"type": "data_grounding", "data": {"grounded": is_grounded, "score": grounding_score, "source_count": len(fused), "context_chars": len(context)}}) + "\n"
 
+        t_retrieval_fast = time.time()
         yield json.dumps({"type": "step", "id": 3, "status": "Synthesizing answer..."}) + "\n"
 
         full_answer = ""
@@ -716,8 +742,9 @@ class CombinedRAGService:
                 chunk_count += 1
                 yield json.dumps({"type": "content", "data": chunk}) + "\n"
 
-        logger.info(f"📝 Streamed {chunk_count} content chunks")
-        yield json.dumps({"type": "step", "id": 4, "status": "Research completed."}) + "\n"
+        t_synthesis_fast = time.time()
+        logger.info(f"⏱️ Step 3 (Fast Synthesis): {t_synthesis_fast - t_retrieval_fast:.2f}s")
+        logger.info(f"⏱️ TOTAL FAST RESEARCH TIME: {t_synthesis_fast - t_start_fast:.2f}s")
 
         if not web_search:
             await self._set_cached_fast_answer(
@@ -758,7 +785,7 @@ class CombinedRAGService:
         yield json.dumps({"type": "step", "id": 1, "status": "Analyzing research intent..."}) + "\n"
 
         # ── History ────────────────────────────────────────────
-        history_key = f"chat:history:{user_id}:{folder_id or 'global'}"
+        history_key = self._session_history_key(user_id, session_id) or self._folder_history_key(user_id, folder_id)
         stored_history = []
         try:
             history_window = max(1, int(settings.RAG_HISTORY_WINDOW_MESSAGES))
@@ -779,6 +806,8 @@ class CombinedRAGService:
 
         # ── Step 1: Agentic Intent Analysis ──────────────────
         intent = await self._analyze_query_intent(question, cleaned_history, folder_id)
+        t_intent = time.time()
+        logger.info(f"⏱️ Step 1 (Intent Analysis): {t_intent - t_start:.2f}s")
         
         # ── Greetings ────────────────────────────────────────
         if intent.get("is_greeting"):
@@ -1015,7 +1044,7 @@ class CombinedRAGService:
                 extra_outputs = [asyncio.TimeoutError()] * len(extra_task_list)
 
         t_retrieval = time.time()
-        logger.info(f"⏱️ Phase 2 (retrieval): {t_retrieval - t_phase1:.2f}s")
+        logger.info(f"⏱️ Step 2 (Deep Retrieval Total): {t_retrieval - t_intent:.2f}s")
 
         # ── Fuse with labels (compact serialization) ──────────
         fused = []
@@ -1133,7 +1162,9 @@ class CombinedRAGService:
                 chunk_count += 1
                 yield json.dumps({"type": "content", "data": chunk}) + "\n"
         
-        logger.info(f"📝 Streamed {chunk_count} content chunks")
+        t_synthesis = time.time()
+        logger.info(f"⏱️ Step 3 (Synthesis): {t_synthesis - t_retrieval:.2f}s")
+        logger.info(f"⏱️ TOTAL DEEP RESEARCH TIME: {t_synthesis - t_start:.2f}s")
 
         # ── Save to PostgreSQL for persistent cross-session history ──
         try:
@@ -1148,10 +1179,13 @@ class CombinedRAGService:
                 db_session_id = str(uuid.uuid5(uuid.NAMESPACE_OID, db_session_id))
 
             # Pack metadata into citations for persistent UI state (Algorithm Insights, etc.)
+            # Initialize results to avoid UnboundLocalError
+            final_results = results if 'results' in locals() else None
+            
             metadata = {
                 "algorithm": algo,
                 "folder_id": folder_id,
-                "gds_results": results if 'results' in locals() else None,
+                "gds_results": final_results,
                 "grounding": {
                     "score": grounding_score,
                     "is_grounded": is_grounded,
@@ -1224,25 +1258,50 @@ class CombinedRAGService:
         }
 
     def _build_answer_prompt(self, question: str, context: str, folder_id: Optional[str], fast_mode: bool = False) -> str:
-        id_rule = "CRITICAL: NEVER include technical node IDs, internal hash identifiers, or database keys (like 'node ID' or '456:789'). Use ONLY human-readable Names."
-        gds_rule = "ALGORITHM EXPLANATION: If the context contains 'ALGORITHM' results (like PageRank, Betweenness), you MUST explicitly state the algorithm name in your response (e.g., 'According to the PageRank algorithm...') and explain the scores and relevance."
-        style_rule = (
-            "• Provide a helpful, natural response in neat, complete sentences. Reference the subject of the question in your answer.\n"
-            "• AVOID ONE-WORD ANSWERS. Even for simple facts, provide context. (e.g., instead of 'Leaves', say 'The plant parts of Moringa oleifera containing Rutin are the leaves.')\n"
-            "• NO PREAMBLE AND NO SIGN-OFF. Never say 'Based on the context', 'I hope you like my response', 'Let me know if you have more questions', or any variation of 'Happy to help'. STOP immediately after the answer.\n"
-            "• NO ROBOTIC LABELS. Never use phrases like 'This answer is justified because...' or 'According to the context...'. Just state the facts as part of your natural explanation.\n"
-            "• NO ROBOTIC DISCLAIMERS. Never mention internal processes like 'I have analyzed conversation history' or 'switching topics'.\n"
-            "• INTEGRATED JUSTIFICATION. Weave the reason why the answer is correct (the connections found in the graph) into your explanation naturally, rather than as a separate 'justification' section.\n"
-            "• STICK TO THE SUBJECT. If the question is about 'Moringa', do not talk about 'Basil' or list other herbs unless explicitly asked to compare them.\n"
-            "• If no information is found in the CONTEXT for the SPECIFIC subject requested, say: 'This information was not found in the database.'\n"
-            "• Avoid technical jargon unless it is part of the data."
-        )
+        # STRICT UI REQUIREMENT: NO TECHNICAL IDS
+        id_rule = "CRITICAL: NEVER include technical node IDs, internal hash identifiers, database keys (like 'node ID' or '456:789'), or GDS embeddings in your response. Refer to items by their 'Name' only."
 
-        return f"""Answer the QUESTION using the facts provided in the CONTEXT.
-
+        if fast_mode:
+            return f"""You are Neural Nexus, a concise knowledge-graph assistant.
 {id_rule}
-{gds_rule}
-{style_rule}
+
+Answer using only the CONTEXT below.
+If the context includes "[DATABASE FACTS]", use those counts and lists exactly.
+QUANTITY RULE: If the user asks for a specific number of items (e.g., "Top 5"), you MUST provide exactly that many items from the context. Do not truncate the list.
+Be direct, accurate, and brief. Avoid filler.
+
+CONTEXT:
+{context}
+
+QUESTION: {question}
+
+Answer in the shortest form that fully addresses the question."""
+
+        return f"""You are Neural Nexus — a sharp, knowledgeable research assistant that answers questions from a knowledge graph.
+{id_rule}
+
+STEP 3 — Answer the question:
+Write 2-3 sentences that DIRECTLY answer the user's original question using the algorithm results and connections provided in the context.
+- Name the #1 result explicitly and explain WHY it ranked highest based on the scores or connections.
+- If there is a pattern (e.g., all top nodes are the same type, scores drop off sharply), mention it.
+- Connect the finding to the user's question — don't just describe the algorithm generically.
+
+TABLE RULES:
+- If providing more than 3 items or rankings, you MUST use a Markdown table.
+- COMPLIANCE WITH QUANTITY: If the user asks for a 'Top 5', 'Top 10', or any specific number, you MUST provide exactly that many items. NEVER omit items based on your own judgment of relevance if they appear in the top results of the context data.
+- NEVER omit the score/rank column if available — it is the mathematical evidence for the answer.
+- Column headers should be short and clear (e.g., 'Rank', 'Subject', 'Score').
+- Always wrap the table with an opening sentence AND a closing summary.
+- NO INTERNAL FILTERING: Never 'clean up' or 'shorten' a list. If it's in the top data, it belongs in the table.
+
+AFTER-TABLE SUMMARY RULES:
+- 2-3 sentences max.
+- Directly answer the user's question first, then mention any notable pattern.
+- Write in plain English — no jargon, no bullet points in the summary.
+- NO PREAMBLE AND NO SIGN-OFF. Never say 'Based on the context', 'I hope this helps', or 'Let me know'. STOP immediately after the answer.
+- NO ROBOTIC LABELS. Never use phrases like 'This answer is justified because...' or 'According to the context...'. Just state the facts as part of your natural explanation.
+
+HONESTY: If context is truly incomplete for a specific sub-question, say it in one sentence only.
 
 CONTEXT:
 {context}
@@ -1355,63 +1414,43 @@ SCHEMA (actual graph structure for this folder):
 CRITICAL CONTEXT:
 - The graph uses folder-scoped labels. Every node in this folder carries the label `{folder_label}`.
 - Use ONLY the relationship types and node labels listed in the SCHEMA above — do NOT invent new ones.
-- The data domain is UNKNOWN — it could be pharma, finance, legal, social, or anything. Adapt your query to the actual schema.
-- CONVERSATION CONTINUITY: The user's question might refer to answers or entities from the RECENT CONVERSATION HISTORY (e.g., using "them", "it", "those"). Use the history to figure out what entity type or specific name they are asking about before deciding on the query.
+- The data domain is UNKNOWN. Adapt your query to the actual schema provided.
+- CONVERSATION CONTINUITY: If the question refers to entities from RECENT HISTORY (e.g., "it", "them"), resolve them based on the context before query generation.
 
 MULTI-HOP REASONING RULES:
 - Answers often require traversing 2-6 hops through the graph.
-- For connections between two entity types that are not directly linked, always try variable-length paths.
+- For connections between entity types that are not directly linked, always try variable-length paths.
 - ALWAYS use UNDIRECTED relationship patterns (no arrow) to catch relationships in BOTH directions:
-  Use: MATCH (a:{folder_label})-[*1..5]-(b:{folder_label}) WHERE a.name IS NOT NULL RETURN ...
-  NEVER use -[*1..5]-> (directed). ALWAYS use -[*1..5]- (undirected).
-  Reason: Relationship directions in the graph are inconsistent — some go A→B, others B→A.
-  Undirected patterns catch BOTH, ensuring no data is missed.
-- (EXAMPLE ONLY — for illustration — actual domain may differ):
-  e.g. Person -[:WorksAt]- Company -[:Located]- City
-  e.g. Product -[:HasComponent]- Material -[:SourcedFrom]- Country
+  Use: MATCH (a:{folder_label})-[*1..5]-(b:{folder_label})
+  NEVER use -> (directed). Relationship directions in the graph are inconsistent.
 
 SOP:
-1. PATH DISCOVERY: ALWAYS use undirected -[*1..5]-(m) for multi-hop questions. NEVER use directed ->. Never assume direct 1-hop connection.
-2. RELATIONSHIPS: Use ONLY rel types from the SCHEMA. Never hallucinate.
-3. NEO4J 5 SYNTAX: Use COUNT {{{{ (n)--() }}}} not size((n)--()).
-4. NO HARDCODING: Use label comparisons and patterns. Never hardcode node names.
-5. TYPE MATCHING: When filtering by entity type, ALWAYS use BOTH methods to catch all nodes:
+1. PATH DISCOVERY: ALWAYS use undirected -[*1..5]-(m) for multi-hop questions.
+2. NEO4J 5 SYNTAX: Use COUNT {{{{ (n)--() }}}} not size((n)--()).
+3. NO HARDCODING: Use label comparisons and patterns. Never hardcode node names unless specified.
+4. TYPE MATCHING: When filtering by type, ALWAYS use BOTH methods to catch all nodes:
    - Label-based: MATCH (n:TypeLabel_{folder_label})
-   - Property-based (fallback for manually-created nodes): OR toLower(n.type) = 'typename'
+   - Property-based: OR toLower(n.type) = 'typename'
    Example: MATCH (n:{folder_label}) WHERE (n:Student_{folder_label} OR toLower(n.type) = 'student') RETURN count(n)
-   This is CRITICAL because some nodes use labels while others use the `type` property.
 
-— GDS ALGORITHM SELECTION GUIDE —
-Pick the right `gds_algo` based on the user's question:
-
-1. CENTRALITY (Who/What is most important/influential?)
-   • "pagerank": REQUIRED for questions about "influence", "highest impact", "most important", "top ranked", "popularity", "best overall". It measures structural importance across the entire graph.
-   • "articlerank": Use for "authoritative" nodes or "prestige" in sparse/diverse graphs.
-   • "betweenness": Use for "bridges", "bottlenecks", "gatekeepers", "connecting different groups".
-   • "closeness": Use for "easiest to reach", "central access point", "closest to all others".
-   • "degree": Use for "most connected", "most active", "hubs" (direct count of links).
-   • "hits": Use for "hubs" (pointing to many authorities) vs "authorities" (pointed to by many hubs).
-
-2. COMMUNITY DETECTION (How is the data naturally grouped?)
-   • "louvain": Use for "natural clusters", "who belongs together", "communities", "groups".
-   • "leiden": Higher quality version of Louvain.
-   • "wcc": Use for "islands", "isolated parts", "disconnected groups".
-   • "kcore": Use for "tightly-knit core", "inner circle", "resilience".
-
-3. SIMILARITY & LINKS
-   • "similarity": Use for "what is similar to X", "most like", "shared neighbors".
-   • "link_prediction": Use for "what is missing", "hidden connections", "potential links".
-
-Question: {question}
+INTELLIGENT GDS DECISION GUIDE:
+- DO NOT use GDS for simple lookups, listings, counting, or direct relationships. Cypher handles these perfectly.
+- DO use GDS when the question requires mathematical graph analysis:
+  • Ranking by importance/influence (PageRank/ArticleRank).
+  • Finding hidden communities or natural clusters (Louvain/Leiden).
+  • Measuring similarity between nodes (Similarity).
+  • Finding bridges or bottlenecks (Betweenness).
+  • Predicting missing connections (Link Prediction).
+- Trigger GDS only when the algorithm genuinely adds insight the Cypher query cannot.
 
 JSON OUTPUT:
 {{
   "use_cypher": bool,
   "cypher_query": "CYPHER or null",
   "use_gds": bool,
-  "gds_algo": "pagerank|articlerank|betweenness|closeness|degree|hits|louvain|leiden|wcc|kcore|triangle_count|similarity|link_prediction_common|link_prediction_adamic|link_prediction_resource|topological_sort|null",
+  "gds_algo": "pagerank|articlerank|betweenness|closeness|degree|hits|louvain|leiden|wcc|kcore|triangle_count|similarity|link_prediction_common|null",
   "research_strategy": "brief description",
-  "search_depth": int // Estimated number of hops needed to traverse the graph to answer this question. Example: 1 for direct mapping, 3 for components, 5 for deep supply chain. Defaults to 5 if unsure. Cap at 10.
+  "search_depth": int // Estimated hops (1-10). Defaults to 5.
 }}
         """
         try:
