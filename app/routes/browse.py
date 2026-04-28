@@ -171,7 +171,7 @@ async def get_nodes_by_type(
                 "name": get_node_name(labels, node_data, node_id),
                 "type": get_node_type(labels, node_data),
                 "folder_id": node_data.get("folder_id"),
-                "properties": {k: v for k, v in node_data.items() if k not in ["id", "name", "type", "folder_id"]},
+                "properties": {k: v for k, v in node_data.items() if k not in ["id", "name", "type", "folder_id", "embedding"] and not k.lower().startswith("fastrp")},
                 "connections": connections
             })
             

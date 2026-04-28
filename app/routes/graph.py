@@ -295,7 +295,8 @@ async def get_all_graph(
                 node_ids.add(node_id)
                 labels = list(node.labels) if node.labels else ["Unknown"]
                 # Extract and parse conflicts if present
-                node_properties = {k: v for k, v in props.items() if k not in ["id", "name", "type", "description", "folder_id", "file_id", "conflicts"]}
+                EXCLUDED_PROPS = ["id", "name", "type", "description", "folder_id", "file_id", "conflicts", "embedding"]
+                node_properties = {k: v for k, v in props.items() if k not in EXCLUDED_PROPS and not k.lower().startswith("fastrp")}
                 conflicts = props.get("conflicts")
                 if conflicts and isinstance(conflicts, str):
                     import json
@@ -426,7 +427,8 @@ async def get_folder_graph(
                 node_ids.add(node_id)
                 labels = list(node.labels) if node.labels else ["Unknown"]
                 # Extract and parse conflicts if present
-                node_properties = {k: v for k, v in props.items() if k not in ["id", "name", "type", "description", "folder_id", "file_id", "conflicts"]}
+                EXCLUDED_PROPS = ["id", "name", "type", "description", "folder_id", "file_id", "conflicts", "embedding"]
+                node_properties = {k: v for k, v in props.items() if k not in EXCLUDED_PROPS and not k.lower().startswith("fastrp")}
                 conflicts = props.get("conflicts")
                 if conflicts and isinstance(conflicts, str):
                     import json
@@ -530,7 +532,8 @@ async def get_file_graph(
             if node_id not in node_ids:
                 node_ids.add(node_id)
                 labels = list(node.labels) if node.labels else ["Unknown"]
-                raw_properties = {k: v for k, v in props.items() if k not in ["id", "name", "type", "description", "folder_id", "file_id"]}
+                EXCLUDED_PROPS = ["id", "name", "type", "description", "folder_id", "file_id", "embedding"]
+                raw_properties = {k: v for k, v in props.items() if k not in EXCLUDED_PROPS and not k.lower().startswith("fastrp")}
                 nodes.append(NodeResponse(
                     id=node_id,
                     name=get_node_name(labels, props, node_id),
@@ -611,7 +614,8 @@ async def get_node_details(
         if not source_files and props.get("file_id"):
              source_files = [props.get("file_id")]
         
-        raw_properties = {k: v for k, v in props.items() if k not in ["id", "name", "type", "description"]}
+        EXCLUDED_PROPS = ["id", "name", "type", "description", "embedding"]
+        raw_properties = {k: v for k, v in props.items() if k not in EXCLUDED_PROPS and not k.lower().startswith("fastrp")}
         
         return NodeDetailsResponse(
             id=node_id,
@@ -669,7 +673,8 @@ async def expand_node(
             
             if n_id not in node_ids:
                 node_ids.add(n_id)
-                raw_properties = {k: v for k, v in props.items() if k not in ["id", "name", "type"]}
+                EXCLUDED_PROPS = ["id", "name", "type", "embedding"]
+                raw_properties = {k: v for k, v in props.items() if k not in EXCLUDED_PROPS and not k.lower().startswith("fastrp")}
                 nodes.append(NodeResponse(
                     id=n_id,
                     name=get_node_name(list(neighbor.labels), props, n_id),
