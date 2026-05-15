@@ -272,15 +272,42 @@ class OllamaService(BaseLLMService):
         response_text = ""
         try:
             response_text = await self.generate_response(strict_prompt)
+            if not response_text or not response_text.strip():
+                logger.warning("Ollama returned empty response for JSON generation")
+                return {"error": "empty_response"}
+            
             clean = response_text.strip()
+            
+            # Extract JSON from markdown blocks
             if "```json" in clean:
                 clean = clean.split("```json", 1)[1].split("```", 1)[0].strip()
             elif "```" in clean:
                 clean = clean.split("```", 1)[1].split("```", 1)[0].strip()
-            return json.loads(clean)
-        except Exception as e:
-            logger.warning(f"Ollama JSON parsing failed: {e}")
+            
+            # Try to extract JSON from text with extra content
+            if not clean.startswith("{"):
+                # Try to find JSON object start
+                idx = clean.find("{")
+                if idx != -1:
+                    # Find matching closing brace
+                    clean = clean[idx:]
+                    # Find last closing brace
+                    last_brace = clean.rfind("}")
+                    if last_brace != -1:
+                        clean = clean[:last_brace + 1]
+            
+            if clean.startswith("{"):
+                return json.loads(clean)
+            else:
+                logger.warning(f"Could not find JSON in response: {response_text[:100]}")
+                return {"error": "no_json_found"}
+                
+        except json.JSONDecodeError as e:
+            logger.warning(f"Ollama JSON parsing failed: {e}. Response was: {response_text[:200]}")
             return {"error": str(e), "raw": response_text}
+        except Exception as e:
+            logger.error(f"Ollama JSON generation error: {e}")
+            return {"error": str(e)}
 
 
     async def check_health(self) -> bool:

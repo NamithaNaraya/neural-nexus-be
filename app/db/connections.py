@@ -111,9 +111,24 @@ async def init_redis() -> None:
         encoding="utf-8",
         decode_responses=True,
     )
-    # Verify connection
-    await _redis_client.ping()
-    logger.info("Redis connection verified")
+
+    # Verify connection with retries to tolerate transient network issues
+    max_attempts = 3
+    delay = 0.5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await _redis_client.ping()
+            logger.info("Redis connection verified")
+            return
+        except Exception as e:
+            logger.warning(f"Redis ping attempt {attempt}/{max_attempts} failed: {e}")
+            if attempt < max_attempts:
+                await asyncio.sleep(delay)
+                delay *= 2
+
+    # If we reach here, ping failed on all attempts. Keep the client object
+    # so runtime calls can still attempt to recover; log a clear warning.
+    logger.warning("Redis could not be reached during init — continuing without cache. Redis operations may fail until connectivity is restored.")
 
 
 async def close_redis() -> None:
@@ -126,6 +141,17 @@ async def close_redis() -> None:
 
 def get_redis_client() -> aioredis.Redis:
     """Get Redis client instance."""
+    global _redis_client
     if not _redis_client:
-        raise RuntimeError("Redis not initialized")
+        # Lazy-create client if init_redis wasn't called or failed earlier.
+        try:
+            _redis_client = aioredis.from_url(
+                settings.REDIS_URL,
+                encoding="utf-8",
+                decode_responses=True,
+            )
+            logger.info("Redis client lazily created (no ping performed)")
+        except Exception as e:
+            logger.warning(f"Failed to lazily create Redis client: {e}")
+            raise RuntimeError("Redis client unavailable")
     return _redis_client

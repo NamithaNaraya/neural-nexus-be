@@ -62,12 +62,16 @@ class EmbeddingService:
 
         try:
             emb = await self.ai.embed(enriched_query or query)
+            logger.info(f"[EmbeddingService] Query embedded successfully: {len(emb)} dimensions")
         except Exception as e:
             logger.error(f"[EmbeddingService] Failed to embed query: {e}")
+            logger.warning(f"[EmbeddingService] Falling back to lexical/keyword search due to embedding failure")
             emb = None
 
         terms = self._tokenize(enriched_query or query)
         search_text = " ".join(exact_names[:3] + expanded_terms[:4] + terms[:8]).strip() or (query or "").strip()
+        
+        logger.debug(f"[EmbeddingService] Query: '{query}' | Expanded terms: {expanded_terms} | Exact names: {exact_names}")
 
         all_results: List[Dict[str, Any]] = []
         seen_names: set[str] = set()

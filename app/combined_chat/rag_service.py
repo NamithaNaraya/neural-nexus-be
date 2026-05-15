@@ -239,7 +239,16 @@ class CombinedRAGService:
         Fallback to simple regex if intent analysis isn't available.
         """
         cleaned = re.sub(r"[^\w\s-]", " ", (question or "").lower())
-        tokens = [t for t in cleaned.split() if len(t) > 3]
+        stopwords = {
+            "what", "which", "where", "when", "who", "whom", "whose", "why", "how",
+            "this", "that", "these", "those", "with", "from", "into", "about",
+            "found", "known", "commonly", "conditions", "condition", "addressed",
+            "compound", "compounds", "plant", "parts", "used", "using", "there",
+            "their", "them", "they", "more", "also", "tell", "give", "show", "list",
+            "name", "names", "please", "could", "would", "should", "have", "does",
+            "fruit", "leaf", "leaves", "root", "roots", "seed", "seeds",
+        }
+        tokens = [t for t in cleaned.split() if len(t) > 2 and t not in stopwords]
         return tokens[:10]
 
     def _token_variants(self, token: str) -> List[str]:
@@ -282,6 +291,9 @@ class CombinedRAGService:
         except Exception as e:
             logger.debug(f"Folder sample fetch failed for query planning: {e}")
             return []
+
+    def _folder_scope_where(self, alias: str = "n") -> str:
+        return f"{alias}.folder_id = $folder_id"
 
     async def _build_query_plan(self, question: str, folder_id: Optional[str]) -> Dict[str, Any]:
         normalized = self._normalize_question(question)
@@ -415,6 +427,56 @@ class CombinedRAGService:
             cleaned.append({**msg, "content": content.strip()})
         return cleaned
 
+    def _is_timeout_or_error_message(self, content: str) -> bool:
+        text = str(content or "").strip().lower()
+        if not text:
+            return False
+        error_markers = (
+            "[ollama timeout]",
+            "[ollama error]",
+            "[streaming error]",
+            "response took too long",
+            "timed out",
+        )
+        return any(marker in text for marker in error_markers)
+
+    def _sanitize_history_for_context(self, history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        """
+        Remove failed assistant turns from conversational context so a timeout
+        cannot poison the next question. If the latest assistant turn timed out,
+        also drop the immediately preceding user question because that turn never
+        produced a valid answer.
+        """
+        if not history:
+            return []
+
+        sanitized: List[Dict[str, str]] = []
+        last_removed_timeout = False
+
+        for msg in history:
+            role = str(msg.get("role", "")).strip().lower()
+            content = str(msg.get("content", "")).strip()
+            if not content:
+                continue
+
+            if role == "assistant" and self._is_timeout_or_error_message(content):
+                last_removed_timeout = True
+                continue
+
+            sanitized.append(msg)
+            last_removed_timeout = False
+
+        if history:
+            last_msg = history[-1]
+            last_role = str(last_msg.get("role", "")).strip().lower()
+            last_content = str(last_msg.get("content", "")).strip()
+            if last_role == "assistant" and self._is_timeout_or_error_message(last_content):
+                while sanitized and str(sanitized[-1].get("role", "")).strip().lower() == "user":
+                    sanitized.pop()
+                    break
+
+        return sanitized
+
     async def _resolve_followup(self, question: str, history: List[Dict[str, str]], folder_id: Optional[str]) -> str:
         """
         Resolve follow-up questions using conversation history.
@@ -520,12 +582,51 @@ class CombinedRAGService:
             "is_greeting": q.strip().strip("?!.") in {"hi", "hello", "hey", "hola", "greetings"},
             "is_new_topic": is_new_topic,
             "entities": list(current_entities),
-            "retrieval_mode": "deep" if use_gds or "?" in q else "fast",
+            # Route simple factual property lookups to 'fast', not 'deep'
+            "retrieval_mode": "deep" if use_gds else (
+                "fast" if self._is_simple_factual(question) else
+                ("deep" if any(w in q for w in ["how", "why", "path", "connect", "relation", "between", "through", "via"]) else "fast")
+            ),
             "use_gds": use_gds,
             "gds_algo": gds_algo,
             "resolved_question": question,
             "research_strategy": f"Heuristic Fallback ({gds_algo if use_gds else 'Direct'})"
         }
+
+    def _is_simple_factual(self, question: str) -> bool:
+        """
+        Determine if a question is a simple factual lookup (use 'fast' mode).
+        vs. a complex reasoning question (use 'deep' mode).
+        
+        Simple: "What is X?", "Tell me about X", "List X"
+        Complex: "How does X relate to Y?", "Why does X happen?", "What are the connections?"
+        """
+        q = (question or "").lower().strip()
+        
+        # Simple factual keywords
+        simple_keywords = {
+            "what", "tell", "list", "show", "name", "define",
+            "find", "get", "give", "describe", "explain about",
+            "which", "who", "where"
+        }
+        
+        # Complex reasoning keywords
+        complex_keywords = {
+            "how", "why", "relate", "connection", "path",
+            "chain", "through", "via", "associate", "compare",
+            "difference", "similar", "between", "across"
+        }
+        
+        # Check for complex keywords first
+        if any(keyword in q for keyword in complex_keywords):
+            return False
+        
+        # Check for simple keywords
+        if any(keyword in q for keyword in simple_keywords):
+            return True
+        
+        # Default to fast for short questions, deep for long complex ones
+        return len(q) < 80
 
     async def _analyze_query_intent(
         self,
@@ -581,7 +682,7 @@ class CombinedRAGService:
 
         try:
             # Increased timeout for intent analysis (Ollama can be slow on some hardware)
-            result = await asyncio.wait_for(self.llm.generate_json(prompt), timeout=12.0)
+            result = await asyncio.wait_for(self.llm.generate_json(prompt), timeout=18.0)
             if not isinstance(result, dict) or "retrieval_mode" not in result:
                 raise ValueError("Invalid intent analysis response")
             return result
@@ -674,8 +775,15 @@ class CombinedRAGService:
             else:
                 res_str = str(result)
             fused.append(f"=== {name} ===\n{res_str}")
+            logger.debug(f"🔍 Retrieved from {name}: {len(res_str)} chars")
 
         context = self._pack_context(fused, _FAST_CONTEXT_CHARS)
+        logger.info(f"📦 Context packed: {len(context)} chars from {len(fused)} sources")
+        
+        if len(context.strip()) < 50:
+            logger.warning(f"⚠️  THIN CONTEXT DETECTED: {len(context)} chars (< 50 threshold)")
+        elif len(context.strip()) < 200:
+            logger.warning(f"⚠️  WEAK CONTEXT: {len(context)} chars (< 200 threshold)")
 
         # ── Intent-aware Re-retrieval: if context is thin, try again with LLM-rewritten query ──
         if len(context.strip()) < 50 and folder_id:
@@ -801,6 +909,7 @@ class CombinedRAGService:
             if msg_str not in seen_msgs and msg.get('content', '').strip():
                 seen_msgs.add(msg_str)
                 combined_history.append(msg)
+        combined_history = self._sanitize_history_for_context(combined_history)
         # Clean history of persona junk before analysis
         cleaned_history = self._clean_history(combined_history)
 
@@ -1257,59 +1366,161 @@ class CombinedRAGService:
             "context_summary": f"Retrieved from folder {folder_id or 'global'}.",
         }
 
-    def _build_answer_prompt(self, question: str, context: str, folder_id: Optional[str], fast_mode: bool = False) -> str:
-        # STRICT UI REQUIREMENT: NO TECHNICAL IDS
-        id_rule = "CRITICAL: NEVER include technical node IDs, internal hash identifiers, database keys (like 'node ID' or '456:789'), or GDS embeddings in your response. Refer to items by their 'Name' only."
+    def _build_answer_prompt(self, question: str, context: str, folder_id=None, fast_mode: bool = False) -> str:
+        """
+        Build the synthesis prompt for the LLM.
+        Three modes:
+          1. fast_mode=True         -> concise factual answer from retrieved context
+          2. has_algorithm_data     -> ranking/analytics answer (GDS output)
+          3. else                   -> factual/relational answer from graph properties
+        All prompts are domain-agnostic: they work for any dataset (medical, legal,
+        financial, botanical, HR, etc.) without domain-specific assumptions.
+        """
 
+        NO_ID_RULE = (
+            "STRICT RULE: Never include internal node IDs, database keys, hash values, "
+            "or embedding vectors in your response. Refer to all items by their name or label only."
+        )
+
+        # Check if context is too thin to answer
+        context_quality_check = len((context or "").strip()) < 50
+        
+        # ── Mode 1: Fast / Catalog ─────────────────────────────────────────────
         if fast_mode:
-            return f"""You are Neural Nexus, a concise knowledge-graph assistant.
-{id_rule}
+            if context_quality_check:
+                # Force honest answer when context is insufficient
+                return f"""You are a knowledge-graph assistant. The user asked a question but there is NOT ENOUGH DATA to answer it properly.
 
-Answer using only the CONTEXT below.
-If the context includes "[DATABASE FACTS]", use those counts and lists exactly.
-QUANTITY RULE: If the user asks for a specific number of items (e.g., "Top 5"), you MUST provide exactly that many items from the context. Do not truncate the list.
-Be direct, accurate, and brief. Avoid filler.
+RULE: Since the context below is empty or nearly empty, you MUST respond with exactly:
+"The data available does not contain information to answer this question."
 
-CONTEXT:
+Do NOT guess, hallucinate, or provide general knowledge.
+
+=== CONTEXT (INSUFFICIENT) ===
 {context}
 
-QUESTION: {question}
+=== QUESTION ===
+{question}
 
-Answer in the shortest form that fully addresses the question."""
+=== ANSWER ==="""
+            
+            return f"""You are a precise knowledge-graph assistant. Answer the user's question using ONLY the CONTEXT provided below.
 
-        return f"""You are Neural Nexus — a sharp, knowledgeable research assistant that answers questions from a knowledge graph.
-{id_rule}
+{NO_ID_RULE}
 
-STEP 3 — Answer the question:
-Write 2-3 sentences that DIRECTLY answer the user's original question using the algorithm results and connections provided in the context.
-- Name the #1 result explicitly and explain WHY it ranked highest based on the scores or connections.
-- If there is a pattern (e.g., all top nodes are the same type, scores drop off sharply), mention it.
-- Connect the finding to the user's question — don't just describe the algorithm generically.
+=== ANSWER RULES ===
+1. CONTEXT-ONLY: Your answer MUST be grounded entirely in the context. Never add information from your training data.
+2. DIRECT: Give the answer immediately. No preamble like "Based on the context..." or "According to the data...".
+3. COMPLETE PROPERTY VALUES: If a property contains multiple values separated by "/" or "," (e.g. "Alpha / Beta / Gamma"), list ALL of them — never truncate.
+4. QUANTITIES: If the user asks for a specific count ("top 5", "list 10"), provide EXACTLY that many items from the context.
+5. REFUSE IF INSUFFICIENT: If the context does not clearly answer the question, refuse with: "The data available does not contain this information."
+6. DATABASE FACTS: If context contains "[DATABASE FACTS]", treat those counts and lists as authoritative ground truth.
+7. BREVITY: Answer in the fewest words that fully and accurately address the question.
+8. TABLES: Use a Markdown table only when listing 4 or more items.
+9. NO SIGN-OFF: Do not end with "I hope this helps", "Let me know", or any closing pleasantry.
 
-TABLE RULES:
-- If providing more than 3 items or rankings, you MUST use a Markdown table.
-- COMPLIANCE WITH QUANTITY: If the user asks for a 'Top 5', 'Top 10', or any specific number, you MUST provide exactly that many items. NEVER omit items based on your own judgment of relevance if they appear in the top results of the context data.
-- NEVER omit the score/rank column if available — it is the mathematical evidence for the answer.
-- Column headers should be short and clear (e.g., 'Rank', 'Subject', 'Score').
-- Always wrap the table with an opening sentence AND a closing summary.
-- NO INTERNAL FILTERING: Never 'clean up' or 'shorten' a list. If it's in the top data, it belongs in the table.
-
-AFTER-TABLE SUMMARY RULES:
-- 2-3 sentences max.
-- Directly answer the user's question first, then mention any notable pattern.
-- Write in plain English — no jargon, no bullet points in the summary.
-- NO PREAMBLE AND NO SIGN-OFF. Never say 'Based on the context', 'I hope this helps', or 'Let me know'. STOP immediately after the answer.
-- NO ROBOTIC LABELS. Never use phrases like 'This answer is justified because...' or 'According to the context...'. Just state the facts as part of your natural explanation.
-
-HONESTY: If context is truly incomplete for a specific sub-question, say it in one sentence only.
-
-CONTEXT:
+=== CONTEXT ===
 {context}
 
-QUESTION: {question}
+=== QUESTION ===
+{question}
 
-DIRECT ANSWER:"""
+=== ANSWER ==="""
 
+        # ── Detect context type: GDS algorithm output vs. graph property data ──
+        has_algorithm_data = (
+            "ALGORITHM:" in context
+            or "pagerank" in context.lower()
+            or "louvain" in context.lower()
+            or "betweenness" in context.lower()
+            or "Graph Algorithm" in context
+            or "centrality" in context.lower()
+        )
+
+        # ── Mode 2: Factual / Relational (graph properties, no algorithm) ──────
+        if not has_algorithm_data:
+            if context_quality_check:
+                return f"""You are a knowledge-graph research assistant. The user asked a question but there is NOT ENOUGH DATA.
+
+RULE: Since the context is insufficient, you MUST respond with exactly:
+"The data available does not contain information to answer this question."
+
+Do NOT guess or provide general knowledge.
+
+=== CONTEXT (INSUFFICIENT) ===
+{context}
+
+=== QUESTION ===
+{question}
+
+=== ANSWER ==="""
+            
+            return f"""You are a precise knowledge-graph research assistant. Answer the user's question using ONLY the CONTEXT provided below.
+
+{NO_ID_RULE}
+
+=== ANSWER RULES ===
+1. CONTEXT-ONLY: Every fact you state MUST come from the context. No training data, no general knowledge.
+2. DIRECT ANSWER FIRST: State the answer in the first sentence. Do not build up to it.
+3. READ EVERY PROPERTY: The context contains structured node properties (key: value pairs).
+   - A property with multiple values like "X / Y / Z" or "X, Y, Z" means ALL of those are valid answers — list ALL of them.
+   - Do not select just one value when multiple exist.
+4. USE RELATIONSHIPS: If the context includes graph relationships (e.g. A -[REL]-> B), use them to explain connections.
+5. NO RANKINGS: Do not frame the answer in terms of "ranked highest" or "most connected" unless the question asks for it.
+6. TABLES: Use a Markdown table when the answer has 4 or more items or comparisons.
+7. CONCISE: 1-4 sentences for simple questions. Longer only if the question requires it.
+8. REFUSE IF INSUFFICIENT: If the context does not clearly contain the answer, refuse with: "The data available does not contain this information."
+9. NO PREAMBLE OR SIGN-OFF: Do not say "Based on the context", "According to the knowledge graph", or "I hope this helps".
+
+=== CONTEXT ===
+{context}
+
+=== QUESTION ===
+{question}
+
+=== ANSWER ==="""
+
+        # ── Mode 3: Algorithm / Analytics output ──────────────────────────────
+        if context_quality_check:
+            return f"""You are a knowledge-graph analytics assistant. There is NOT ENOUGH ALGORITHM DATA to answer this.
+
+RULE: Since the context is empty or insufficient, respond with:
+"The analysis could not be completed due to insufficient data."
+
+Do NOT provide generic advice or general knowledge.
+
+=== CONTEXT (INSUFFICIENT) ===
+{context}
+
+=== QUESTION ===
+{question}
+
+=== ANSWER ==="""
+        
+        return f"""You are a precise knowledge-graph analytics assistant. Answer the user's question using the algorithm results in the CONTEXT below.
+
+{NO_ID_RULE}
+
+=== ANSWER RULES ===
+1. CONTEXT-ONLY: Base every statement on the algorithm results provided. No assumptions or general knowledge.
+2. LEAD WITH THE ANSWER: In the first sentence, directly state what the algorithm found (e.g., "The most central node is X with a score of Y.").
+3. EXPLAIN THE RANKING: Briefly explain why the top result ranked highest (score, connection count, community membership, etc.).
+4. PATTERNS: If there is a clear pattern in the results (e.g., top nodes are all the same type, scores drop sharply after rank 3), mention it.
+5. QUANTITY COMPLIANCE: If the user asked for "Top N" items, you MUST include exactly N items. Never truncate.
+6. TABLES: When listing 3 or more ranked results, you MUST use a Markdown table with columns for Rank, Name, and Score/Metric.
+   - Never omit the score column — it is the mathematical evidence for the answer.
+7. AFTER-TABLE SUMMARY: Write 1-2 sentences summarising the key finding in plain language.
+8. NO PREAMBLE OR SIGN-OFF: Do not say "Based on the context", "I hope this helps", or any closing pleasantry. Stop immediately after the answer.
+9. NO INTERNAL FILTERING: Do not omit items from the top results because you judge them less relevant. Report what the algorithm returned.
+10. REFUSE IF INSUFFICIENT: If the context lacks data to answer the question, respond with: "The analysis does not contain sufficient data for this answer."
+
+=== CONTEXT ===
+{context}
+
+=== QUESTION ===
+{question}
+
+=== ANSWER ==="""
 
 
     # ────────────────────────────────────────────────────────────
@@ -1546,8 +1757,6 @@ JSON OUTPUT:
         if not folder_id:
             return ""
 
-        folder_label = f"F_{folder_id.replace('-', '_')}"
-
         try:
             async with self.neo4j.session() as session:
 
@@ -1556,10 +1765,13 @@ JSON OUTPUT:
                 # This is critical: Herb→HAS_PART→PlantPart and PlantPart→CONTAINS→Phytoconstituent
                 # may have different directions, so directed queries miss entire branches.
                 q1 = f"""
-                    MATCH (a:{folder_label})-[r1]-(b:{folder_label})
-                    WHERE a.name IS NOT NULL AND b.name IS NOT NULL
-                    OPTIONAL MATCH (b)-[r2]-(c:{folder_label})
-                    WHERE c.name IS NOT NULL AND c <> a
+                    MATCH (a)-[r1]-(b)
+                    WHERE {self._folder_scope_where('a')}
+                      AND {self._folder_scope_where('b')}
+                      AND a.name IS NOT NULL AND b.name IS NOT NULL
+                    OPTIONAL MATCH (b)-[r2]-(c)
+                    WHERE {self._folder_scope_where('c')}
+                      AND c.name IS NOT NULL AND c <> a
                     RETURN
                         a.name AS source,
                         type(r1) AS rel1,
@@ -1573,8 +1785,12 @@ JSON OUTPUT:
                 # Discovers longer chains like Herb→PlantPart→Phytoconstituent→Biomarker
                 # Undirected to follow relationship chains regardless of direction.
                 q2 = f"""
-                    MATCH (a:{folder_label})-[r1]-(b:{folder_label})-[r2]-(c:{folder_label})-[r3]-(d:{folder_label})
-                    WHERE a.name IS NOT NULL AND d.name IS NOT NULL
+                    MATCH (a)-[r1]-(b)-[r2]-(c)-[r3]-(d)
+                    WHERE {self._folder_scope_where('a')}
+                      AND {self._folder_scope_where('b')}
+                      AND {self._folder_scope_where('c')}
+                      AND {self._folder_scope_where('d')}
+                      AND a.name IS NOT NULL AND d.name IS NOT NULL
                       AND a <> d AND a <> c AND b <> d
                     RETURN
                         a.name AS node_a,
