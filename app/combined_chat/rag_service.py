@@ -628,6 +628,41 @@ class CombinedRAGService:
         # Default to fast for short questions, deep for long complex ones
         return len(q) < 80
 
+    def _fast_heuristic_intent(self, question: str, history: Optional[List[Dict[str, str]]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Ultra-fast heuristic to detect greetings and simple factual patterns
+        without calling an LLM. Returns None if it's potentially complex.
+        """
+        q = (question or "").lower().strip().strip("?!.")
+        
+        # 1. Greetings
+        greetings = {"hi", "hello", "hey", "hola", "greetings", "good morning", "good afternoon", "good evening"}
+        if q in greetings:
+            return {
+                "is_greeting": True,
+                "is_new_topic": True,
+                "entities": [],
+                "retrieval_mode": "fast",
+                "resolved_question": question,
+                "use_gds": False,
+                "research_strategy": "Greeting (Heuristic)"
+            }
+
+        # 2. Very simple factual lookups (3 words or less)
+        words = q.split()
+        if len(words) <= 3 and any(w in q for w in ["what", "who", "where", "tell", "show"]):
+             return {
+                "is_greeting": False,
+                "is_new_topic": True,
+                "entities": self._extract_keywords(question),
+                "retrieval_mode": "fast",
+                "resolved_question": question,
+                "use_gds": False,
+                "research_strategy": "Simple Lookup (Heuristic)"
+            }
+
+        return None
+
     async def _analyze_query_intent(
         self,
         question: str,
@@ -648,46 +683,30 @@ class CombinedRAGService:
             history_text = "\n".join([f"{m['role']}: {m['content'][:200]}" for m in history[-3:]])
 
         prompt = (
-            "You are a research query analyst for a Knowledge Graph RAG system.\n"
-            "Analyze the following user question in the context of the conversation history.\n\n"
-            "YOUR TASKS:\n"
-            "1. is_greeting: Is this a greeting (hi, hello) or a pleasantry (how are you, thanks)?\n"
-            "2. is_new_topic: Is the user asking about a DIFFERENT entity or subject than the last assistant response? \n"
-            "   - YES: If the last turn was about 'Basil' and now they ask about 'Moringa'.\n"
-            "   - NO: If they are asking for details, follow-ups, or more info about the SAME subject.\n"
-            "3. entities: Extract ONLY the technical entities (plants, chemicals, names) present in the CURRENT question.\n"
-            "4. resolved_question: If the question uses pronouns (it, they) or is a partial sentence, rewrite it to be self-contained using history. If it is already a full question about a new subject, keep it EXACTLY as is.\n"
-            "5. retrieval_mode:\n"
-            "   - 'catalog': counting, listing all of a type.\n"
-            "   - 'deep': relationships, multi-hop paths, 'influence', 'why/how' questions.\n"
-            "   - 'fast': direct factual property lookups.\n"
-            "6. use_gds: bool (True if the question asks about influence, importance, communities, or clusters)\n"
-            "7. gds_algo: 'pagerank'|'louvain'|'betweenness'|'closeness'|null\n"
-            "8. research_strategy: A 3-5 word summary of the plan.\n\n"
-            "CONVERSATION HISTORY:\n"
-            f"{history_text or '[No history]'}\n\n"
-            f"USER QUESTION: {question}\n\n"
-            "Return ONLY a JSON object with this exact structure:\n"
+            "You are a query analyst for a Graph RAG system. Analyze the question and history.\n"
+            "Return ONLY a JSON object with this structure:\n"
             "{\n"
             "  \"is_greeting\": bool,\n"
-            "  \"is_new_topic\": bool,\n"
-            "  \"entities\": [\"entity1\", \"entity2\"],\n"
+            "  \"is_new_topic\": bool (True if the subject changed from history),\n"
+            "  \"entities\": [\"technical_terms\"],\n"
             "  \"retrieval_mode\": \"fast\"|\"deep\"|\"catalog\",\n"
-            "  \"resolved_question\": \"rewritten question\",\n"
-            "  \"use_gds\": bool,\n"
-            "  \"gds_algo\": \"algo_name\"|null,\n"
-            "  \"research_strategy\": \"string\"\n"
-            "}"
+            "  \"resolved_question\": \"rewritten question if it uses pronouns like it/they\",\n"
+            "  \"use_gds\": bool (True for influence/importance/communities),\n"
+            "  \"gds_algo\": \"pagerank\"|\"louvain\"|null,\n"
+            "  \"research_strategy\": \"3-word summary\"\n"
+            "}\n\n"
+            f"HISTORY:\n{history_text or 'None'}\n"
+            f"QUESTION: {question}"
         )
 
         try:
-            # Increased timeout for intent analysis (Ollama can be slow on some hardware)
-            result = await asyncio.wait_for(self.llm.generate_json(prompt), timeout=18.0)
+            # Optimized timeout: 5s is plenty for a fast JSON response
+            result = await asyncio.wait_for(self.llm.generate_json(prompt), timeout=5.0)
             if not isinstance(result, dict) or "retrieval_mode" not in result:
-                raise ValueError("Invalid intent analysis response")
+                raise ValueError("Invalid response")
             return result
         except Exception as e:
-            logger.warning(f"Intent analysis failed: {repr(e)}. Using heuristic fallback.")
+            logger.debug(f"AI Intent analysis failed/timed out: {repr(e)}. Falling back to heuristic.")
             return self._get_heuristic_intent(question, history)
 
     async def _stream_fast_answer(
@@ -913,10 +932,28 @@ class CombinedRAGService:
         # Clean history of persona junk before analysis
         cleaned_history = self._clean_history(combined_history)
 
-        # ── Step 1: Agentic Intent Analysis ──────────────────
-        intent = await self._analyze_query_intent(question, cleaned_history, folder_id)
-        t_intent = time.time()
-        logger.info(f"⏱️ Step 1 (Intent Analysis): {t_intent - t_start:.2f}s")
+        # ── Step 1: Intent Analysis (Fast Heuristic First) ────
+        intent = self._fast_heuristic_intent(question, cleaned_history)
+        
+        intent_task = None
+        if not intent:
+            # Launch AI intent analysis in background
+            intent_task = asyncio.create_task(self._analyze_query_intent(question, cleaned_history, folder_id))
+            # Default to a "fast" intent until analysis confirms otherwise
+            intent = self._get_heuristic_intent(question, cleaned_history)
+        
+        if intent_task:
+            try:
+                # Wait for AI intent analysis with a short timeout (2.5s)
+                # This catches the intent for most simple/medium queries quickly
+                intent = await asyncio.wait_for(intent_task, timeout=2.5)
+            except asyncio.TimeoutError:
+                logger.info("⏱️ AI Intent analysis taking too long (>2.5s). Using heuristic baseline.")
+            except Exception as e:
+                logger.debug(f"Background intent analysis error: {e}")
+        
+        t_intent_end = time.time()
+        logger.info(f"⏱️ Intent phase total: {t_intent_end - t_start:.2f}s")
         
         # ── Greetings ────────────────────────────────────────
         if intent.get("is_greeting"):

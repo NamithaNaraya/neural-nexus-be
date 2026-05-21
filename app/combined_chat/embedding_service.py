@@ -90,7 +90,12 @@ class EmbeddingService:
                 seen_names.add(key)
 
         async with self.neo4j.session() as session:
-            if emb:
+            # Prepare all tasks for parallel execution
+            tasks = []
+            
+            # Layer 1: Vector
+            async def run_vector():
+                if not emb: return []
                 try:
                     vector_query = f"""
                         CALL db.index.vector.queryNodes('{settings.VECTOR_INDEX_NAME}', $top_k, $emb)
@@ -99,27 +104,21 @@ class EmbeddingService:
                           AND ($folder_id IS NULL OR node.folder_id = $folder_id)
                         RETURN
                             node.name AS name,
-                            coalesce(
-                                node.description,
-                                node.text,
-                                node.summary,
-                                node.commonName,
-                                node.scientificName,
-                                ''
-                            ) AS text,
+                            coalesce(node.description, node.text, node.summary, node.commonName, node.scientificName, '') AS text,
                             labels(node) AS labels,
                             score,
                             coalesce(node.id, elementId(node)) AS node_id
                         LIMIT {_MAX_RESULTS}
                     """
                     res = await session.run(vector_query, emb=emb, folder_id=folder_id, top_k=_VECTOR_OVER_FETCH)
-                    vec_data = await res.data()
-                    add_results(vec_data, "vector")
-                    logger.info(f"[EmbeddingService] Layer 1 (Vector): {len(vec_data)} results")
+                    return await res.data()
                 except Exception as e:
-                    logger.warning(f"[EmbeddingService] Layer 1 (Vector) failed: {e}")
+                    logger.warning(f"Layer 1 (Vector) failed: {e}")
+                    return []
 
-            if exact_names:
+            # Layer 2: Exact
+            async def run_exact():
+                if not exact_names: return []
                 try:
                     exact_query = """
                         MATCH (node)
@@ -128,31 +127,21 @@ class EmbeddingService:
                           AND toLower(node.name) IN $exact_names
                         RETURN
                             node.name AS name,
-                            coalesce(
-                                node.description,
-                                node.text,
-                                node.summary,
-                                node.commonName,
-                                node.scientificName,
-                                ''
-                            ) AS text,
+                            coalesce(node.description, node.text, node.summary, node.commonName, node.scientificName, '') AS text,
                             labels(node) AS labels,
                             0.98 AS score,
                             coalesce(node.id, elementId(node)) AS node_id
                         LIMIT 10
                     """
-                    res = await session.run(
-                        exact_query,
-                        folder_id=folder_id,
-                        exact_names=[name.lower() for name in exact_names[:8]],
-                    )
-                    exact_data = await res.data()
-                    add_results(exact_data, "exact")
-                    logger.info(f"[EmbeddingService] Layer 2 (Exact): {len(exact_data)} results")
+                    res = await session.run(exact_query, folder_id=folder_id, exact_names=[n.lower() for n in exact_names[:8]])
+                    return await res.data()
                 except Exception as e:
-                    logger.warning(f"[EmbeddingService] Layer 2 (Exact) failed: {e}")
+                    logger.warning(f"Layer 2 (Exact) failed: {e}")
+                    return []
 
-            if terms:
+            # Layer 3: Lexical
+            async def run_lexical():
+                if not terms: return []
                 try:
                     lexical_query = """
                         MATCH (node)
@@ -172,27 +161,21 @@ class EmbeddingService:
                           )
                         RETURN
                             node.name AS name,
-                            coalesce(
-                                node.description,
-                                node.text,
-                                node.summary,
-                                node.commonName,
-                                node.scientificName,
-                                ''
-                            ) AS text,
+                            coalesce(node.description, node.text, node.summary, node.commonName, node.scientificName, '') AS text,
                             labels(node) AS labels,
                             0.78 AS score,
                             coalesce(node.id, elementId(node)) AS node_id
                         LIMIT 15
                     """
                     res = await session.run(lexical_query, folder_id=folder_id, terms=terms)
-                    lex_data = await res.data()
-                    add_results(lex_data, "lexical")
-                    logger.info(f"[EmbeddingService] Layer 3 (Lexical): {len(lex_data)} results")
+                    return await res.data()
                 except Exception as e:
-                    logger.warning(f"[EmbeddingService] Layer 3 (Lexical) failed: {e}")
+                    logger.warning(f"Layer 3 (Lexical) failed: {e}")
+                    return []
 
-            if len(all_results) < 5 and search_text:
+            # Layer 4: Fulltext
+            async def run_fulltext():
+                if not search_text: return []
                 try:
                     fulltext_query = """
                         CALL db.index.fulltext.queryNodes('entity_search', $search_text)
@@ -201,41 +184,28 @@ class EmbeddingService:
                           AND ($folder_id IS NULL OR node.folder_id = $folder_id)
                         RETURN
                             node.name AS name,
-                            coalesce(
-                                node.description,
-                                node.text,
-                                node.summary,
-                                node.commonName,
-                                node.scientificName,
-                                ''
-                            ) AS text,
+                            coalesce(node.description, node.text, node.summary, node.commonName, node.scientificName, '') AS text,
                             labels(node) AS labels,
                             score * 0.65 AS score,
                             coalesce(node.id, elementId(node)) AS node_id
                         LIMIT 12
                     """
                     res = await session.run(fulltext_query, search_text=search_text, folder_id=folder_id)
-                    ft_data = await res.data()
-                    add_results(ft_data, "fulltext")
-                    logger.info(f"[EmbeddingService] Layer 4 (Fulltext): {len(ft_data)} results")
+                    return await res.data()
                 except Exception as e:
-                    logger.warning(f"[EmbeddingService] Layer 4 (Fulltext) failed: {e}")
+                    logger.warning(f"Layer 4 (Fulltext) failed: {e}")
+                    return []
 
-            if not all_results and folder_id:
+            # Layer 5: Folder Scan
+            async def run_scan():
+                if not folder_id: return []
                 try:
                     scan_query = """
                         MATCH (node {folder_id: $folder_id})
                         WHERE node.name IS NOT NULL
                         RETURN
                             node.name AS name,
-                            coalesce(
-                                node.description,
-                                node.text,
-                                node.summary,
-                                node.commonName,
-                                node.scientificName,
-                                ''
-                            ) AS text,
+                            coalesce(node.description, node.text, node.summary, node.commonName, node.scientificName, '') AS text,
                             labels(node) AS labels,
                             0.45 AS score,
                             coalesce(node.id, elementId(node)) AS node_id
@@ -243,11 +213,21 @@ class EmbeddingService:
                         LIMIT 20
                     """
                     res = await session.run(scan_query, folder_id=folder_id)
-                    scan_data = await res.data()
-                    add_results(scan_data, "scan")
-                    logger.info(f"[EmbeddingService] Layer 5 (Folder Scan): {len(scan_data)} results")
+                    return await res.data()
                 except Exception as e:
-                    logger.warning(f"[EmbeddingService] Layer 5 (Folder Scan) failed: {e}")
+                    logger.warning(f"Layer 5 (Folder Scan) failed: {e}")
+                    return []
+
+            # Execute all layers in parallel
+            vec_res, exact_res, lex_res, ft_res, scan_res = await asyncio.gather(
+                run_vector(), run_exact(), run_lexical(), run_fulltext(), run_scan()
+            )
+
+            add_results(vec_res, "vector")
+            add_results(exact_res, "exact")
+            add_results(lex_res, "lexical")
+            add_results(ft_res, "fulltext")
+            add_results(scan_res, "scan")
 
         query_terms = set(terms)
         exact_term_set = {self._normalize_text(name) for name in exact_names}
